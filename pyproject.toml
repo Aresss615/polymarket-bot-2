@@ -1,0 +1,20 @@
+[project]
+name = "polymarket-bot"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "requests>=2.31",
+    "anthropic>=0.40",
+    "feedparser>=6.0",
+    "rich>=13.0",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
