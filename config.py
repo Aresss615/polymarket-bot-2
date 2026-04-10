@@ -12,17 +12,17 @@ GAMMA_API_URL = "https://gamma-api.polymarket.com"
 CLOB_API_URL = "https://clob.polymarket.com"
 OKX_API_URL = "https://www.okx.com/api/v5"
 BYBIT_API_URL = "https://api.bybit.com/v5"
-NEWSAPI_URL = "https://newsapi.org/v2"
 GOOGLE_NEWS_RSS_URL = "https://news.google.com/rss/search"
 
-# --- API Keys ---
-NEWSAPI_KEY = os.environ.get("NEWSAPI_KEY", "")
+# --- Groq LLM Settings ---
+GROQ_PRIMARY_MODEL = "llama-3.3-70b-versatile"
+GROQ_FALLBACK_MODEL = "llama-3.1-8b-instant"
 
 # --- Strategy Settings ---
 ARBITRAGE_CONFIDENCE_THRESHOLD = 0.85
 LEVEL_CLEARANCE_PCT = 0.015  # 1.5%
 LEVEL_WINDOW_MINUTES = 10
-NEWS_POLL_INTERVAL = 60  # seconds
+NEWS_POLL_INTERVAL = 300  # 5 minutes — fits within 70B's 1K RPD limit
 TRADE_SIZE = 10.0  # dollars per paper trade
 STARTING_BALANCE = 1000.0
 

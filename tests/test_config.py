@@ -10,13 +10,16 @@ from config import (
     CLOB_API_URL,
     OKX_API_URL,
     BYBIT_API_URL,
-    NEWSAPI_URL,
+    GOOGLE_NEWS_RSS_URL,
+    GROQ_PRIMARY_MODEL,
+    GROQ_FALLBACK_MODEL,
     SUPPORTED_COINS,
     ARBITRAGE_CONFIDENCE_THRESHOLD,
     LEVEL_CLEARANCE_PCT,
     LEVEL_WINDOW_MINUTES,
     TRADE_SIZE,
     STARTING_BALANCE,
+    NEWS_POLL_INTERVAL,
 )
 
 
@@ -84,10 +87,13 @@ def test_constants():
     assert CLOB_API_URL == "https://clob.polymarket.com"
     assert OKX_API_URL == "https://www.okx.com/api/v5"
     assert BYBIT_API_URL == "https://api.bybit.com/v5"
-    assert NEWSAPI_URL == "https://newsapi.org/v2"
+    assert GOOGLE_NEWS_RSS_URL == "https://news.google.com/rss/search"
+    assert GROQ_PRIMARY_MODEL == "llama-3.3-70b-versatile"
+    assert GROQ_FALLBACK_MODEL == "llama-3.1-8b-instant"
     assert ARBITRAGE_CONFIDENCE_THRESHOLD == 0.85
     assert LEVEL_CLEARANCE_PCT == 0.015
     assert LEVEL_WINDOW_MINUTES == 10
+    assert NEWS_POLL_INTERVAL == 300
     assert TRADE_SIZE == 10.0
     assert STARTING_BALANCE == 1000.0
     assert "BTC" in SUPPORTED_COINS
