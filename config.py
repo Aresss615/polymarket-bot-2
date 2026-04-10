@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 import os
@@ -18,13 +18,24 @@ GOOGLE_NEWS_RSS_URL = "https://news.google.com/rss/search"
 GROQ_PRIMARY_MODEL = "llama-3.3-70b-versatile"
 GROQ_FALLBACK_MODEL = "llama-3.1-8b-instant"
 
-# --- Strategy Settings ---
+# --- Crypto UpDown Settings ---
+MIN_SECONDS_TO_CLOSE = 5       # Skip markets closing in <5s
+MAX_SECONDS_TO_CLOSE = 120     # Only target markets closing within 120s
+CRYPTO_NEAR_CERTAIN_UPPER = 0.92  # Skip markets already priced >92%
+CRYPTO_NEAR_CERTAIN_LOWER = 0.08  # Skip markets already priced <8%
+MIN_EDGE = 0.03                # Minimum edge to trade
+MIN_LIQUIDITY = 500            # Minimum liquidity in dollars
+
+# --- Arbitrage Settings ---
 ARBITRAGE_CONFIDENCE_THRESHOLD = 0.85
-LEVEL_CLEARANCE_PCT = 0.015  # 1.5%
-LEVEL_WINDOW_MINUTES = 10
-NEWS_POLL_INTERVAL = 300  # 5 minutes — fits within 70B's 1K RPD limit
-TRADE_SIZE = 10.0  # dollars per paper trade
-STARTING_BALANCE = 1000.0
+NEWS_POLL_INTERVAL = 300  # 5 minutes
+
+# --- Trading Settings ---
+STARTING_BALANCE = 20.0
+BET_FRACTION = 0.10       # risk 10% of balance per trade
+MIN_BET = 1.0             # never bet less than $1
+MAX_BET = 50.0            # never bet more than $50
+TICK_INTERVAL = 10.0      # seconds between ticks (fast for crypto updown)
 
 # --- Supported Coins (ticker -> OKX instrument ID) ---
 SUPPORTED_COINS = {
@@ -66,6 +77,15 @@ class Market:
 
 
 @dataclass
+class UpDownMarket:
+    market: Market
+    coin: str
+    interval_minutes: int
+    seconds_to_close: int
+    up_outcome_index: int  # 0 or 1
+
+
+@dataclass
 class Article:
     title: str
     source: str
@@ -74,18 +94,9 @@ class Article:
 
 
 @dataclass
-class LevelMarket:
-    market: Market
-    coin: str
-    threshold: float
-    direction: str  # "above" or "below"
-    expiry: datetime
-
-
-@dataclass
 class Signal:
     market: Market
-    strategy: str  # "level" or "arbitrage"
+    strategy: str  # "updown" or "arbitrage"
     side: str  # "YES" or "NO"
     confidence: float
     reason: str
@@ -102,3 +113,6 @@ class Trade:
     size: float
     confidence: float
     reason: str
+    status: str = "pending"   # pending, won, lost
+    payout: float = 0.0
+    end_date: datetime | None = None

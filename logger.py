@@ -14,6 +14,9 @@ CSV_FIELDS = [
     "size",
     "confidence",
     "reason",
+    "status",
+    "payout",
+    "end_date",
 ]
 
 
@@ -39,8 +42,35 @@ def log_trade(trade: Trade, path: Path = TRADES_CSV) -> None:
                 f"{trade.size:.2f}",
                 f"{trade.confidence:.2f}",
                 trade.reason,
+                trade.status,
+                f"{trade.payout:.2f}",
+                trade.end_date.isoformat() if trade.end_date else "",
             ]
         )
+
+
+def save_trades(trades: list[Trade], path: Path = TRADES_CSV) -> None:
+    """Rewrite the entire CSV with current trade state."""
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(CSV_FIELDS)
+        for trade in trades:
+            writer.writerow(
+                [
+                    trade.timestamp.isoformat(),
+                    trade.market_slug,
+                    trade.question,
+                    trade.strategy,
+                    trade.side,
+                    f"{trade.entry_price:.4f}",
+                    f"{trade.size:.2f}",
+                    f"{trade.confidence:.2f}",
+                    trade.reason,
+                    trade.status,
+                    f"{trade.payout:.2f}",
+                    trade.end_date.isoformat() if trade.end_date else "",
+                ]
+            )
 
 
 def read_trades(path: Path = TRADES_CSV) -> list[Trade]:
@@ -61,6 +91,13 @@ def read_trades(path: Path = TRADES_CSV) -> list[Trade]:
                     size=float(row["size"]),
                     confidence=float(row["confidence"]),
                     reason=row["reason"],
+                    status=row.get("status", "pending"),
+                    payout=float(row.get("payout", 0)),
+                    end_date=(
+                        datetime.fromisoformat(row["end_date"])
+                        if row.get("end_date")
+                        else None
+                    ),
                 )
             )
     return trades

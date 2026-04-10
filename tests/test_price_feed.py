@@ -1,6 +1,6 @@
 from unittest.mock import patch, MagicMock
 
-from price_feed import get_price_okx, get_price_bybit, get_price
+from price_feed import get_price_okx, get_price_bybit, get_price_coingecko, get_price
 
 
 def _mock_okx_response(price: str):
@@ -14,6 +14,13 @@ def _mock_bybit_response(price: str):
     resp = MagicMock()
     resp.raise_for_status = MagicMock()
     resp.json.return_value = {"result": {"list": [{"lastPrice": price}]}}
+    return resp
+
+
+def _mock_coingecko_response(coin_id: str, price: float):
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.json.return_value = {coin_id: {"usd": price}}
     return resp
 
 
@@ -47,6 +54,24 @@ def test_get_price_bybit_failure(mock_get):
     assert price is None
 
 
+@patch("price_feed.requests.get")
+def test_get_price_coingecko_success(mock_get):
+    mock_get.return_value = _mock_coingecko_response("bitcoin", 84500.0)
+    price = get_price_coingecko("BTC")
+    assert price == 84500.0
+
+
+@patch("price_feed.requests.get")
+def test_get_price_coingecko_failure(mock_get):
+    mock_get.side_effect = Exception("timeout")
+    price = get_price_coingecko("BTC")
+    assert price is None
+
+
+def test_get_price_coingecko_unknown_coin():
+    assert get_price_coingecko("FAKECOIN") is None
+
+
 @patch("price_feed.get_price_okx")
 def test_get_price_uses_okx_first(mock_okx):
     mock_okx.return_value = 84500.5
@@ -61,6 +86,17 @@ def test_get_price_falls_back_to_bybit(mock_okx, mock_bybit):
     mock_bybit.return_value = 84500.5
     price = get_price("BTC")
     assert price == 84500.5
+
+
+@patch("price_feed.get_price_coingecko")
+@patch("price_feed.get_price_bybit")
+@patch("price_feed.get_price_okx")
+def test_get_price_falls_back_to_coingecko(mock_okx, mock_bybit, mock_cg):
+    mock_okx.return_value = None
+    mock_bybit.return_value = None
+    mock_cg.return_value = 84000.0
+    price = get_price("BTC")
+    assert price == 84000.0
 
 
 @patch("price_feed.get_price_okx")

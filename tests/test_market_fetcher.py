@@ -1,17 +1,23 @@
 from unittest.mock import patch, MagicMock
-import json
+from datetime import datetime, timezone, timedelta
 
-from market_fetcher import fetch_active_markets, get_market_price
+from market_fetcher import (
+    fetch_active_markets,
+    find_updown_markets,
+    get_market_price,
+    fetch_resolved_market,
+)
+from config import Market
 
 
 SAMPLE_GAMMA_RESPONSE = [
     {
         "conditionId": "0xabc123",
-        "question": "Will BTC be above $84,000 at 5pm ET?",
-        "slug": "btc-above-84k",
-        "outcomes": '["Yes","No"]',
-        "outcomePrices": '["0.65","0.35"]',
-        "clobTokenIds": '["0xyes","0xno"]',
+        "question": "BTC-USDT Up or Down?",
+        "slug": "btc-updown-5m-12345",
+        "outcomes": '["Up","Down"]',
+        "outcomePrices": '["0.55","0.45"]',
+        "clobTokenIds": '["0xup","0xdown"]',
         "endDate": "2026-04-10T21:00:00Z",
         "active": True,
     },
@@ -41,22 +47,21 @@ def test_fetch_active_markets(mock_get):
     markets = fetch_active_markets()
     assert len(markets) == 2
     assert markets[0].condition_id == "0xabc123"
-    assert markets[0].question == "Will BTC be above $84,000 at 5pm ET?"
-    assert markets[0].outcome_prices == [0.65, 0.35]
-    assert markets[0].token_ids == ["0xyes", "0xno"]
+    assert markets[0].slug == "btc-updown-5m-12345"
+    assert markets[0].outcome_prices == [0.55, 0.45]
+    assert markets[0].token_ids == ["0xup", "0xdown"]
     assert markets[0].end_date is not None
     assert markets[1].slug == "fed-rates"
 
 
 @patch("market_fetcher.requests.get")
 def test_fetch_active_markets_with_list_fields(mock_get):
-    """Gamma API sometimes returns lists instead of JSON strings."""
     data = [
         {
             "conditionId": "0x111",
             "question": "Test?",
             "slug": "test",
-            "outcomes": ["Yes", "No"],
+            "outcomes": ["Up", "Down"],
             "outcomePrices": [0.5, 0.5],
             "clobTokenIds": ["0xa", "0xb"],
             "endDate": "2026-04-10T21:00:00Z",
@@ -83,6 +88,69 @@ def test_fetch_active_markets_skips_bad_data(mock_get):
     assert len(markets) == 1
 
 
+def test_find_updown_markets_matches_slug():
+    now = datetime.now(timezone.utc)
+    m1 = Market(
+        condition_id="0x1",
+        question="BTC Up or Down?",
+        slug="btc-updown-5m-123",
+        outcomes=["Up", "Down"],
+        outcome_prices=[0.55, 0.45],
+        token_ids=["0xa", "0xb"],
+        end_date=now + timedelta(seconds=45),
+        active=True,
+    )
+    m2 = Market(
+        condition_id="0x2",
+        question="Fed rates?",
+        slug="fed-rates",
+        outcomes=["Yes", "No"],
+        outcome_prices=[0.4, 0.6],
+        token_ids=["0xc", "0xd"],
+        end_date=now + timedelta(seconds=60),
+        active=True,
+    )
+    results = find_updown_markets([m1, m2])
+    assert len(results) == 1
+    assert results[0].coin == "BTC"
+    assert results[0].interval_minutes == 5
+
+
+def test_find_updown_markets_respects_time_window():
+    now = datetime.now(timezone.utc)
+    # Too far out (200s > 120s max)
+    m = Market(
+        condition_id="0x3",
+        question="ETH Up or Down?",
+        slug="eth-updown-15m-456",
+        outcomes=["Up", "Down"],
+        outcome_prices=[0.5, 0.5],
+        token_ids=["0xa", "0xb"],
+        end_date=now + timedelta(seconds=200),
+        active=True,
+    )
+    results = find_updown_markets([m])
+    assert len(results) == 0
+
+
+def test_find_updown_detects_interval():
+    now = datetime.now(timezone.utc)
+    m = Market(
+        condition_id="0x4",
+        question="SOL Up or Down?",
+        slug="sol-updown-15m-789",
+        outcomes=["Up", "Down"],
+        outcome_prices=[0.5, 0.5],
+        token_ids=["0xa", "0xb"],
+        end_date=now + timedelta(seconds=60),
+        active=True,
+    )
+    results = find_updown_markets([m])
+    assert len(results) == 1
+    assert results[0].interval_minutes == 15
+    assert results[0].coin == "SOL"
+
+
 @patch("market_fetcher.requests.get")
 def test_get_market_price_success(mock_get):
     resp = MagicMock()
@@ -98,3 +166,58 @@ def test_get_market_price_failure(mock_get):
     mock_get.side_effect = Exception("timeout")
     price = get_market_price("0xtoken_yes")
     assert price is None
+
+
+@patch("market_fetcher.requests.get")
+def test_fetch_resolved_market_detects_near_boundary_resolution(mock_get):
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.json.return_value = [
+        {
+            "outcomes": '["Up","Down"]',
+            "outcomePrices": '["0.9999","0.0001"]',
+        }
+    ]
+    mock_get.return_value = resp
+
+    resolved = fetch_resolved_market("btc-updown-5m-123")
+    assert resolved is not None
+    assert resolved["outcomes"] == ["Up", "Down"]
+
+
+@patch("market_fetcher.requests.get")
+def test_fetch_resolved_market_returns_none_when_not_resolved(mock_get):
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.json.return_value = [
+        {
+            "outcomes": '["Up","Down"]',
+            "outcomePrices": '["0.73","0.27"]',
+        }
+    ]
+    mock_get.return_value = resp
+
+    assert fetch_resolved_market("btc-updown-5m-123") is None
+
+
+@patch("market_fetcher.requests.get")
+def test_fetch_resolved_market_checks_closed_variants(mock_get):
+    first = MagicMock()
+    first.raise_for_status = MagicMock()
+    first.json.return_value = []  # default slug lookup returns nothing
+
+    second = MagicMock()
+    second.raise_for_status = MagicMock()
+    second.json.return_value = [
+        {
+            "outcomes": '["Up","Down"]',
+            "outcomePrices": '["0.0000","1.0000"]',
+        }
+    ]
+
+    mock_get.side_effect = [first, second]
+    resolved = fetch_resolved_market("btc-updown-5m-123")
+
+    assert resolved is not None
+    assert resolved["outcome_prices"] == [0.0, 1.0]
+    assert mock_get.call_count >= 2

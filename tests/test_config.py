@@ -2,8 +2,8 @@ from datetime import datetime, timezone
 
 from config import (
     Market,
+    UpDownMarket,
     Article,
-    LevelMarket,
     Signal,
     Trade,
     GAMMA_API_URL,
@@ -15,9 +15,11 @@ from config import (
     GROQ_FALLBACK_MODEL,
     SUPPORTED_COINS,
     ARBITRAGE_CONFIDENCE_THRESHOLD,
-    LEVEL_CLEARANCE_PCT,
-    LEVEL_WINDOW_MINUTES,
-    TRADE_SIZE,
+    MIN_SECONDS_TO_CLOSE,
+    MAX_SECONDS_TO_CLOSE,
+    BET_FRACTION,
+    MIN_BET,
+    MAX_BET,
     STARTING_BALANCE,
     NEWS_POLL_INTERVAL,
 )
@@ -26,17 +28,34 @@ from config import (
 def test_market_dataclass():
     m = Market(
         condition_id="0xabc",
-        question="Will BTC be above $84,000?",
-        slug="btc-above-84k",
-        outcomes=["Yes", "No"],
-        outcome_prices=[0.65, 0.35],
-        token_ids=["0xyes", "0xno"],
+        question="BTC-USDT Up or Down?",
+        slug="btc-updown-5m-123",
+        outcomes=["Up", "Down"],
+        outcome_prices=[0.55, 0.45],
+        token_ids=["0xup", "0xdown"],
         end_date=datetime(2026, 4, 10, 21, 0, tzinfo=timezone.utc),
         active=True,
     )
     assert m.condition_id == "0xabc"
-    assert m.outcome_prices[0] == 0.65
+    assert m.outcome_prices[0] == 0.55
     assert m.active is True
+
+
+def test_updown_market_dataclass():
+    m = Market(
+        condition_id="0x1",
+        question="BTC Up or Down?",
+        slug="btc-updown-5m-1",
+        outcomes=["Up", "Down"],
+        outcome_prices=[0.5, 0.5],
+        token_ids=["0xa", "0xb"],
+        end_date=datetime(2026, 4, 10, 21, 0, tzinfo=timezone.utc),
+        active=True,
+    )
+    udm = UpDownMarket(market=m, coin="BTC", interval_minutes=5, seconds_to_close=45, up_outcome_index=0)
+    assert udm.coin == "BTC"
+    assert udm.interval_minutes == 5
+    assert udm.up_outcome_index == 0
 
 
 def test_article_dataclass():
@@ -61,8 +80,8 @@ def test_signal_dataclass():
         end_date=None,
         active=True,
     )
-    s = Signal(market=m, strategy="level", side="YES", confidence=0.95, reason="test")
-    assert s.strategy == "level"
+    s = Signal(market=m, strategy="updown", side="YES", confidence=0.95, reason="test")
+    assert s.strategy == "updown"
     assert s.confidence == 0.95
 
 
@@ -71,15 +90,35 @@ def test_trade_dataclass():
         timestamp=datetime.now(timezone.utc),
         market_slug="test",
         question="Test?",
-        strategy="level",
+        strategy="updown",
         side="YES",
-        entry_price=0.65,
+        entry_price=0.55,
         size=10.0,
         confidence=0.95,
         reason="test reason",
     )
     assert t.size == 10.0
-    assert t.entry_price == 0.65
+    assert t.entry_price == 0.55
+    assert t.status == "pending"
+    assert t.payout == 0.0
+
+
+def test_trade_settlement_fields():
+    t = Trade(
+        timestamp=datetime.now(timezone.utc),
+        market_slug="test",
+        question="Test?",
+        strategy="updown",
+        side="YES",
+        entry_price=0.60,
+        size=10.0,
+        confidence=0.9,
+        reason="test",
+        status="won",
+        payout=16.67,
+    )
+    assert t.status == "won"
+    assert t.payout == 16.67
 
 
 def test_constants():
@@ -91,10 +130,12 @@ def test_constants():
     assert GROQ_PRIMARY_MODEL == "llama-3.3-70b-versatile"
     assert GROQ_FALLBACK_MODEL == "llama-3.1-8b-instant"
     assert ARBITRAGE_CONFIDENCE_THRESHOLD == 0.85
-    assert LEVEL_CLEARANCE_PCT == 0.015
-    assert LEVEL_WINDOW_MINUTES == 10
+    assert MIN_SECONDS_TO_CLOSE == 5
+    assert MAX_SECONDS_TO_CLOSE == 120
     assert NEWS_POLL_INTERVAL == 300
-    assert TRADE_SIZE == 10.0
-    assert STARTING_BALANCE == 1000.0
+    assert BET_FRACTION == 0.10
+    assert MIN_BET == 1.0
+    assert MAX_BET == 50.0
+    assert STARTING_BALANCE == 20.0
     assert "BTC" in SUPPORTED_COINS
     assert SUPPORTED_COINS["BTC"] == "BTC-USDT"

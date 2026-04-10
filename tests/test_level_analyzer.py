@@ -1,182 +1,96 @@
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
-from config import Market, LevelMarket, Signal, LEVEL_CLEARANCE_PCT, LEVEL_WINDOW_MINUTES
-from level_analyzer import parse_level_market, find_level_markets, analyze_level_opportunity
-
-
-# --- parse_level_market tests ---
+from config import Market, UpDownMarket
+from level_analyzer import analyze_updown_market
 
 
-def test_parse_btc_above(sample_market):
-    """sample_market question: 'Will BTC be above $84,000 at 5pm ET on April 10?'"""
-    lm = parse_level_market(sample_market)
-    assert lm is not None
-    assert lm.coin == "BTC"
-    assert lm.threshold == 84000.0
-    assert lm.direction == "above"
-    assert lm.expiry == sample_market.end_date
-
-
-def test_parse_eth_below():
+def _make_updown(coin="BTC", up_price=0.60, down_price=0.40, secs=45, up_idx=0):
+    outcomes = ["Up", "Down"] if up_idx == 0 else ["Down", "Up"]
+    prices = [up_price, down_price] if up_idx == 0 else [down_price, up_price]
     m = Market(
         condition_id="0x1",
-        question="Will ETH be below $1,800 at 12pm ET on April 11?",
-        slug="eth-below-1800",
-        outcomes=["Yes", "No"],
-        outcome_prices=[0.3, 0.7],
-        token_ids=["0xa", "0xb"],
-        end_date=datetime(2026, 4, 11, 16, 0, tzinfo=timezone.utc),
-        active=True,
-    )
-    lm = parse_level_market(m)
-    assert lm is not None
-    assert lm.coin == "ETH"
-    assert lm.threshold == 1800.0
-    assert lm.direction == "below"
-
-
-def test_parse_sol_with_decimals():
-    m = Market(
-        condition_id="0x2",
-        question="Will SOL be above $130.50 at 3pm ET?",
-        slug="sol-above-130",
-        outcomes=["Yes", "No"],
-        outcome_prices=[0.5, 0.5],
-        token_ids=["0xa", "0xb"],
-        end_date=datetime(2026, 4, 10, 19, 0, tzinfo=timezone.utc),
-        active=True,
-    )
-    lm = parse_level_market(m)
-    assert lm is not None
-    assert lm.coin == "SOL"
-    assert lm.threshold == 130.50
-
-
-def test_parse_non_level_market(sample_non_level_market):
-    """'Will the Fed raise rates in April?' — not a level market."""
-    lm = parse_level_market(sample_non_level_market)
-    assert lm is None
-
-
-def test_parse_no_end_date():
-    m = Market(
-        condition_id="0x3",
-        question="Will BTC be above $80,000 at 5pm ET?",
-        slug="btc-80k",
-        outcomes=["Yes", "No"],
-        outcome_prices=[0.5, 0.5],
-        token_ids=["0xa", "0xb"],
-        end_date=None,
-        active=True,
-    )
-    lm = parse_level_market(m)
-    assert lm is None
-
-
-def test_parse_with_comma_in_price():
-    m = Market(
-        condition_id="0x4",
-        question="Will BTC be above $100,000 at 5pm ET?",
-        slug="btc-100k",
-        outcomes=["Yes", "No"],
-        outcome_prices=[0.5, 0.5],
+        question=f"{coin}-USDT Up or Down?",
+        slug=f"{coin.lower()}-updown-5m-123",
+        outcomes=outcomes,
+        outcome_prices=prices,
         token_ids=["0xa", "0xb"],
         end_date=datetime(2026, 4, 10, 21, 0, tzinfo=timezone.utc),
         active=True,
     )
-    lm = parse_level_market(m)
-    assert lm is not None
-    assert lm.threshold == 100000.0
+    return UpDownMarket(market=m, coin=coin, interval_minutes=5, seconds_to_close=secs, up_outcome_index=up_idx)
 
 
-# --- find_level_markets tests ---
-
-
-def test_find_level_markets(sample_market, sample_non_level_market):
-    results = find_level_markets([sample_market, sample_non_level_market])
-    assert len(results) == 1
-    assert results[0].coin == "BTC"
-
-
-def test_find_level_markets_empty():
-    assert find_level_markets([]) == []
-
-
-# --- analyze_level_opportunity tests ---
-
-
-def test_signal_yes_when_price_above_threshold(sample_level_market):
-    """BTC at $86,000 is 2.4% above $84,000 threshold — should signal YES."""
-    now = sample_level_market.expiry - timedelta(minutes=5)
-    signal = analyze_level_opportunity(sample_level_market, 86000.0, now=now)
+def test_signal_yes_when_market_favors_up():
+    """UP at 0.60 -> model boosts to 0.65, edge +5% -> YES."""
+    udm = _make_updown(up_price=0.60, down_price=0.40)
+    signal = analyze_updown_market(udm)
     assert signal is not None
     assert signal.side == "YES"
-    assert signal.strategy == "level"
+    assert signal.strategy == "updown"
     assert signal.confidence > 0
 
 
-def test_signal_no_when_price_below_threshold(sample_level_market):
-    """BTC at $82,000 is 2.4% below $84,000 threshold — should signal NO."""
-    now = sample_level_market.expiry - timedelta(minutes=5)
-    signal = analyze_level_opportunity(sample_level_market, 82000.0, now=now)
+def test_signal_no_when_market_favors_down():
+    """UP at 0.40 -> model pushes to 0.35, edge on YES is -5% -> NO."""
+    udm = _make_updown(up_price=0.40, down_price=0.60)
+    signal = analyze_updown_market(udm)
     assert signal is not None
     assert signal.side == "NO"
 
 
-def test_no_signal_when_too_close_to_threshold(sample_level_market):
-    """BTC at $84,500 is only 0.6% above $84,000 — below 1.5% clearance."""
-    now = sample_level_market.expiry - timedelta(minutes=5)
-    signal = analyze_level_opportunity(sample_level_market, 84500.0, now=now)
+def test_no_signal_at_50_50():
+    """Market at 50/50 -> no direction, no edge."""
+    udm = _make_updown(up_price=0.50, down_price=0.50)
+    signal = analyze_updown_market(udm)
     assert signal is None
 
 
-def test_no_signal_when_too_far_from_expiry(sample_level_market):
-    """More than 10 minutes to expiry — too early."""
-    now = sample_level_market.expiry - timedelta(minutes=30)
-    signal = analyze_level_opportunity(sample_level_market, 86000.0, now=now)
+def test_no_signal_when_near_certain_high():
+    """UP at 0.95 -> skip, no room for edge."""
+    udm = _make_updown(up_price=0.95, down_price=0.05)
+    signal = analyze_updown_market(udm)
     assert signal is None
 
 
-def test_no_signal_after_expiry(sample_level_market):
-    """Market already expired."""
-    now = sample_level_market.expiry + timedelta(minutes=5)
-    signal = analyze_level_opportunity(sample_level_market, 86000.0, now=now)
+def test_no_signal_when_near_certain_low():
+    """UP at 0.05 -> skip, no room for edge."""
+    udm = _make_updown(up_price=0.05, down_price=0.95)
+    signal = analyze_updown_market(udm)
     assert signal is None
 
 
-def test_below_direction_yes():
-    """'Will ETH be below $2000' — ETH at $1900 should signal YES."""
-    m = Market(
-        condition_id="0x5",
-        question="Will ETH be below $2,000 at 5pm ET?",
-        slug="eth-below-2k",
-        outcomes=["Yes", "No"],
-        outcome_prices=[0.5, 0.5],
-        token_ids=["0xa", "0xb"],
-        end_date=datetime(2026, 4, 10, 21, 0, tzinfo=timezone.utc),
-        active=True,
-    )
-    lm = LevelMarket(market=m, coin="ETH", threshold=2000.0, direction="below", expiry=m.end_date)
-    now = lm.expiry - timedelta(minutes=5)
-    signal = analyze_level_opportunity(lm, 1900.0, now=now)
-    assert signal is not None
-    assert signal.side == "YES"
-
-
-def test_below_direction_no():
-    """'Will ETH be below $2000' — ETH at $2100 should signal NO."""
-    m = Market(
-        condition_id="0x6",
-        question="Will ETH be below $2,000 at 5pm ET?",
-        slug="eth-below-2k",
-        outcomes=["Yes", "No"],
-        outcome_prices=[0.5, 0.5],
-        token_ids=["0xa", "0xb"],
-        end_date=datetime(2026, 4, 10, 21, 0, tzinfo=timezone.utc),
-        active=True,
-    )
-    lm = LevelMarket(market=m, coin="ETH", threshold=2000.0, direction="below", expiry=m.end_date)
-    now = lm.expiry - timedelta(minutes=5)
-    signal = analyze_level_opportunity(lm, 2100.0, now=now)
+def test_inverted_up_index():
+    """When UP is at index 1, prices are read correctly."""
+    # outcomes=["Down", "Up"], prices=[0.40, 0.60], up_idx=1
+    # yes_price=0.40, implied_up=1-0.40=0.60 -> boost to 0.65
+    # model_yes_prob=1-0.65=0.35, edge=0.35-0.40=-0.05 -> NO
+    udm = _make_updown(up_price=0.60, down_price=0.40, up_idx=1)
+    signal = analyze_updown_market(udm)
     assert signal is not None
     assert signal.side == "NO"
+
+
+def test_signal_includes_reason():
+    udm = _make_updown(up_price=0.60, down_price=0.40)
+    signal = analyze_updown_market(udm)
+    assert signal is not None
+    assert "BTC" in signal.reason
+    assert "UP" in signal.reason
+    assert "45s" in signal.reason
+
+
+def test_no_signal_insufficient_prices():
+    """Market with only one price -> skip."""
+    m = Market(
+        condition_id="0x2",
+        question="BTC Up or Down?",
+        slug="btc-updown-5m-456",
+        outcomes=["Up"],
+        outcome_prices=[0.60],
+        token_ids=["0xa"],
+        end_date=datetime(2026, 4, 10, 21, 0, tzinfo=timezone.utc),
+        active=True,
+    )
+    udm = UpDownMarket(market=m, coin="BTC", interval_minutes=5, seconds_to_close=45, up_outcome_index=0)
+    signal = analyze_updown_market(udm)
+    assert signal is None
