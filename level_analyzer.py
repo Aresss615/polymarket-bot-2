@@ -82,6 +82,6 @@ def analyze_level_opportunity(
         market=level_market.market,
         strategy="level",
         side=side,
-        confidence=min(clearance / LEVEL_CLEARANCE_PCT, 1.0),
+        confidence=min(clearance / (LEVEL_CLEARANCE_PCT * 3), 1.0),
         reason=reason,
     )

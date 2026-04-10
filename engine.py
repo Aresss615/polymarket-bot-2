@@ -87,19 +87,25 @@ class Engine:
 
         # Check level markets every tick
         self.status = "Checking level markets"
-        for signal in self.check_level_markets():
-            trade = self._try_execute(signal)
-            if trade:
-                new_trades.append(trade)
-
-        # Check news on interval
-        if now - self.last_news_poll >= NEWS_POLL_INTERVAL:
-            self.status = "Checking news arbitrage"
-            self.last_news_poll = now
-            for signal in self.check_arbitrage():
+        try:
+            for signal in self.check_level_markets():
                 trade = self._try_execute(signal)
                 if trade:
                     new_trades.append(trade)
+        except Exception:
+            self.status = "Level check error"
+
+        # Check news on interval
+        if now - self.last_news_poll >= NEWS_POLL_INTERVAL:
+            self.last_news_poll = now
+            self.status = "Checking news arbitrage"
+            try:
+                for signal in self.check_arbitrage():
+                    trade = self._try_execute(signal)
+                    if trade:
+                        new_trades.append(trade)
+            except Exception:
+                self.status = "Arbitrage check error"
 
         self.status = "Idle"
         return new_trades
