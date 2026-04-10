@@ -9,7 +9,7 @@ from config import (
     NEWS_POLL_INTERVAL,
 )
 from market_fetcher import fetch_active_markets
-from news_fetcher import fetch_all_news
+from news_fetcher import fetch_google_news
 from price_feed import get_price
 from level_analyzer import find_level_markets, analyze_level_opportunity
 from arbitrage_analyzer import analyze_headlines
@@ -71,7 +71,7 @@ class Engine:
         return signals
 
     def check_arbitrage(self) -> list[Signal]:
-        articles = fetch_all_news()
+        articles = fetch_google_news()
         if not articles:
             return []
         return analyze_headlines(articles, self.markets)
