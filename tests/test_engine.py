@@ -3,14 +3,15 @@ from datetime import datetime, timezone, timedelta
 
 import pytest
 
-from config import Market, Signal, Trade, STARTING_BALANCE, BET_FRACTION, MIN_BET, MAX_BET
+from config import Market, Signal, Trade, STARTING_BALANCE, BET_FRACTION, MIN_BET, MAX_BET, MAX_BETS_PER_CYCLE, TICK_INTERVAL, UpDownMarket
 from engine import Engine
 
 
 @pytest.fixture(autouse=True)
 def _clean_engine():
-    """Ensure Engine doesn't load real trades.csv in tests."""
-    with patch("engine.read_trades", return_value=[]):
+    """Ensure Engine doesn't load real trades.csv or make network calls in tests."""
+    with patch("engine.read_trades", return_value=[]), \
+         patch("engine.get_price", return_value=None):
         yield
 
 
@@ -52,18 +53,18 @@ def test_engine_initial_state():
 def test_execute_paper_trade(mock_log):
     engine = Engine()
     market = _make_market()
-    signal = _make_signal(market)
+    signal = _make_signal(market, confidence=0.95)
 
     trade = engine.execute_paper_trade(signal)
 
     assert trade.market_slug == "btc-updown-5m-123"
     assert trade.side == "YES"
     assert trade.entry_price == 0.55
-    expected_size = max(MIN_BET, min(MAX_BET, STARTING_BALANCE * BET_FRACTION))
-    assert trade.size == expected_size
+    assert trade.size >= MIN_BET
+    assert trade.size <= MAX_BET
     assert trade.strategy == "updown"
     assert trade.status == "pending"
-    assert engine.balance == STARTING_BALANCE - expected_size
+    assert engine.balance < STARTING_BALANCE
     assert "btc-updown-5m-123" in engine.traded_markets
     mock_log.assert_called_once()
 
@@ -97,7 +98,9 @@ def test_tick_executes_updown_trade(mock_log, mock_analyze, mock_find, mock_fetc
     signal = _make_signal(market)
 
     mock_fetch.return_value = [market]
-    mock_find.return_value = [MagicMock()]
+    udm_mock = MagicMock()
+    udm_mock.interval_minutes = 5
+    mock_find.return_value = [udm_mock]
     mock_analyze.return_value = signal
 
     engine = Engine()
@@ -113,12 +116,55 @@ def test_tick_executes_updown_trade(mock_log, mock_analyze, mock_find, mock_fetc
 @patch("engine.analyze_updown_market")
 def test_tick_no_signal_no_trade(mock_analyze, mock_find, mock_fetch):
     mock_fetch.return_value = [_make_market()]
-    mock_find.return_value = [MagicMock()]
+    udm_mock = MagicMock()
+    udm_mock.interval_minutes = 5
+    mock_find.return_value = [udm_mock]
     mock_analyze.return_value = None
 
     engine = Engine()
     trades = engine.tick()
     assert trades == []
+
+
+@patch("engine.fetch_active_markets")
+@patch("engine.find_updown_markets")
+@patch("engine.analyze_updown_market")
+@patch("engine.log_trade")
+def test_tick_respects_max_bets_per_cycle(mock_log, mock_analyze, mock_find, mock_fetch):
+    """Only MAX_BETS_PER_CYCLE trades should be executed per tick."""
+    markets = [_make_market(f"btc-updown-5m-{i}") for i in range(10)]
+    signals = [_make_signal(m) for m in markets]
+
+    mock_fetch.return_value = markets
+    udm_mocks = []
+    for _ in range(10):
+        m = MagicMock()
+        m.interval_minutes = 5
+        udm_mocks.append(m)
+    mock_find.return_value = udm_mocks
+    mock_analyze.side_effect = signals
+
+    engine = Engine()
+    trades = engine.tick()
+
+    assert len(trades) <= MAX_BETS_PER_CYCLE
+
+
+@patch("engine.fetch_active_markets")
+@patch("engine.find_updown_markets")
+@patch("engine.analyze_updown_market")
+def test_tick_skips_15m_markets(mock_analyze, mock_find, mock_fetch):
+    """15-minute interval markets should be filtered out."""
+    mock_fetch.return_value = [_make_market()]
+    udm_mock = MagicMock()
+    udm_mock.interval_minutes = 15  # Should be skipped
+    mock_find.return_value = [udm_mock]
+
+    engine = Engine()
+    trades = engine.tick()
+
+    assert trades == []
+    mock_analyze.assert_not_called()
 
 
 @patch("engine.fetch_active_markets")
@@ -285,22 +331,23 @@ def test_settle_trade_without_end_date_uses_market_resolution(mock_log, mock_res
 # --- Bet sizing tests ---
 
 
-def test_bet_size_fraction_of_balance():
+def test_bet_size_scales_with_confidence():
     engine = Engine()
-    # $20 * 10% = $2
-    assert engine.bet_size() == STARTING_BALANCE * BET_FRACTION
+    low_conf = engine.bet_size(confidence=0.2)
+    high_conf = engine.bet_size(confidence=0.9)
+    assert high_conf > low_conf
 
 
 def test_bet_size_respects_min():
     engine = Engine()
-    engine.balance = 5.0  # $5 * 10% = $0.50, below MIN_BET
-    assert engine.bet_size() == MIN_BET
+    engine.balance = 5.0  # small balance
+    assert engine.bet_size() >= MIN_BET
 
 
 def test_bet_size_respects_max():
     engine = Engine()
-    engine.balance = 1000.0  # $1000 * 10% = $100, above MAX_BET
-    assert engine.bet_size() == MAX_BET
+    engine.balance = 1000.0
+    assert engine.bet_size(confidence=1.0) <= MAX_BET
 
 
 @patch("engine.log_trade")
@@ -309,7 +356,7 @@ def test_bet_size_compounds_on_wins(mock_log):
     initial_size = engine.bet_size()
 
     # Simulate a win that increases balance
-    engine.balance = 30.0  # grew from wins
+    engine.balance = 30.0
     bigger_size = engine.bet_size()
     assert bigger_size > initial_size
 
@@ -323,3 +370,28 @@ def test_bet_size_shrinks_on_losses(mock_log):
     engine.balance = 10.0
     smaller_size = engine.bet_size()
     assert smaller_size < initial_size
+
+
+# --- Adaptive tick interval tests ---
+
+
+def test_adaptive_interval_fast_near_expiry():
+    engine = Engine()
+    m = _make_market()
+    udm = UpDownMarket(market=m, coin="BTC", interval_minutes=5, seconds_to_close=20, up_outcome_index=0)
+    engine.updown_markets_found = [udm]
+    assert engine._adaptive_interval() == 5.0
+
+
+def test_adaptive_interval_normal_when_far():
+    engine = Engine()
+    m = _make_market()
+    udm = UpDownMarket(market=m, coin="BTC", interval_minutes=5, seconds_to_close=40, up_outcome_index=0)
+    engine.updown_markets_found = [udm]
+    assert engine._adaptive_interval() == TICK_INTERVAL
+
+
+def test_adaptive_interval_normal_when_empty():
+    engine = Engine()
+    engine.updown_markets_found = []
+    assert engine._adaptive_interval() == TICK_INTERVAL

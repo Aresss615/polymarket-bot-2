@@ -12,6 +12,7 @@ from config import (
     MIN_SECONDS_TO_CLOSE,
     MAX_SECONDS_TO_CLOSE,
     MIN_LIQUIDITY,
+    UPDOWN_INTERVAL_FILTER,
 )
 
 UPDOWN_SLUG_RE = re.compile(
@@ -136,32 +137,34 @@ def fetch_resolved_market(slug: str) -> dict | None:
     """Fetch a market by slug and return resolution info.
 
     Returns dict with 'outcomes' and 'outcome_prices' if the market
-    is resolved (prices are exactly 0/1), or None if not yet resolved.
+    is resolved (prices are effectively 0/1), or None if not yet resolved.
+
+    Uses a single query without active/closed filters — Gamma returns the
+    market regardless of state when queried by slug. This avoids the old
+    6-variant sequential approach that could block for 60s per trade.
     """
-    query_variants = [
-        {"slug": slug},
-        {"slug": slug, "active": "false"},
-        {"slug": slug, "closed": "true"},
-        {"slug": slug, "active": "false", "closed": "true"},
-        {"slug": slug, "archived": "true"},
-        {"slug": slug, "active": "false", "closed": "true", "archived": "true"},
-    ]
     try:
-        market = None
-        for params in query_variants:
+        resp = requests.get(
+            f"{GAMMA_API_URL}/markets",
+            params={"slug": slug},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        if not isinstance(data, list) or not data:
+            # Fallback: try with closed=true if slug query returned nothing
             resp = requests.get(
                 f"{GAMMA_API_URL}/markets",
-                params=params,
-                timeout=10,
+                params={"slug": slug, "closed": "true"},
+                timeout=5,
             )
             resp.raise_for_status()
             data = resp.json()
-            if isinstance(data, list) and data:
-                market = data[0]
-                break
+            if not isinstance(data, list) or not data:
+                return None
 
-        if market is None:
-            return None
+        market = data[0]
 
         prices_raw = _parse_json_or_list(market.get("outcomePrices", "[]"))
         prices = [float(p) for p in prices_raw]
@@ -172,13 +175,16 @@ def fetch_resolved_market(slug: str) -> dict | None:
             return None
 
         # Market is resolved when one side is effectively 1 and the other 0.
-        # Gamma can occasionally surface tiny float noise around boundaries.
+        # Use a relaxed threshold to catch Gamma's intermediate indexing state
+        # where prices may briefly show 0.98/0.02 before snapping to 1.0/0.0.
         hi = max(prices[0], prices[1])
         lo = min(prices[0], prices[1])
-        is_resolved = hi >= 0.999 and lo <= 0.001
+        is_resolved = hi >= 0.95 and lo <= 0.05
         if not is_resolved:
             return None
 
-        return {"outcomes": outcomes, "outcome_prices": prices}
+        # Snap to clean 1.0/0.0 for consistent downstream handling
+        snapped = [1.0 if p == hi else 0.0 for p in prices]
+        return {"outcomes": outcomes, "outcome_prices": snapped}
     except Exception:
         return None

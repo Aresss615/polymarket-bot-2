@@ -11,12 +11,16 @@ from config import (
     MAX_BET,
     NEWS_POLL_INTERVAL,
     TICK_INTERVAL,
+    MAX_BETS_PER_CYCLE,
+    UPDOWN_INTERVAL_FILTER,
+    SUPPORTED_COINS,
 )
 from market_fetcher import fetch_active_markets, find_updown_markets, fetch_resolved_market
 from news_fetcher import fetch_google_news
 from level_analyzer import analyze_updown_market
 from arbitrage_analyzer import analyze_headlines
 from logger import log_trade, read_trades, save_trades
+from price_feed import get_price
 
 
 class Engine:
@@ -71,9 +75,15 @@ class Engine:
     def total_pnl(self) -> float:
         return sum(t.payout - t.size for t in self.trades if t.status != "pending")
 
-    def bet_size(self) -> float:
-        """Compute bet size: fraction of balance, clamped to [MIN_BET, MAX_BET]."""
-        raw = self.balance * BET_FRACTION
+    def bet_size(self, confidence: float = 0.5) -> float:
+        """Compute bet size using exponential confidence scaling.
+
+        Uses confidence^1.5 to create steep differentiation:
+        conf 0.20 → ~3.6% of balance, conf 0.40 → ~10%, conf 0.60 → ~19%.
+        This concentrates capital on the highest-conviction trades.
+        """
+        kelly_fraction = BET_FRACTION * (confidence ** 1.5) * 4
+        raw = self.balance * kelly_fraction
         return max(MIN_BET, min(MAX_BET, raw))
 
     def execute_paper_trade(self, signal: Signal) -> Trade:
@@ -84,7 +94,7 @@ class Engine:
             else 0.5
         )
 
-        size = self.bet_size()
+        size = self.bet_size(signal.confidence)
         trade = Trade(
             timestamp=datetime.now(timezone.utc),
             market_slug=signal.market.slug,
@@ -105,26 +115,35 @@ class Engine:
 
     def _try_execute(self, signal: Signal) -> Trade | None:
         if signal.market.slug in self.traded_markets:
+            self._log(f"  Skip (already traded): {signal.market.slug}")
             return None
         if self.balance < MIN_BET:
+            self._log(f"  Skip (balance ${self.balance:.2f} < min ${MIN_BET})")
             return None
         return self.execute_paper_trade(signal)
 
-    def settle_trades(self):
+    def settle_trades(self, max_checks: int = 3):
         """Settle pending trades whose markets have been resolved on Polymarket.
 
         Queries the Gamma API for each pending trade's market to check
         if it has been resolved (outcome prices are exactly 1/0).
+        Caps API calls per tick to avoid blocking the trading loop.
         """
         now = datetime.now(timezone.utc)
         settled = False
+        api_calls = 0
         for trade in self.trades:
             if trade.status != "pending":
                 continue
             if trade.end_date is not None:
-                # Wait at least 30s past expiry before checking resolution
-                if (now - trade.end_date).total_seconds() < 30:
+                # Wait at least 10s past expiry for Gamma to index
+                # Chainlink settles in ~1-5s, Gamma indexes in ~5-15s
+                if (now - trade.end_date).total_seconds() < 10:
                     continue
+
+            if api_calls >= max_checks:
+                break  # remaining pending trades checked next tick
+            api_calls += 1
 
             resolved = fetch_resolved_market(trade.market_slug)
             if resolved is None:
@@ -173,9 +192,14 @@ class Engine:
     def check_updown_markets(self) -> list[Signal]:
         signals = []
         for udm in self.updown_markets_found:
+            # Skip non-5m intervals (15m has lower WR)
+            if udm.interval_minutes != UPDOWN_INTERVAL_FILTER:
+                continue
             signal = analyze_updown_market(udm)
             if signal:
                 signals.append(signal)
+        # Sort by confidence descending — only take the best signals
+        signals.sort(key=lambda s: s.confidence, reverse=True)
         return signals
 
     def check_arbitrage(self) -> list[Signal]:
@@ -185,39 +209,62 @@ class Engine:
             return []
         return analyze_headlines(articles, self.markets)
 
+    def _warm_active_coins(self, coins: set[str]):
+        """Warm price cache only for coins with active updown markets."""
+        for coin in coins:
+            try:
+                get_price(coin)
+            except Exception:
+                pass
+
     def tick(self) -> list[Trade]:
         now = time.time()
         new_trades = []
         self.tick_count += 1
 
+        # === CRITICAL PATH: fetch → warm active coins → analyze → trade ===
+        # Market fetch first — this is the time-sensitive operation
         try:
             self.status = "Fetching markets"
             self.markets = fetch_active_markets()
-            self._log(f"Fetched {len(self.markets)} markets (closing within 120s)")
+            self._log(f"Fetched {len(self.markets)} markets")
         except Exception as e:
             self._log(f"Market fetch error: {e}")
             self.status = "Market fetch error"
             return new_trades
 
-        # Settle expired trades
-        self.settle_trades()
-
-        # Check crypto updown markets every tick
+        # Find updown markets and warm prices ONLY for coins that need analysis
         self.status = "Checking updown markets"
         try:
             self.updown_markets_found = find_updown_markets(self.markets)
             self._log(f"Found {len(self.updown_markets_found)} updown markets")
+
+            # Warm prices only for coins with active markets (not all 16)
+            active_coins = {udm.coin for udm in self.updown_markets_found}
+            if active_coins:
+                self._warm_active_coins(active_coins)
+
             signals = self.check_updown_markets()
             self._log(f"UpDown signals: {len(signals)}")
+            cycle_bets = 0
             for signal in signals:
                 self._log(f"  Signal: {signal.side} on {signal.market.slug} ({signal.confidence:.0%})")
+                if cycle_bets >= MAX_BETS_PER_CYCLE:
+                    self._log(f"  Skipped (max {MAX_BETS_PER_CYCLE} bets/cycle)")
+                    break
                 trade = self._try_execute(signal)
                 if trade:
                     self._log(f"  TRADE: {trade.side} {trade.market_slug} @ ${trade.entry_price:.2f}")
                     new_trades.append(trade)
+                    cycle_bets += 1
         except Exception as e:
             self._log(f"UpDown check error: {e}")
             self.status = "UpDown check error"
+
+        # === NON-CRITICAL PATH: settle, news, background warming ===
+
+        # Settle expired trades (cap per tick to avoid blocking)
+        self.settle_trades()
 
         # Check news on interval
         secs_until_news = max(0, NEWS_POLL_INTERVAL - (now - self.last_news_poll))
@@ -239,14 +286,35 @@ class Engine:
         else:
             self._log(f"Next news poll in {secs_until_news:.0f}s")
 
+        # Background: warm remaining coins for momentum history (non-blocking budget)
+        try:
+            remaining = set(SUPPORTED_COINS.keys()) - {udm.coin for udm in self.updown_markets_found}
+            t0 = time.time()
+            for coin in remaining:
+                if time.time() - t0 > 3.0:  # max 3s for background warming
+                    break
+                get_price(coin)
+        except Exception:
+            pass
+
         self.status = "Idle"
         return new_trades
+
+    def _adaptive_interval(self) -> float:
+        """Shorter tick interval when markets are approaching expiry."""
+        if any(udm.seconds_to_close <= 30 for udm in self.updown_markets_found):
+            return 5.0  # poll faster near expiry
+        return TICK_INTERVAL
 
     def run(self, interval: float = TICK_INTERVAL):
         self.running = True
         while self.running:
+            t0 = time.time()
             self.tick()
-            time.sleep(interval)
+            elapsed = time.time() - t0
+            sleep_time = max(0, self._adaptive_interval() - elapsed)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
 
     def stop(self):
         self.running = False

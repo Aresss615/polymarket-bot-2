@@ -40,7 +40,7 @@ Synchronous engine loop with threading: engine runs in a background thread (10s 
 **Key modules:**
 - `config.py` — All constants, API URLs, thresholds, and dataclass models (Market, UpDownMarket, Article, Signal, Trade)
 - `price_feed.py` — OKX primary, Bybit fallback, CoinGecko fallback for crypto prices
-- `market_fetcher.py` — Polymarket Gamma API with time-windowed fetching (markets closing within 5-120s), slug-based updown detection
+- `market_fetcher.py` — Polymarket Gamma API with time-windowed fetching (markets closing within 5-45s), slug-based updown detection
 - `news_fetcher.py` — Google News RSS via feedparser
 - `arbitrage_analyzer.py` — Calls Groq LLM to match headlines to markets
 - `level_analyzer.py` — Analyzes crypto updown markets using market-implied probability
@@ -56,4 +56,4 @@ Requires `.env` file (see `.env.example`):
 ## Known Issues
 
 - OKX and Bybit APIs have SSL cert issues on Python 3.14/macOS — price_feed falls back to CoinGecko
-- Crypto updown markets cycle every 5 minutes; the bot only targets the final 120 seconds of each cycle
+- Crypto updown markets cycle every 5 minutes; the bot only targets the final 45 seconds of each cycle (5-45s window, trades placed with ≥15s remaining)

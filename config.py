@@ -20,11 +20,27 @@ GROQ_FALLBACK_MODEL = "llama-3.1-8b-instant"
 
 # --- Crypto UpDown Settings ---
 MIN_SECONDS_TO_CLOSE = 5       # Skip markets closing in <5s
-MAX_SECONDS_TO_CLOSE = 120     # Only target markets closing within 120s
-CRYPTO_NEAR_CERTAIN_UPPER = 0.92  # Skip markets already priced >92%
-CRYPTO_NEAR_CERTAIN_LOWER = 0.08  # Skip markets already priced <8%
-MIN_EDGE = 0.03                # Minimum edge to trade
+MAX_SECONDS_TO_CLOSE = 45      # Only trade markets closing within 45s (31-45s is the sweet spot)
+MIN_SECONDS_TO_TRADE = 15      # Don't place trades with <15s remaining (execution cutoff)
+CRYPTO_NEAR_CERTAIN_UPPER = 0.88  # Skip markets already priced >88%
+CRYPTO_NEAR_CERTAIN_LOWER = 0.12  # Skip markets already priced <12%
+CRYPTO_SKIP_BAND_LOW = 0.38    # Skip "coin flip" zone: implied 38-62% has no edge
+CRYPTO_SKIP_BAND_HIGH = 0.62
+MIN_EDGE = 0.05                # Minimum edge to trade
 MIN_LIQUIDITY = 500            # Minimum liquidity in dollars
+MAX_BETS_PER_CYCLE = 5         # Max concurrent bets per 5-min cycle (raised: XRP/SOL are profitable)
+UPDOWN_INTERVAL_FILTER = 5     # Only trade 5-minute intervals (skip 15m)
+
+# Per-coin minimum edge overrides — based on historical win rate and profitability
+COIN_MIN_EDGE = {
+    "BTC": 0.15,   # 60% WR, +$10.45 — most efficiently priced, NO side loses money, needs big edge
+    "ETH": 0.08,   # 72% WR, +$22.57 — marginal, tighten filter
+    "DOGE": 0.06,  # 78% WR, +$31.02 — solid performer
+    "HYPE": 0.06,  # 81% WR, +$18.79 — good WR, slight bump from default
+    # XRP: 85% WR, +$68.29 — uses default 0.05, best performer
+    # SOL: 79% WR, +$50.62 — uses default 0.05
+    # BNB: 79% WR, +$36.46 — uses default 0.05
+}
 
 # --- Arbitrage Settings ---
 ARBITRAGE_CONFIDENCE_THRESHOLD = 0.85
@@ -32,7 +48,7 @@ NEWS_POLL_INTERVAL = 300  # 5 minutes
 
 # --- Trading Settings ---
 STARTING_BALANCE = 20.0
-BET_FRACTION = 0.10       # risk 10% of balance per trade
+BET_FRACTION = 0.15       # risk 15% of balance per trade (data supports higher fraction at 72%+ WR)
 MIN_BET = 1.0             # never bet less than $1
 MAX_BET = 50.0            # never bet more than $50
 TICK_INTERVAL = 10.0      # seconds between ticks (fast for crypto updown)

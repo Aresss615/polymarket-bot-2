@@ -142,7 +142,7 @@ def test_find_updown_detects_interval():
         outcomes=["Up", "Down"],
         outcome_prices=[0.5, 0.5],
         token_ids=["0xa", "0xb"],
-        end_date=now + timedelta(seconds=60),
+        end_date=now + timedelta(seconds=30),
         active=True,
     )
     results = find_updown_markets([m])
@@ -183,6 +183,26 @@ def test_fetch_resolved_market_detects_near_boundary_resolution(mock_get):
     resolved = fetch_resolved_market("btc-updown-5m-123")
     assert resolved is not None
     assert resolved["outcomes"] == ["Up", "Down"]
+    # Prices should be snapped to clean 1.0/0.0
+    assert resolved["outcome_prices"] == [1.0, 0.0]
+
+
+@patch("market_fetcher.requests.get")
+def test_fetch_resolved_market_detects_relaxed_threshold(mock_get):
+    """Gamma may briefly show 0.97/0.03 during indexing — should still detect."""
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.json.return_value = [
+        {
+            "outcomes": '["Up","Down"]',
+            "outcomePrices": '["0.97","0.03"]',
+        }
+    ]
+    mock_get.return_value = resp
+
+    resolved = fetch_resolved_market("btc-updown-5m-123")
+    assert resolved is not None
+    assert resolved["outcome_prices"] == [1.0, 0.0]
 
 
 @patch("market_fetcher.requests.get")
@@ -201,10 +221,10 @@ def test_fetch_resolved_market_returns_none_when_not_resolved(mock_get):
 
 
 @patch("market_fetcher.requests.get")
-def test_fetch_resolved_market_checks_closed_variants(mock_get):
+def test_fetch_resolved_market_falls_back_to_closed(mock_get):
     first = MagicMock()
     first.raise_for_status = MagicMock()
-    first.json.return_value = []  # default slug lookup returns nothing
+    first.json.return_value = []  # slug-only lookup returns nothing
 
     second = MagicMock()
     second.raise_for_status = MagicMock()
@@ -220,4 +240,4 @@ def test_fetch_resolved_market_checks_closed_variants(mock_get):
 
     assert resolved is not None
     assert resolved["outcome_prices"] == [0.0, 1.0]
-    assert mock_get.call_count >= 2
+    assert mock_get.call_count == 2  # slug, then slug+closed

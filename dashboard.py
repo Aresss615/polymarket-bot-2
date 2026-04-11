@@ -58,7 +58,7 @@ def make_dashboard(engine) -> Layout:
     trades_table.add_column("Market", max_width=28, no_wrap=True)
     trades_table.add_column("Side", width=4)
     trades_table.add_column("Entry", justify="right", width=6)
-    trades_table.add_column("Size", justify="right", width=5)
+    trades_table.add_column("Size", justify="right", width=6)
     trades_table.add_column("Result", width=8)
     trades_table.add_column("P/L", justify="right", width=8)
     trades_table.add_column("Reason", max_width=32, no_wrap=True)
@@ -82,7 +82,7 @@ def make_dashboard(engine) -> Layout:
             t.market_slug[:28],
             Text(t.side, style=side_style),
             f"${t.entry_price:.2f}",
-            f"${t.size:.0f}",
+            f"${t.size:.2f}",
             result_text,
             pl_text,
             t.reason[:32],
