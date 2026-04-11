@@ -133,6 +133,25 @@ def test_find_updown_markets_respects_time_window():
     assert len(results) == 0
 
 
+def test_find_updown_markets_15m_in_window():
+    """15m markets within 120s should be discovered."""
+    now = datetime.now(timezone.utc)
+    m = Market(
+        condition_id="0x5",
+        question="ETH Up or Down?",
+        slug="eth-updown-15m-456",
+        outcomes=["Up", "Down"],
+        outcome_prices=[0.7, 0.3],
+        token_ids=["0xa", "0xb"],
+        end_date=now + timedelta(seconds=90),
+        active=True,
+    )
+    results = find_updown_markets([m])
+    assert len(results) == 1
+    assert results[0].interval_minutes == 15
+    assert results[0].coin == "ETH"
+
+
 def test_find_updown_detects_interval():
     now = datetime.now(timezone.utc)
     m = Market(

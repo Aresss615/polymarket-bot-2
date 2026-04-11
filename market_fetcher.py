@@ -11,8 +11,11 @@ from config import (
     UpDownMarket,
     MIN_SECONDS_TO_CLOSE,
     MAX_SECONDS_TO_CLOSE,
+    MIN_SECONDS_TO_CLOSE_5M,
+    MAX_SECONDS_TO_CLOSE_5M,
+    MIN_SECONDS_TO_CLOSE_15M,
+    MAX_SECONDS_TO_CLOSE_15M,
     MIN_LIQUIDITY,
-    UPDOWN_INTERVAL_FILTER,
 )
 
 UPDOWN_SLUG_RE = re.compile(
@@ -105,7 +108,15 @@ def find_updown_markets(markets: list[Market]) -> list[UpDownMarket]:
         interval = int(match.group(2))
         secs = max(0, int((m.end_date - now).total_seconds()))
 
-        if secs < MIN_SECONDS_TO_CLOSE or secs > MAX_SECONDS_TO_CLOSE:
+        # Per-interval time window
+        if interval == 15:
+            min_secs = MIN_SECONDS_TO_CLOSE_15M
+            max_secs = MAX_SECONDS_TO_CLOSE_15M
+        else:
+            min_secs = MIN_SECONDS_TO_CLOSE_5M
+            max_secs = MAX_SECONDS_TO_CLOSE_5M
+
+        if secs < min_secs or secs > max_secs:
             continue
 
         results.append(
