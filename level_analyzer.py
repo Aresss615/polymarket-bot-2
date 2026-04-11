@@ -22,10 +22,11 @@ from config import (
     CRYPTO_SKIP_BAND_LOW,
     CRYPTO_SKIP_BAND_HIGH,
     MIN_EDGE,
-    MIN_SECONDS_TO_TRADE,
+    MIN_SECONDS_TO_TRADE_5M,
+    MIN_SECONDS_TO_TRADE_15M,
     COIN_MIN_EDGE,
 )
-from price_feed import get_price, get_price_momentum
+from price_feed import get_price, get_price_momentum, is_price_stale
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +44,10 @@ def analyze_updown_market(udm: UpDownMarket) -> tuple[Signal | None, str]:
     if len(market.outcome_prices) < 2:
         return None, f"{coin} skip: <2 outcome prices"
 
+    # Stale data guard — don't trade on outdated price info
+    if is_price_stale(coin, max_age=30.0):
+        return None, f"{coin} skip: price data stale (>30s old)"
+
     # Recompute actual seconds remaining from end_date (the snapshot in
     # udm.seconds_to_close may be stale by the time we get here)
     if market.end_date:
@@ -50,8 +55,11 @@ def analyze_updown_market(udm: UpDownMarket) -> tuple[Signal | None, str]:
     else:
         actual_seconds = udm.seconds_to_close
 
-    if actual_seconds < MIN_SECONDS_TO_TRADE:
-        return None, f"{coin} skip: {actual_seconds:.0f}s left < {MIN_SECONDS_TO_TRADE}s min"
+    # Per-interval minimum time to trade
+    min_seconds = MIN_SECONDS_TO_TRADE_15M if udm.interval_minutes == 15 else MIN_SECONDS_TO_TRADE_5M
+
+    if actual_seconds < min_seconds:
+        return None, f"{coin} skip: {actual_seconds:.0f}s left < {min_seconds}s min"
 
     yes_price = market.outcome_prices[0]
 
@@ -137,8 +145,8 @@ def analyze_updown_market(udm: UpDownMarket) -> tuple[Signal | None, str]:
         side = "NO"
 
     # Confidence scales with edge magnitude and time proximity
-    # Closer to expiry = higher confidence, but cap at MIN_SECONDS_TO_TRADE
-    time_factor = max(0.5, 1.0 - (actual_seconds - MIN_SECONDS_TO_TRADE) / 30.0)  # 1.0 at 15s, 0.5 at 45s
+    # Closer to expiry = higher confidence, but cap at min_seconds
+    time_factor = max(0.5, 1.0 - (actual_seconds - min_seconds) / 30.0)  # 1.0 at min_seconds, 0.5 at min_seconds+30s
     edge_factor = min(abs(edge) / 0.12, 1.0)
     confidence = edge_factor * time_factor
 

@@ -1,8 +1,16 @@
+import pytest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from config import Market, UpDownMarket
 from level_analyzer import analyze_updown_market
+
+
+@pytest.fixture(autouse=True)
+def _mock_price_freshness():
+    """Default: price data is fresh in tests."""
+    with patch("level_analyzer.is_price_stale", return_value=False):
+        yield
 
 
 def _make_updown(coin="BTC", up_price=0.75, down_price=0.25, secs=30, up_idx=0):
@@ -178,3 +186,32 @@ def test_70_80_zone_requires_higher_edge(mock_mom):
     signal, reason = analyze_updown_market(udm)
     assert signal is None  # rejected by 70-80% edge floor
     assert "edge" in reason
+
+
+@patch("level_analyzer.is_price_stale", return_value=True)
+@patch("level_analyzer.get_price_momentum", return_value=0.002)
+def test_skip_when_price_data_stale(mock_mom, mock_stale):
+    """If price data is stale (>30s old), skip the trade."""
+    udm = _make_updown(coin="SOL", up_price=0.82, down_price=0.18)
+    signal, reason = analyze_updown_market(udm)
+    assert signal is None
+    assert "stale" in reason.lower()
+
+
+@patch("level_analyzer.get_price_momentum", return_value=0.002)
+def test_15m_uses_higher_min_seconds(mock_mom):
+    """15m markets use MIN_SECONDS_TO_TRADE_15M (10s), not 5s."""
+    # Create a 15m market with only 8 seconds remaining
+    udm = _make_updown(coin="SOL", up_price=0.82, down_price=0.18, secs=8)
+    from config import UpDownMarket
+    udm_15m = UpDownMarket(
+        market=udm.market,
+        coin="SOL",
+        interval_minutes=15,
+        seconds_to_close=8,
+        up_outcome_index=0,
+    )
+    udm_15m.market.slug = "sol-updown-15m-123"
+    signal, reason = analyze_updown_market(udm_15m)
+    assert signal is None
+    assert "left" in reason  # "8s left < 10s min"
