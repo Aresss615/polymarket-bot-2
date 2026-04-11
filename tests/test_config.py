@@ -131,7 +131,7 @@ def test_constants():
     assert GROQ_FALLBACK_MODEL == "llama-3.1-8b-instant"
     assert ARBITRAGE_CONFIDENCE_THRESHOLD == 0.85
     assert MIN_SECONDS_TO_CLOSE == 5
-    assert MAX_SECONDS_TO_CLOSE == 30
+    assert MAX_SECONDS_TO_CLOSE == 120
     assert NEWS_POLL_INTERVAL == 300
     assert BET_FRACTION == 0.15
     assert MIN_BET == 1.0

@@ -19,9 +19,20 @@ GROQ_PRIMARY_MODEL = "llama-3.3-70b-versatile"
 GROQ_FALLBACK_MODEL = "llama-3.1-8b-instant"
 
 # --- Crypto UpDown Settings ---
-MIN_SECONDS_TO_CLOSE = 5       # Skip markets closing in <5s
-MAX_SECONDS_TO_CLOSE = 30      # Only trade markets closing within 30s (20-30s is the sweet spot)
-MIN_SECONDS_TO_TRADE = 5       # Don't place trades with <5s remaining (execution cutoff)
+# 5-minute markets
+MIN_SECONDS_TO_CLOSE_5M = 5       # Skip markets closing in <5s
+MAX_SECONDS_TO_CLOSE_5M = 45      # Trade 5m markets closing within 45s
+MIN_SECONDS_TO_TRADE_5M = 5       # Don't place trades with <5s remaining
+
+# 15-minute markets — wider window since they're longer duration
+MIN_SECONDS_TO_CLOSE_15M = 10     # Skip markets closing in <10s
+MAX_SECONDS_TO_CLOSE_15M = 120    # Trade 15m markets closing within 2 minutes
+MIN_SECONDS_TO_TRADE_15M = 10     # Higher cutoff — more time needed for execution
+
+# Legacy aliases used by market_fetcher fetch_active_markets (interval-agnostic)
+MIN_SECONDS_TO_CLOSE = 5
+MAX_SECONDS_TO_CLOSE = 120        # Widened to accommodate 15m window
+MIN_SECONDS_TO_TRADE = 5          # Per-interval override happens in analyzer
 CRYPTO_NEAR_CERTAIN_UPPER = 0.88  # Skip markets already priced >88%
 CRYPTO_NEAR_CERTAIN_LOWER = 0.12  # Skip markets already priced <12%
 CRYPTO_SKIP_BAND_LOW = 0.38    # Skip "coin flip" zone: implied 38-62% has no edge
