@@ -40,7 +40,6 @@ CRYPTO_SKIP_BAND_HIGH = 0.62
 MIN_EDGE = 0.05                # Minimum edge to trade
 MIN_LIQUIDITY = 500            # Minimum liquidity in dollars
 MAX_BETS_PER_CYCLE = 5         # Max concurrent bets per 5-min cycle (raised: XRP/SOL are profitable)
-UPDOWN_INTERVAL_FILTER = 5     # Only trade 5-minute intervals (skip 15m)
 
 # Per-coin minimum edge overrides — based on historical win rate and profitability
 COIN_MIN_EDGE = {

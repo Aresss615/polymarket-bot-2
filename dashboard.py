@@ -56,6 +56,7 @@ def make_dashboard(engine) -> Layout:
     trades_table = Table(title="Trades", expand=True)
     trades_table.add_column("Time", width=8)
     trades_table.add_column("Market", max_width=28, no_wrap=True)
+    trades_table.add_column("Type", width=4)
     trades_table.add_column("Side", width=4)
     trades_table.add_column("Entry", justify="right", width=6)
     trades_table.add_column("Size", justify="right", width=6)
@@ -65,6 +66,7 @@ def make_dashboard(engine) -> Layout:
 
     for t in engine.trades[-15:]:
         side_style = "green" if t.side == "YES" else "red"
+        market_type = getattr(t, 'market_type', '5m')
 
         if t.status == "won":
             result_text = Text("WIN", style="bold green")
@@ -80,6 +82,7 @@ def make_dashboard(engine) -> Layout:
         trades_table.add_row(
             t.timestamp.strftime("%H:%M:%S"),
             t.market_slug[:28],
+            market_type,
             Text(t.side, style=side_style),
             f"${t.entry_price:.2f}",
             f"${t.size:.2f}",
@@ -89,7 +92,7 @@ def make_dashboard(engine) -> Layout:
         )
 
     if not engine.trades:
-        trades_table.add_row("—", "No trades yet", "—", "—", "—", "—", "—", "Waiting...")
+        trades_table.add_row("—", "No trades yet", "—", "—", "—", "—", "—", "—", "Waiting...")
 
     # --- Activity Log ---
     log_lines = list(engine.activity_log)[-18:]

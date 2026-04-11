@@ -12,7 +12,6 @@ from config import (
     NEWS_POLL_INTERVAL,
     TICK_INTERVAL,
     MAX_BETS_PER_CYCLE,
-    UPDOWN_INTERVAL_FILTER,
     SUPPORTED_COINS,
 )
 from market_fetcher import fetch_active_markets, find_updown_markets, fetch_resolved_market
