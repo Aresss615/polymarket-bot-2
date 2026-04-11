@@ -30,13 +30,18 @@ from price_feed import get_price, get_price_momentum
 log = logging.getLogger(__name__)
 
 
-def analyze_updown_market(udm: UpDownMarket) -> Signal | None:
+def analyze_updown_market(udm: UpDownMarket) -> tuple[Signal | None, str]:
+    """Analyze an updown market for trading signals.
+
+    Returns (signal, reason) — signal is None if the market is skipped,
+    and reason always explains the decision.
+    """
     market = udm.market
     slug = market.slug
+    coin = udm.coin
 
     if len(market.outcome_prices) < 2:
-        log.debug("[%s] skip: <2 outcome prices", slug)
-        return None
+        return None, f"{coin} skip: <2 outcome prices"
 
     # Recompute actual seconds remaining from end_date (the snapshot in
     # udm.seconds_to_close may be stale by the time we get here)
@@ -46,8 +51,7 @@ def analyze_updown_market(udm: UpDownMarket) -> Signal | None:
         actual_seconds = udm.seconds_to_close
 
     if actual_seconds < MIN_SECONDS_TO_TRADE:
-        log.debug("[%s] skip: %.0fs remaining < %ds min", slug, actual_seconds, MIN_SECONDS_TO_TRADE)
-        return None
+        return None, f"{coin} skip: {actual_seconds:.0f}s left < {MIN_SECONDS_TO_TRADE}s min"
 
     yes_price = market.outcome_prices[0]
 
@@ -59,13 +63,11 @@ def analyze_updown_market(udm: UpDownMarket) -> Signal | None:
 
     # Skip near-certain markets (no edge available)
     if implied_up_prob >= CRYPTO_NEAR_CERTAIN_UPPER or implied_up_prob <= CRYPTO_NEAR_CERTAIN_LOWER:
-        log.debug("[%s] skip: near-certain (implied %.0f%%)", slug, implied_up_prob * 100)
-        return None
+        return None, f"{coin} skip: near-certain ({implied_up_prob:.0%})"
 
     # Skip the "coin flip" zone — these are just noise with high fees
     if CRYPTO_SKIP_BAND_LOW <= implied_up_prob <= CRYPTO_SKIP_BAND_HIGH:
-        log.debug("[%s] skip: coin-flip zone (implied %.0f%%)", slug, implied_up_prob * 100)
-        return None
+        return None, f"{coin} skip: coin-flip zone ({implied_up_prob:.0%})"
 
     # Determine market-implied direction
     if implied_up_prob > 0.5:
@@ -93,8 +95,7 @@ def analyze_updown_market(udm: UpDownMarket) -> Signal | None:
 
     # Skip if price actively contradicts the market direction
     if price_contradicts:
-        log.debug("[%s] skip: price contradicts %s (momentum %+.3f%%)", slug, direction, (momentum or 0) * 100)
-        return None
+        return None, f"{coin} skip: price contradicts {direction} (momentum {momentum:+.3%})"
 
     # Calculate model probability with dynamic boost
     # Stronger market signal + price confirmation = bigger boost
@@ -104,8 +105,7 @@ def analyze_updown_market(udm: UpDownMarket) -> Signal | None:
     else:
         # No price data or neutral — scale boost by strength, require strong signal
         if strength < 0.20:
-            log.debug("[%s] skip: weak signal (strength %.0f%%) without price confirmation", slug, strength * 100)
-            return None  # Not strong enough without price confirmation (need >=70%)
+            return None, f"{coin} skip: weak signal ({strength:.0%}) without price confirmation"
         boost = 0.02 + strength * 0.15  # 0.05 at strength=0.20 to ~0.077 at 0.38
 
     if direction == "UP":
@@ -129,8 +129,7 @@ def analyze_updown_market(udm: UpDownMarket) -> Signal | None:
         min_edge = max(min_edge, 0.07)
 
     if abs(edge) < min_edge:
-        log.debug("[%s] skip: edge %.1f%% < min %.1f%% (entry %.0f%%)", slug, abs(edge) * 100, min_edge * 100, entry_price * 100)
-        return None
+        return None, f"{coin} skip: edge {abs(edge):.1%} < min {min_edge:.1%} (entry {entry_price:.0%})"
 
     if edge > 0:
         side = "YES"
@@ -148,14 +147,15 @@ def analyze_updown_market(udm: UpDownMarket) -> Signal | None:
         momentum_str = f", price {'confirms' if price_confirms else 'neutral'} ({momentum:+.3%})"
 
     reason = (
-        f"{udm.coin} implied {direction} at {implied_up_prob:.0%}, "
+        f"{coin} implied {direction} at {implied_up_prob:.0%}, "
         f"edge {edge:+.1%}, {actual_seconds:.0f}s to close{momentum_str}"
     )
 
-    return Signal(
+    signal = Signal(
         market=market,
         strategy="updown",
         side=side,
         confidence=confidence,
         reason=reason,
     )
+    return signal, reason

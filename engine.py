@@ -20,7 +20,7 @@ from news_fetcher import fetch_google_news
 from level_analyzer import analyze_updown_market
 from arbitrage_analyzer import analyze_headlines
 from logger import log_trade, read_trades, save_trades
-from price_feed import get_price
+from price_feed import get_price, get_prices_batch
 
 
 class Engine:
@@ -195,9 +195,11 @@ class Engine:
             # Skip non-5m intervals (15m has lower WR)
             if udm.interval_minutes != UPDOWN_INTERVAL_FILTER:
                 continue
-            signal = analyze_updown_market(udm)
+            signal, reason = analyze_updown_market(udm)
             if signal:
                 signals.append(signal)
+            else:
+                self._log(f"  {reason}")
         # Sort by confidence descending — only take the best signals
         signals.sort(key=lambda s: s.confidence, reverse=True)
         return signals
@@ -210,24 +212,22 @@ class Engine:
         return analyze_headlines(articles, self.markets)
 
     def _warm_active_coins(self, coins: set[str]):
-        """Warm price cache only for coins with active updown markets."""
-        for coin in coins:
-            try:
-                get_price(coin)
-            except Exception:
-                pass
+        """Warm price cache for active coins using a single batch API call."""
+        get_prices_batch(coins)
 
     def tick(self) -> list[Trade]:
-        now = time.time()
+        tick_start = time.time()
         new_trades = []
         self.tick_count += 1
 
         # === CRITICAL PATH: fetch → warm active coins → analyze → trade ===
         # Market fetch first — this is the time-sensitive operation
+        t0 = time.time()
         try:
             self.status = "Fetching markets"
             self.markets = fetch_active_markets()
-            self._log(f"Fetched {len(self.markets)} markets")
+            fetch_ms = (time.time() - t0) * 1000
+            self._log(f"Fetched {len(self.markets)} markets ({fetch_ms:.0f}ms)")
         except Exception as e:
             self._log(f"Market fetch error: {e}")
             self.status = "Market fetch error"
@@ -237,12 +237,17 @@ class Engine:
         self.status = "Checking updown markets"
         try:
             self.updown_markets_found = find_updown_markets(self.markets)
-            self._log(f"Found {len(self.updown_markets_found)} updown markets")
+            udm_5m = [u for u in self.updown_markets_found if u.interval_minutes == UPDOWN_INTERVAL_FILTER]
+            self._log(f"Found {len(udm_5m)} 5m updown markets (+ {len(self.updown_markets_found) - len(udm_5m)} other)")
 
-            # Warm prices only for coins with active markets (not all 16)
-            active_coins = {udm.coin for udm in self.updown_markets_found}
+            # Warm prices only for coins with active 5m markets
+            active_coins = {udm.coin for udm in udm_5m}
             if active_coins:
+                t0 = time.time()
                 self._warm_active_coins(active_coins)
+                warm_ms = (time.time() - t0) * 1000
+                if warm_ms > 2000:
+                    self._log(f"  Price warming slow: {warm_ms:.0f}ms for {len(active_coins)} coins")
 
             signals = self.check_updown_markets()
             self._log(f"UpDown signals: {len(signals)}")
@@ -254,7 +259,7 @@ class Engine:
                     break
                 trade = self._try_execute(signal)
                 if trade:
-                    self._log(f"  TRADE: {trade.side} {trade.market_slug} @ ${trade.entry_price:.2f}")
+                    self._log(f"  TRADE: {trade.side} {trade.market_slug} @ ${trade.entry_price:.2f}, ${trade.size:.2f}")
                     new_trades.append(trade)
                     cycle_bets += 1
         except Exception as e:
@@ -267,6 +272,7 @@ class Engine:
         self.settle_trades()
 
         # Check news on interval
+        now = time.time()
         secs_until_news = max(0, NEWS_POLL_INTERVAL - (now - self.last_news_poll))
         if secs_until_news == 0:
             self.last_news_poll = now
@@ -286,17 +292,17 @@ class Engine:
         else:
             self._log(f"Next news poll in {secs_until_news:.0f}s")
 
-        # Background: warm remaining coins for momentum history (non-blocking budget)
+        # Background: warm remaining coins for momentum history (single batch call)
         try:
             remaining = set(SUPPORTED_COINS.keys()) - {udm.coin for udm in self.updown_markets_found}
-            t0 = time.time()
-            for coin in remaining:
-                if time.time() - t0 > 3.0:  # max 3s for background warming
-                    break
-                get_price(coin)
+            if remaining:
+                get_prices_batch(remaining)
         except Exception:
             pass
 
+        tick_ms = (time.time() - tick_start) * 1000
+        if tick_ms > 5000:
+            self._log(f"SLOW TICK: {tick_ms:.0f}ms")
         self.status = "Idle"
         return new_trades
 

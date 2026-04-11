@@ -101,7 +101,7 @@ def test_tick_executes_updown_trade(mock_log, mock_analyze, mock_find, mock_fetc
     udm_mock = MagicMock()
     udm_mock.interval_minutes = 5
     mock_find.return_value = [udm_mock]
-    mock_analyze.return_value = signal
+    mock_analyze.return_value = (signal, "test reason")
 
     engine = Engine()
     trades = engine.tick()
@@ -119,7 +119,7 @@ def test_tick_no_signal_no_trade(mock_analyze, mock_find, mock_fetch):
     udm_mock = MagicMock()
     udm_mock.interval_minutes = 5
     mock_find.return_value = [udm_mock]
-    mock_analyze.return_value = None
+    mock_analyze.return_value = (None, "skip: test")
 
     engine = Engine()
     trades = engine.tick()
@@ -133,7 +133,7 @@ def test_tick_no_signal_no_trade(mock_analyze, mock_find, mock_fetch):
 def test_tick_respects_max_bets_per_cycle(mock_log, mock_analyze, mock_find, mock_fetch):
     """Only MAX_BETS_PER_CYCLE trades should be executed per tick."""
     markets = [_make_market(f"btc-updown-5m-{i}") for i in range(10)]
-    signals = [_make_signal(m) for m in markets]
+    signals = [(_make_signal(m), "test reason") for m in markets]
 
     mock_fetch.return_value = markets
     udm_mocks = []
@@ -158,6 +158,7 @@ def test_tick_skips_15m_markets(mock_analyze, mock_find, mock_fetch):
     mock_fetch.return_value = [_make_market()]
     udm_mock = MagicMock()
     udm_mock.interval_minutes = 15  # Should be skipped
+    udm_mock.coin = "BTC"
     mock_find.return_value = [udm_mock]
 
     engine = Engine()

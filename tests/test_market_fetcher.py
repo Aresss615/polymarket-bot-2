@@ -97,7 +97,7 @@ def test_find_updown_markets_matches_slug():
         outcomes=["Up", "Down"],
         outcome_prices=[0.55, 0.45],
         token_ids=["0xa", "0xb"],
-        end_date=now + timedelta(seconds=45),
+        end_date=now + timedelta(seconds=20),
         active=True,
     )
     m2 = Market(
@@ -107,7 +107,7 @@ def test_find_updown_markets_matches_slug():
         outcomes=["Yes", "No"],
         outcome_prices=[0.4, 0.6],
         token_ids=["0xc", "0xd"],
-        end_date=now + timedelta(seconds=60),
+        end_date=now + timedelta(seconds=40),
         active=True,
     )
     results = find_updown_markets([m1, m2])
