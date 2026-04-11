@@ -1,0 +1,23 @@
+[
+  {
+    "timestamp": "2026-04-11T14:53:10.116771+00:00",
+    "what": "Tightened MAX_SECONDS_TO_CLOSE_5M from 45 to 30",
+    "old_value": "45",
+    "new_value": "30",
+    "last_trade_slug": "btc-updown-5m-1775917200"
+  },
+  {
+    "timestamp": "2026-04-11T14:53:10.117172+00:00",
+    "what": "Raised BTC COIN_MIN_EDGE from 0.07 to 0.10",
+    "old_value": "0.07",
+    "new_value": "0.10",
+    "last_trade_slug": "btc-updown-5m-1775917200"
+  },
+  {
+    "timestamp": "2026-04-11T14:53:10.117265+00:00",
+    "what": "Tightened CRYPTO_SKIP_BAND to 0.40-0.60 from 0.38-0.62",
+    "old_value": "0.38-0.62",
+    "new_value": "0.40-0.60",
+    "last_trade_slug": "btc-updown-5m-1775917200"
+  }
+]

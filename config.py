@@ -21,7 +21,7 @@ GROQ_FALLBACK_MODEL = "llama-3.1-8b-instant"
 # --- Crypto UpDown Settings ---
 # 5-minute markets
 MIN_SECONDS_TO_CLOSE_5M = 5       # Skip markets closing in <5s
-MAX_SECONDS_TO_CLOSE_5M = 45      # Trade 5m markets closing within 45s
+MAX_SECONDS_TO_CLOSE_5M = 30      # Was 45; data shows 91s+ drops to 67% WR
 MIN_SECONDS_TO_TRADE_5M = 5       # Don't place trades with <5s remaining
 
 # 15-minute markets — wider window since they're longer duration
@@ -35,15 +35,15 @@ MAX_SECONDS_TO_CLOSE = 120        # Widened to accommodate 15m window
 MIN_SECONDS_TO_TRADE = 5          # Per-interval override happens in analyzer
 CRYPTO_NEAR_CERTAIN_UPPER = 0.88  # Skip markets already priced >88%
 CRYPTO_NEAR_CERTAIN_LOWER = 0.12  # Skip markets already priced <12%
-CRYPTO_SKIP_BAND_LOW = 0.38    # Skip "coin flip" zone: implied 38-62% has no edge
-CRYPTO_SKIP_BAND_HIGH = 0.62
+CRYPTO_SKIP_BAND_LOW = 0.40    # Was 0.38; <0.60 entry has 58% WR — tighten
+CRYPTO_SKIP_BAND_HIGH = 0.60   # Was 0.62; symmetric
 MIN_EDGE = 0.05                # Minimum edge to trade
 MIN_LIQUIDITY = 500            # Minimum liquidity in dollars
 MAX_BETS_PER_CYCLE = 5         # Max concurrent bets per 5-min cycle (raised: XRP/SOL are profitable)
 
 # Per-coin minimum edge overrides — based on historical win rate and profitability
 COIN_MIN_EDGE = {
-    "BTC": 0.07,   # 60% WR, +$10.45 — most efficiently priced, NO side loses money, needs big edge
+    "BTC": 0.10,   # Was 0.07; 64% WR, -$7.17 — worst performer, needs big edge
     "ETH": 0.06,   # 72% WR, +$22.57 — marginal, tighten filter
     "DOGE": 0.06,  # 78% WR, +$31.02 — solid performer
     "HYPE": 0.06,  # 81% WR, +$18.79 — good WR, slight bump from default
