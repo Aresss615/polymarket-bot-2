@@ -153,19 +153,40 @@ def test_tick_respects_max_bets_per_cycle(mock_log, mock_analyze, mock_find, moc
 @patch("engine.fetch_active_markets")
 @patch("engine.find_updown_markets")
 @patch("engine.analyze_updown_market")
-def test_tick_skips_15m_markets(mock_analyze, mock_find, mock_fetch):
-    """15-minute interval markets should be filtered out."""
-    mock_fetch.return_value = [_make_market()]
+@patch("engine.log_trade")
+def test_tick_executes_15m_trade(mock_log, mock_analyze, mock_find, mock_fetch):
+    """15-minute interval markets should now be traded."""
+    market = _make_market("eth-updown-15m-100")
+    signal = _make_signal(market)
+
+    mock_fetch.return_value = [market]
     udm_mock = MagicMock()
-    udm_mock.interval_minutes = 15  # Should be skipped
-    udm_mock.coin = "BTC"
+    udm_mock.interval_minutes = 15
+    udm_mock.coin = "ETH"
     mock_find.return_value = [udm_mock]
+    mock_analyze.return_value = (signal, "test reason")
 
     engine = Engine()
     trades = engine.tick()
 
-    assert trades == []
-    mock_analyze.assert_not_called()
+    assert len(trades) == 1
+    assert trades[0].strategy == "updown"
+    mock_analyze.assert_called_once()
+
+
+@patch("engine.log_trade")
+def test_trade_market_type_from_signal(mock_log):
+    """Trade should have market_type set based on the market slug."""
+    engine = Engine()
+    market_5m = _make_market("btc-updown-5m-123")
+    signal_5m = _make_signal(market_5m)
+    trade_5m = engine.execute_paper_trade(signal_5m)
+    assert trade_5m.market_type == "5m"
+
+    market_15m = _make_market("eth-updown-15m-456")
+    signal_15m = _make_signal(market_15m)
+    trade_15m = engine.execute_paper_trade(signal_15m)
+    assert trade_15m.market_type == "15m"
 
 
 @patch("engine.fetch_active_markets")

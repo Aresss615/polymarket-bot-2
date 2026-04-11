@@ -95,6 +95,8 @@ class Engine:
         )
 
         size = self.bet_size(signal.confidence)
+        # Detect market type from slug
+        market_type = "15m" if "-15m-" in signal.market.slug else "5m"
         trade = Trade(
             timestamp=datetime.now(timezone.utc),
             market_slug=signal.market.slug,
@@ -106,6 +108,7 @@ class Engine:
             confidence=signal.confidence,
             reason=signal.reason,
             end_date=signal.market.end_date,
+            market_type=market_type,
         )
         self.trades.append(trade)
         self.traded_markets.add(signal.market.slug)
@@ -192,15 +195,11 @@ class Engine:
     def check_updown_markets(self) -> list[Signal]:
         signals = []
         for udm in self.updown_markets_found:
-            # Skip non-5m intervals (15m has lower WR)
-            if udm.interval_minutes != UPDOWN_INTERVAL_FILTER:
-                continue
             signal, reason = analyze_updown_market(udm)
             if signal:
                 signals.append(signal)
             else:
                 self._log(f"  {reason}")
-        # Sort by confidence descending — only take the best signals
         signals.sort(key=lambda s: s.confidence, reverse=True)
         return signals
 
@@ -237,11 +236,12 @@ class Engine:
         self.status = "Checking updown markets"
         try:
             self.updown_markets_found = find_updown_markets(self.markets)
-            udm_5m = [u for u in self.updown_markets_found if u.interval_minutes == UPDOWN_INTERVAL_FILTER]
-            self._log(f"Found {len(udm_5m)} 5m updown markets (+ {len(self.updown_markets_found) - len(udm_5m)} other)")
+            udm_5m = [u for u in self.updown_markets_found if u.interval_minutes == 5]
+            udm_15m = [u for u in self.updown_markets_found if u.interval_minutes == 15]
+            self._log(f"Found {len(udm_5m)} 5m + {len(udm_15m)} 15m updown markets")
 
-            # Warm prices only for coins with active 5m markets
-            active_coins = {udm.coin for udm in udm_5m}
+            # Warm prices for all active updown markets (both 5m and 15m)
+            active_coins = {udm.coin for udm in self.updown_markets_found}
             if active_coins:
                 t0 = time.time()
                 self._warm_active_coins(active_coins)
