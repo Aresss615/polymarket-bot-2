@@ -17,6 +17,7 @@ CSV_FIELDS = [
     "status",
     "payout",
     "end_date",
+    "market_type",
 ]
 
 
@@ -45,6 +46,7 @@ def log_trade(trade: Trade, path: Path = TRADES_CSV) -> None:
                 trade.status,
                 f"{trade.payout:.2f}",
                 trade.end_date.isoformat() if trade.end_date else "",
+                trade.market_type,
             ]
         )
 
@@ -69,6 +71,7 @@ def save_trades(trades: list[Trade], path: Path = TRADES_CSV) -> None:
                     trade.status,
                     f"{trade.payout:.2f}",
                     trade.end_date.isoformat() if trade.end_date else "",
+                    trade.market_type,
                 ]
             )
 
@@ -98,6 +101,7 @@ def read_trades(path: Path = TRADES_CSV) -> list[Trade]:
                         if row.get("end_date")
                         else None
                     ),
+                    market_type=row.get("market_type", "5m"),
                 )
             )
     return trades

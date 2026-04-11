@@ -87,3 +87,49 @@ def test_read_trades_legacy_csv_without_end_date(tmp_csv):
     trades = read_trades(tmp_csv)
     assert len(trades) == 1
     assert trades[0].end_date is None
+
+
+def test_market_type_field_round_trip(tmp_csv):
+    """Trade with market_type persists through CSV write/read."""
+    from logger import log_trade, read_trades
+    from config import Trade
+    from datetime import datetime, timezone
+
+    trade = Trade(
+        timestamp=datetime(2026, 4, 11, 12, 0, tzinfo=timezone.utc),
+        market_slug="btc-updown-15m-123",
+        question="BTC Up or Down?",
+        strategy="updown",
+        side="YES",
+        entry_price=0.75,
+        size=2.00,
+        confidence=0.80,
+        reason="test reason",
+        market_type="15m",
+    )
+    log_trade(trade, path=tmp_csv)
+    trades = read_trades(path=tmp_csv)
+    assert len(trades) == 1
+    assert trades[0].market_type == "15m"
+
+
+def test_market_type_defaults_to_5m(tmp_csv):
+    """Old CSV rows without market_type default to '5m'."""
+    from logger import read_trades
+    import csv
+
+    # Write a row without the market_type column
+    with open(tmp_csv, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "timestamp", "market_slug", "question", "strategy", "side",
+            "entry_price", "size", "confidence", "reason", "status", "payout", "end_date",
+        ])
+        writer.writerow([
+            "2026-04-10T12:00:00+00:00", "btc-updown-5m-123", "BTC?", "updown", "YES",
+            "0.75", "2.00", "0.80", "reason", "won", "2.67", "2026-04-10T12:05:00+00:00",
+        ])
+
+    trades = read_trades(path=tmp_csv)
+    assert len(trades) == 1
+    assert trades[0].market_type == "5m"

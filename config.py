@@ -132,3 +132,4 @@ class Trade:
     status: str = "pending"   # pending, won, lost
     payout: float = 0.0
     end_date: datetime | None = None
+    market_type: str = "5m"    # "5m" or "15m"
