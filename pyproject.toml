@@ -9,6 +9,7 @@ dependencies = [
     "rich>=13.0",
     "python-dotenv>=1.0",
     "py-clob-client>=0.17",
+    "web3>=6.0",
 ]
 
 [project.optional-dependencies]

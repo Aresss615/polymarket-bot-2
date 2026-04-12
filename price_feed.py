@@ -7,10 +7,12 @@ import urllib3
 from config import OKX_API_URL, BYBIT_API_URL, SUPPORTED_COINS
 
 # Python 3.14 on macOS has broken SSL cert verification for most CEX APIs.
-# Use a session with verification disabled for public market data endpoints.
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# On Windows/Linux this works fine, so only disable on macOS.
+import sys as _sys
 _session = requests.Session()
-_session.verify = False
+if _sys.platform == "darwin":
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    _session.verify = False
 
 # CoinGecko coin ID mapping
 COINGECKO_IDS = {

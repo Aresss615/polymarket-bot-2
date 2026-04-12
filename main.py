@@ -23,6 +23,7 @@ def main():
         if not pk:
             print("ERROR: POLYMARKET_PRIVATE_KEY not set in .env")
             return
+        funder = _os.getenv("POLYMARKET_FUNDER") or None
         print("\n*** LIVE TRADING MODE ***")
         print(f"This will use real money on Polymarket.")
         print(f"Max bet: ${LIVE_MAX_BET}, Daily loss limit: $2.00")
@@ -30,7 +31,7 @@ def main():
         if input().strip().lower() != "yes":
             print("Aborted.")
             return
-        executor = LiveExecutor(private_key=pk)
+        executor = LiveExecutor(private_key=pk, funder=funder)
         # Override bet sizing for $5 live test
         import config as _cfg
         _cfg.MAX_BET = LIVE_MAX_BET

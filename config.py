@@ -85,8 +85,8 @@ MAX_EXPOSURE_PER_COIN = 10.0   # max $ exposure on any single coin
 SLIPPAGE_BUFFER = 0.02         # extra edge buffer for simulation/live modes
 
 # --- Live Trading ($5 bankroll) ---
-LIVE_MAX_BET = 1.00            # $1 max per trade with $5 bankroll
-LIVE_MIN_BET = 1.00            # $1 min per trade (Polymarket minimum)
+LIVE_MAX_BET = 5.00            # Polymarket min is 5 shares; at 0.90 = $4.50
+LIVE_MIN_BET = 1.00            # base size (executor bumps to 5 shares minimum)
 LIVE_DAILY_MAX_LOSS = 2.0      # stop at $2 daily loss (40% of bankroll)
 LIVE_MAX_OPEN_EXPOSURE = 3.0   # max $3 at risk simultaneously
 

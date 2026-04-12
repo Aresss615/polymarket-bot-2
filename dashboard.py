@@ -28,18 +28,18 @@ def _fmt_pnl(pnl: float) -> Text:
 def make_dashboard(engine) -> Layout:
     layout = Layout()
 
-    # --- Header: Session stats (all-time) + Patch stats (current version) ---
-    pending = sum(1 for t in engine.trades if t.status == "pending")
-    pnl = engine.total_pnl
+    # --- Header: current-version stats only ---
+    v_trades = [t for t in engine.trades if t.strategy_version == STRATEGY_VERSION]
+    pending = sum(1 for t in v_trades if t.status == "pending")
+    v_settled = [t for t in v_trades if t.status in ("won", "lost")]
+    v_wins = sum(1 for t in v_settled if t.status == "won")
+    v_losses = len(v_settled) - v_wins
+    pnl = sum(t.payout - t.size for t in v_settled)
     pnl_style = "green" if pnl >= 0 else "red"
     pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
-    wr_str = f"{engine.win_rate:.0%}" if engine.settled_count > 0 else "—"
+    wr_str = f"{v_wins/len(v_settled):.0%}" if v_settled else "—"
 
     patch = compute_patch_stats(engine.trades)
-    patch_wr = f"{patch.win_rate:.0%}" if patch.settled_trades > 0 else "—"
-    patch_pnl = patch.net_pnl
-    patch_pnl_str = f"+${patch_pnl:.2f}" if patch_pnl >= 0 else f"-${abs(patch_pnl):.2f}"
-    patch_pnl_style = "green" if patch_pnl >= 0 else "red"
 
     header_text = Text()
     mode_label = {"paper": "[PAPER]", "simulation": "[SIM]", "live": "[LIVE]"}.get(TRADING_MODE, "[?]")
@@ -47,10 +47,8 @@ def make_dashboard(engine) -> Layout:
     header_text.append(f"{mode_label} ", style=mode_style)
     header_text.append("Polymarket Bot", style="bold white")
     header_text.append(f"  |  Balance: ${engine.balance:,.2f}", style="bold white")
-    header_text.append(f"  |  Session: {pnl_str}", style=f"bold {pnl_style}")
-    header_text.append(f" ({engine.wins}W/{engine.losses}L {wr_str})", style="white")
-    header_text.append(f"  |  Patch v{STRATEGY_VERSION}: {patch_pnl_str}", style=f"bold {patch_pnl_style}")
-    header_text.append(f" ({patch.wins}W/{patch.losses}L {patch_wr})", style="white")
+    header_text.append(f"  |  v{STRATEGY_VERSION} P&L: {pnl_str}", style=f"bold {pnl_style}")
+    header_text.append(f" ({v_wins}W/{v_losses}L {wr_str})", style="white")
     header_text.append(f"  |  Pending: {pending}", style="bold white")
     header_text.append(f"  |  Tick: {engine.tick_count}", style="dim")
     header_text.append(f"  |  {engine.status}", style="dim")

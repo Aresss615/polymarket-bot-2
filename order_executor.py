@@ -122,7 +122,7 @@ class LiveExecutor(OrderExecutor):
     - At least one manual trade completed on polymarket.com UI
     """
 
-    def __init__(self, private_key: str, chain_id: int = 137):
+    def __init__(self, private_key: str, chain_id: int = 137, funder: str = None):
         from py_clob_client.client import ClobClient
         from py_clob_client.clob_types import OrderArgs, OrderType
 
@@ -130,6 +130,8 @@ class LiveExecutor(OrderExecutor):
             "https://clob.polymarket.com",
             key=private_key,
             chain_id=chain_id,
+            signature_type=2 if funder else 0,
+            funder=funder,
         )
         self._client.set_api_creds(self._client.create_or_derive_api_creds())
         self._OrderArgs = OrderArgs
@@ -153,14 +155,11 @@ class LiveExecutor(OrderExecutor):
         limit_price = round(min(entry_price + 0.02, 0.99), 2)
 
         # Size in shares: USDC amount / price
-        shares = round(size / limit_price, 2)
-        if shares < 0.1:
-            return OrderResult(
-                filled=False, fill_price=entry_price, fill_size=0.0,
-                fees=0.0, slippage=0.0, latency_ms=0.0,
-                order_id="", status="rejected",
-                reason=f"shares too small: {shares}",
-            )
+        # Polymarket minimum order size is 5 shares
+        MIN_SHARES = 5.0
+        shares = max(round(size / limit_price, 2), MIN_SHARES)
+        # Recalculate actual USDC cost from adjusted shares
+        actual_size = round(shares * limit_price, 2)
 
         t0 = _time.time()
         try:
@@ -178,12 +177,12 @@ class LiveExecutor(OrderExecutor):
             if resp.get("success") or resp.get("orderID"):
                 order_id = resp.get("orderID", resp.get("id", "unknown"))
                 fee_rate = polymarket_taker_fee(limit_price)
-                fees = size * fee_rate
+                fees = actual_size * fee_rate
 
                 return OrderResult(
                     filled=True,
                     fill_price=limit_price,
-                    fill_size=size,
+                    fill_size=actual_size,
                     fees=fees,
                     slippage=limit_price - entry_price,
                     latency_ms=latency_ms,
@@ -199,9 +198,13 @@ class LiveExecutor(OrderExecutor):
                 )
         except Exception as e:
             latency_ms = (_time.time() - t0) * 1000
+            # Extract detailed error from PolyApiException
+            err_detail = repr(e)
+            if hasattr(e, 'status_code'):
+                err_detail = f"HTTP {e.status_code}: {getattr(e, 'error_msg', e)}"
             return OrderResult(
                 filled=False, fill_price=entry_price, fill_size=0.0,
                 fees=0.0, slippage=0.0, latency_ms=latency_ms,
                 order_id="", status="rejected",
-                reason=str(e),
+                reason=err_detail,
             )
