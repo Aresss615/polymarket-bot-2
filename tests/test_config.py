@@ -22,6 +22,7 @@ from config import (
     MAX_BET,
     STARTING_BALANCE,
     NEWS_POLL_INTERVAL,
+    STRATEGY_VERSION,
 )
 
 
@@ -101,6 +102,7 @@ def test_trade_dataclass():
     assert t.entry_price == 0.55
     assert t.status == "pending"
     assert t.payout == 0.0
+    assert t.strategy_version == 0
 
 
 def test_trade_settlement_fields():
@@ -133,9 +135,11 @@ def test_constants():
     assert MIN_SECONDS_TO_CLOSE == 5
     assert MAX_SECONDS_TO_CLOSE == 120
     assert NEWS_POLL_INTERVAL == 300
-    assert BET_FRACTION == 0.15
+    assert BET_FRACTION == 0.08
     assert MIN_BET == 1.0
-    assert MAX_BET == 50.0
+    assert MAX_BET == 10.0
     assert STARTING_BALANCE == 20.0
     assert "BTC" in SUPPORTED_COINS
     assert SUPPORTED_COINS["BTC"] == "BTC-USDT"
+    assert isinstance(STRATEGY_VERSION, int)
+    assert STRATEGY_VERSION >= 1

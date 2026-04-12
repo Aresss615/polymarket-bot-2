@@ -25,13 +25,16 @@ from config import (
     MIN_SECONDS_TO_TRADE_5M,
     MIN_SECONDS_TO_TRADE_15M,
     COIN_MIN_EDGE,
+    NO_SIDE_EDGE_PREMIUM,
+    BTC_NO_BLACKLISTED,
+    MAX_TAKER_FEE_RATE,
 )
 from price_feed import get_price, get_price_momentum, is_price_stale
 
 log = logging.getLogger(__name__)
 
 
-def analyze_updown_market(udm: UpDownMarket) -> tuple[Signal | None, str]:
+def analyze_updown_market(udm: UpDownMarket, extra_min_edge: float = 0.0) -> tuple[Signal | None, str]:
     """Analyze an updown market for trading signals.
 
     Returns (signal, reason) — signal is None if the market is skipped,
@@ -129,20 +132,34 @@ def analyze_updown_market(udm: UpDownMarket) -> tuple[Signal | None, str]:
 
     edge = model_yes_prob - yes_price
 
-    # Price-dependent edge floor: 70-80% entry prices need more edge since
-    # breakeven WR is high there (75% WR at 0.75 entry = breakeven)
-    entry_price = yes_price if edge > 0 else (1.0 - yes_price)
-    min_edge = COIN_MIN_EDGE.get(udm.coin, MIN_EDGE)
-    if 0.70 <= entry_price <= 0.80:
-        min_edge = max(min_edge, 0.07)
-
-    if abs(edge) < min_edge:
-        return None, f"{coin} skip: edge {abs(edge):.1%} < min {min_edge:.1%} (entry {entry_price:.0%})"
-
+    # Determine side first (needed for side-specific filters below)
     if edge > 0:
         side = "YES"
     else:
         side = "NO"
+
+    # BTC NO blacklist — historically ~48% WR, a money loser
+    if side == "NO" and coin == "BTC" and BTC_NO_BLACKLISTED:
+        return None, f"{coin} skip: BTC NO blacklisted (historical ~48% WR)"
+
+    # Price-dependent edge floor: 70-80% entry prices need more edge since
+    # breakeven WR is high there (75% WR at 0.75 entry = breakeven)
+    entry_price = yes_price if edge > 0 else (1.0 - yes_price)
+    min_edge = COIN_MIN_EDGE.get(udm.coin, MIN_EDGE) + extra_min_edge
+    if 0.70 <= entry_price <= 0.80:
+        min_edge = max(min_edge, 0.07 + extra_min_edge)
+
+    # NO side requires extra edge — YES: 82% WR vs NO: 75% historically
+    if side == "NO":
+        min_edge += NO_SIDE_EDGE_PREMIUM
+
+    # Fee-aware edge: subtract estimated taker fee before comparing to min_edge
+    # This filters trades that look profitable but aren't after fees
+    estimated_fee = MAX_TAKER_FEE_RATE * (1.0 - 2.0 * abs(entry_price - 0.50))
+    effective_edge = abs(edge) - max(0.0, estimated_fee)
+
+    if effective_edge < min_edge:
+        return None, f"{coin} skip: edge {abs(edge):.1%} - fee {estimated_fee:.1%} = {effective_edge:.1%} < min {min_edge:.1%} (entry {entry_price:.0%})"
 
     # Confidence scales with edge magnitude and time proximity
     # Closer to expiry = higher confidence, but cap at min_seconds

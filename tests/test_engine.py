@@ -3,15 +3,21 @@ from datetime import datetime, timezone, timedelta
 
 import pytest
 
-from config import Market, Signal, Trade, STARTING_BALANCE, BET_FRACTION, MIN_BET, MAX_BET, MAX_BETS_PER_CYCLE, TICK_INTERVAL, UpDownMarket
+from config import Market, Signal, Trade, STARTING_BALANCE, BET_FRACTION, MIN_BET, MAX_BET, MAX_BETS_PER_CYCLE, TICK_INTERVAL, UpDownMarket, STRATEGY_VERSION
 from engine import Engine
 
 
 @pytest.fixture(autouse=True)
 def _clean_engine():
     """Ensure Engine doesn't load real trades.csv or make network calls in tests."""
+    from strategy_eval import Mode15mResult
+    _default_15m = Mode15mResult(enabled=True, tightened=False, confidence_boost=0.0, edge_boost=0.0, reason="test")
     with patch("engine.read_trades", return_value=[]), \
-         patch("engine.get_price", return_value=None):
+         patch("engine.get_price", return_value=None), \
+         patch("engine.evaluate_15m_mode", return_value=_default_15m), \
+         patch("engine.log_trade_jsonl"), \
+         patch("engine.log_settlement"), \
+         patch("engine.log_risk_block"):
         yield
 
 
@@ -64,6 +70,7 @@ def test_execute_paper_trade(mock_log):
     assert trade.size <= MAX_BET
     assert trade.strategy == "updown"
     assert trade.status == "pending"
+    assert trade.strategy_version == STRATEGY_VERSION
     assert engine.balance < STARTING_BALANCE
     assert "btc-updown-5m-123" in engine.traded_markets
     mock_log.assert_called_once()
@@ -154,8 +161,11 @@ def test_tick_respects_max_bets_per_cycle(mock_log, mock_analyze, mock_find, moc
 @patch("engine.find_updown_markets")
 @patch("engine.analyze_updown_market")
 @patch("engine.log_trade")
-def test_tick_executes_15m_trade(mock_log, mock_analyze, mock_find, mock_fetch):
-    """15-minute interval markets should now be traded."""
+def test_tick_skips_15m_when_disabled(mock_log, mock_analyze, mock_find, mock_fetch):
+    """15-minute markets are filtered out when evaluate_15m_mode returns disabled."""
+    from strategy_eval import Mode15mResult
+    disabled_15m = Mode15mResult(enabled=False, tightened=False, confidence_boost=0.0, edge_boost=0.0, reason="disabled")
+
     market = _make_market("eth-updown-15m-100")
     signal = _make_signal(market)
 
@@ -166,12 +176,12 @@ def test_tick_executes_15m_trade(mock_log, mock_analyze, mock_find, mock_fetch):
     mock_find.return_value = [udm_mock]
     mock_analyze.return_value = (signal, "test reason")
 
-    engine = Engine()
-    trades = engine.tick()
+    with patch("engine.evaluate_15m_mode", return_value=disabled_15m):
+        engine = Engine()
+        trades = engine.tick()
 
-    assert len(trades) == 1
-    assert trades[0].strategy == "updown"
-    mock_analyze.assert_called_once()
+    assert len(trades) == 0
+    mock_analyze.assert_not_called()
 
 
 @patch("engine.log_trade")
@@ -355,42 +365,51 @@ def test_settle_trade_without_end_date_uses_market_resolution(mock_log, mock_res
 
 def test_bet_size_scales_with_confidence():
     engine = Engine()
-    low_conf = engine.bet_size(confidence=0.2)
-    high_conf = engine.bet_size(confidence=0.9)
+    low_conf = engine.bet_size(confidence=0.2, entry_price=0.70)
+    high_conf = engine.bet_size(confidence=0.9, entry_price=0.70)
     assert high_conf > low_conf
+
+
+def test_bet_size_scales_inversely_with_entry_price():
+    """High entry prices should produce smaller bets (worse payout ratio)."""
+    engine = Engine()
+    engine.balance = 70.0
+    low_entry = engine.bet_size(confidence=0.3, entry_price=0.60)
+    high_entry = engine.bet_size(confidence=0.3, entry_price=0.85)
+    assert low_entry > high_entry
 
 
 def test_bet_size_respects_min():
     engine = Engine()
     engine.balance = 5.0  # small balance
-    assert engine.bet_size() >= MIN_BET
+    assert engine.bet_size(confidence=0.3, entry_price=0.70) >= MIN_BET
 
 
 def test_bet_size_respects_max():
     engine = Engine()
     engine.balance = 1000.0
-    assert engine.bet_size(confidence=1.0) <= MAX_BET
+    assert engine.bet_size(confidence=1.0, entry_price=0.50) <= MAX_BET
 
 
 @patch("engine.log_trade")
 def test_bet_size_compounds_on_wins(mock_log):
     engine = Engine()
-    initial_size = engine.bet_size()
+    initial_size = engine.bet_size(confidence=0.3, entry_price=0.70)
 
     # Simulate a win that increases balance
     engine.balance = 30.0
-    bigger_size = engine.bet_size()
+    bigger_size = engine.bet_size(confidence=0.3, entry_price=0.70)
     assert bigger_size > initial_size
 
 
 @patch("engine.log_trade")
 def test_bet_size_shrinks_on_losses(mock_log):
     engine = Engine()
-    initial_size = engine.bet_size()
+    initial_size = engine.bet_size(confidence=0.3, entry_price=0.70)
 
     # Simulate losses that decreased balance
     engine.balance = 10.0
-    smaller_size = engine.bet_size()
+    smaller_size = engine.bet_size(confidence=0.3, entry_price=0.70)
     assert smaller_size < initial_size
 
 

@@ -7,6 +7,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# --- Trading Mode ---
+TRADING_MODE = os.getenv("TRADING_MODE", "paper")  # "paper", "simulation", "live"
+
 # --- API Endpoints ---
 GAMMA_API_URL = "https://gamma-api.polymarket.com"
 CLOB_API_URL = "https://clob.polymarket.com"
@@ -26,7 +29,7 @@ MIN_SECONDS_TO_TRADE_5M = 5       # Don't place trades with <5s remaining
 
 # 15-minute markets — wider window since they're longer duration
 MIN_SECONDS_TO_CLOSE_15M = 10     # Skip markets closing in <10s
-MAX_SECONDS_TO_CLOSE_15M = 120    # Trade 15m markets closing within 2 minutes
+MAX_SECONDS_TO_CLOSE_15M = 60     # Was 120; 2 min too early, tighten to 60s
 MIN_SECONDS_TO_TRADE_15M = 10     # Higher cutoff — more time needed for execution
 
 # Legacy aliases used by market_fetcher fetch_active_markets (interval-agnostic)
@@ -40,17 +43,49 @@ CRYPTO_SKIP_BAND_HIGH = 0.60   # Was 0.62; symmetric
 MIN_EDGE = 0.05                # Minimum edge to trade
 MIN_LIQUIDITY = 500            # Minimum liquidity in dollars
 MAX_BETS_PER_CYCLE = 5         # Max concurrent bets per 5-min cycle (raised: XRP/SOL are profitable)
+# --- Strategy Versioning ---
+# Bump this every time you change strategy parameters. Analytics will only
+# evaluate trades from the current version, preventing historical leakage.
+STRATEGY_VERSION = 8
+
+# Minimum trades in current patch before evaluating performance
+MIN_PATCH_TRADES_FOR_EVAL = 20
+
+# --- 15-Minute Market Adaptive Thresholds ---
+# Instead of a static on/off flag, 15m mode is evaluated dynamically per-patch.
+# These thresholds control when 15m markets are enabled/disabled/tightened.
+ENABLE_15M_MIN_WIN_RATE = 0.65       # minimum win rate to keep 15m enabled
+ENABLE_15M_MIN_PROFIT_FACTOR = 1.0   # minimum profit factor (gross profit / gross loss)
+ENABLE_15M_MIN_AVG_PNL = 0.0         # minimum average PnL per trade
+
+# Adaptive tightening: when performance is marginal, tighten these instead of disabling
+ADAPTIVE_CONFIDENCE_BOOST = 0.10     # require this much more confidence when tightening
+ADAPTIVE_EDGE_BOOST = 0.03           # require this much more edge when tightening
 
 # Per-coin minimum edge overrides — based on historical win rate and profitability
 COIN_MIN_EDGE = {
-    "BTC": 0.10,   # Was 0.07; 64% WR, -$7.17 — worst performer, needs big edge
-    "ETH": 0.06,   # 72% WR, +$22.57 — marginal, tighten filter
-    "DOGE": 0.06,  # 78% WR, +$31.02 — solid performer
-    "HYPE": 0.06,  # 81% WR, +$18.79 — good WR, slight bump from default
-    # XRP: 85% WR, +$68.29 — uses default 0.05, best performer
-    # SOL: 79% WR, +$50.62 — uses default 0.05
-    # BNB: 79% WR, +$36.46 — uses default 0.05
+    "BTC": 0.08,   # 64% WR, -$7.17 — worst performer, effectively disabled
+    "ETH": 0.06,   # 79% WR, +$8.66
+    "DOGE": 0.06,  # 78% WR, +$0.13 — barely profitable, keep filter tight
+    "HYPE": 0.08,  # 82% WR but turned net negative (-$3.92), needs more edge
+    # XRP: 81% WR, +$4.11 — uses default 0.05
+    # SOL: 83% WR, +$25.55 — uses default 0.05
+    # BNB: 85% WR, +$22.98 — uses default 0.05
 }
+
+# --- Signal Adjustments (data-driven from 451-trade analysis) ---
+NO_SIDE_EDGE_PREMIUM = 0.03   # require 3% extra edge for NO trades (YES: 82% WR, NO: 75%)
+BTC_NO_BLACKLISTED = False     # block BTC NO trades entirely (historical ~48% WR)
+
+# --- Fee Model ---
+MAX_TAKER_FEE_RATE = 0.018    # 1.8% dynamic taker fee at price 0.50, lower at extremes
+
+# --- Risk Management ---
+DAILY_MAX_LOSS = 10.0          # stop trading if daily realized losses exceed this
+MAX_OPEN_EXPOSURE = 25.0       # max $ at risk across all pending trades
+MAX_CONSECUTIVE_LOSSES = 5     # pause 1 cycle after this many consecutive losses
+MAX_EXPOSURE_PER_COIN = 10.0   # max $ exposure on any single coin
+SLIPPAGE_BUFFER = 0.02         # extra edge buffer for simulation/live modes
 
 # --- Arbitrage Settings ---
 ARBITRAGE_CONFIDENCE_THRESHOLD = 0.85
@@ -58,9 +93,9 @@ NEWS_POLL_INTERVAL = 300  # 5 minutes
 
 # --- Trading Settings ---
 STARTING_BALANCE = 20.0
-BET_FRACTION = 0.15       # risk 15% of balance per trade (data supports higher fraction at 72%+ WR)
+BET_FRACTION = 0.08       # base risk fraction per trade (was 0.15; reduced to prevent outsized losses)
 MIN_BET = 1.0             # never bet less than $1
-MAX_BET = 50.0            # never bet more than $50
+MAX_BET = 10.0            # never bet more than $10 (was $50; $20 losses took 23 wins to recover)
 TICK_INTERVAL = 10.0      # seconds between ticks (fast for crypto updown)
 
 # --- Supported Coins (ticker -> OKX instrument ID) ---
@@ -143,3 +178,29 @@ class Trade:
     payout: float = 0.0
     end_date: datetime | None = None
     market_type: str = "5m"    # "5m" or "15m"
+    strategy_version: int = 0  # patch version that generated this trade
+    fees: float = 0.0          # execution fees charged
+    fill_price: float | None = None  # actual fill price (None = same as entry_price)
+
+
+@dataclass
+class OrderResult:
+    """Result of an order execution attempt."""
+    filled: bool
+    fill_price: float
+    fill_size: float
+    fees: float
+    slippage: float
+    latency_ms: float
+    order_id: str
+    status: str       # "filled", "partial", "rejected"
+    reason: str = ""  # rejection reason if applicable
+
+
+@dataclass
+class RiskConfig:
+    """Configuration for risk management."""
+    daily_max_loss: float = DAILY_MAX_LOSS
+    max_open_exposure: float = MAX_OPEN_EXPOSURE
+    max_consecutive_losses: int = MAX_CONSECUTIVE_LOSSES
+    max_exposure_per_coin: float = MAX_EXPOSURE_PER_COIN

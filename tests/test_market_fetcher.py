@@ -134,7 +134,7 @@ def test_find_updown_markets_respects_time_window():
 
 
 def test_find_updown_markets_15m_in_window():
-    """15m markets within 120s should be discovered."""
+    """15m markets within 60s window should be discovered."""
     now = datetime.now(timezone.utc)
     m = Market(
         condition_id="0x5",
@@ -143,7 +143,7 @@ def test_find_updown_markets_15m_in_window():
         outcomes=["Up", "Down"],
         outcome_prices=[0.7, 0.3],
         token_ids=["0xa", "0xb"],
-        end_date=now + timedelta(seconds=90),
+        end_date=now + timedelta(seconds=45),
         active=True,
     )
     results = find_updown_markets([m])

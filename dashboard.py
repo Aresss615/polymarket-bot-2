@@ -1,3 +1,4 @@
+import re
 import time
 
 from rich.layout import Layout
@@ -6,26 +7,128 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from config import STRATEGY_VERSION, TRADING_MODE
+from strategy_eval import compute_patch_stats
+
+# Extract coin ticker from updown slugs like "btc-updown-5m-123"
+_COIN_RE = re.compile(r"^([a-z]+)-updown-", re.IGNORECASE)
+
+
+def _extract_coin(slug: str) -> str | None:
+    m = _COIN_RE.match(slug)
+    return m.group(1).upper() if m else None
+
+
+def _fmt_pnl(pnl: float) -> Text:
+    if pnl >= 0:
+        return Text(f"+${pnl:.2f}", style="green")
+    return Text(f"-${abs(pnl):.2f}", style="red")
+
 
 def make_dashboard(engine) -> Layout:
     layout = Layout()
 
-    # --- Header ---
+    # --- Header: Session stats (all-time) + Patch stats (current version) ---
     pending = sum(1 for t in engine.trades if t.status == "pending")
     pnl = engine.total_pnl
     pnl_style = "green" if pnl >= 0 else "red"
     pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
     wr_str = f"{engine.win_rate:.0%}" if engine.settled_count > 0 else "—"
 
+    patch = compute_patch_stats(engine.trades)
+    patch_wr = f"{patch.win_rate:.0%}" if patch.settled_trades > 0 else "—"
+    patch_pnl = patch.net_pnl
+    patch_pnl_str = f"+${patch_pnl:.2f}" if patch_pnl >= 0 else f"-${abs(patch_pnl):.2f}"
+    patch_pnl_style = "green" if patch_pnl >= 0 else "red"
+
     header_text = Text()
-    header_text.append("Polymarket Paper Bot", style="bold white")
+    mode_label = {"paper": "[PAPER]", "simulation": "[SIM]", "live": "[LIVE]"}.get(TRADING_MODE, "[?]")
+    mode_style = {"paper": "dim", "simulation": "yellow", "live": "bold red"}.get(TRADING_MODE, "dim")
+    header_text.append(f"{mode_label} ", style=mode_style)
+    header_text.append("Polymarket Bot", style="bold white")
     header_text.append(f"  |  Balance: ${engine.balance:,.2f}", style="bold white")
-    header_text.append(f"  |  P/L: {pnl_str}", style=f"bold {pnl_style}")
-    header_text.append(f"  |  W/L: {engine.wins}/{engine.losses} ({wr_str})", style="bold white")
+    header_text.append(f"  |  Session: {pnl_str}", style=f"bold {pnl_style}")
+    header_text.append(f" ({engine.wins}W/{engine.losses}L {wr_str})", style="white")
+    header_text.append(f"  |  Patch v{STRATEGY_VERSION}: {patch_pnl_str}", style=f"bold {patch_pnl_style}")
+    header_text.append(f" ({patch.wins}W/{patch.losses}L {patch_wr})", style="white")
     header_text.append(f"  |  Pending: {pending}", style="bold white")
     header_text.append(f"  |  Tick: {engine.tick_count}", style="dim")
     header_text.append(f"  |  {engine.status}", style="dim")
     header = Panel(header_text, style="blue")
+
+    # --- Patch Stats + 15m Mode Panel ---
+    mode = getattr(engine, "mode_15m", None)
+
+    stats_text = Text()
+    stats_text.append(f"Patch v{STRATEGY_VERSION}", style="bold white")
+    stats_text.append(f"  Trades: {patch.settled_trades}/{patch.total_trades}")
+    if patch.settled_trades > 0:
+        stats_text.append(f"  WR: {patch.win_rate:.0%}")
+        pf_str = f"{patch.profit_factor:.1f}" if patch.profit_factor != float("inf") else "∞"
+        stats_text.append(f"  PF: {pf_str}")
+        stats_text.append(f"  Exp: ${patch.expectancy:.2f}/trade")
+    stats_text.append("\n")
+
+    if mode:
+        if mode.tightened:
+            mode_style = "yellow"
+        elif mode.enabled:
+            mode_style = "green"
+        else:
+            mode_style = "red"
+        stats_text.append("15m: ", style="bold white")
+        stats_text.append(mode.reason, style=mode_style)
+    else:
+        stats_text.append("15m: awaiting first tick", style="dim")
+
+    stats_panel = Panel(stats_text, title="Strategy", border_style="cyan")
+
+    # --- Risk Panel ---
+    risk_text = Text()
+    rm = getattr(engine, "risk_manager", None)
+    if rm:
+        open_exp = sum(t.size for t in engine.trades if t.status == "pending")
+        daily_pnl = rm.daily_pnl
+        daily_style = "green" if daily_pnl >= 0 else "red"
+        daily_str = f"+${daily_pnl:.2f}" if daily_pnl >= 0 else f"-${abs(daily_pnl):.2f}"
+        risk_text.append("Daily P&L: ", style="bold white")
+        risk_text.append(daily_str, style=daily_style)
+        risk_text.append(f"  |  Exposure: ${open_exp:.2f}/${rm.config.max_open_exposure:.2f}", style="white")
+        streak = rm.consecutive_losses
+        streak_style = "red" if streak >= 3 else "white"
+        risk_text.append(f"  |  Loss streak: {streak}", style=streak_style)
+        if rm.kill_switch_active:
+            risk_text.append("  |  KILL SWITCH: ON", style="bold red")
+    else:
+        risk_text.append("Risk manager not initialized", style="dim")
+    risk_panel = Panel(risk_text, title="Risk", border_style="yellow")
+
+    # --- Per-Coin Breakdown Table (current patch only) ---
+    coin_table = Table(title=f"Per-Coin (v{STRATEGY_VERSION})", expand=True)
+    coin_table.add_column("Coin", width=5)
+    coin_table.add_column("Trades", justify="right", width=6)
+    coin_table.add_column("WR", justify="right", width=5)
+    coin_table.add_column("PF", justify="right", width=5)
+    coin_table.add_column("P/L", justify="right", width=8)
+
+    # Gather coins from current-patch updown trades
+    patch_trades = [t for t in engine.trades if t.strategy_version == STRATEGY_VERSION and t.strategy == "updown"]
+    coins = sorted({_extract_coin(t.market_slug) for t in patch_trades if _extract_coin(t.market_slug)})
+
+    for coin in coins:
+        coin_trades = [t for t in patch_trades if _extract_coin(t.market_slug) == coin]
+        settled = [t for t in coin_trades if t.status in ("won", "lost")]
+        wins = sum(1 for t in settled if t.status == "won")
+        losses = len(settled) - wins
+        gross_profit = sum(t.payout - t.size for t in settled if t.status == "won")
+        gross_loss = sum(t.size for t in settled if t.status == "lost")
+        net = gross_profit - gross_loss
+        wr = f"{wins / len(settled):.0%}" if settled else "—"
+        pf = f"{gross_profit / gross_loss:.1f}" if gross_loss > 0 else ("∞" if gross_profit > 0 else "—")
+        coin_table.add_row(coin, str(len(settled)), wr, pf, _fmt_pnl(net))
+
+    if not coins:
+        coin_table.add_row("—", "—", "—", "—", Text("—", style="dim"))
 
     # --- UpDown Markets Table ---
     updown_table = Table(title="Crypto UpDown Markets", expand=True)
@@ -99,17 +202,27 @@ def make_dashboard(engine) -> Layout:
     log_text = "\n".join(log_lines) if log_lines else "Waiting for first tick..."
     log_panel = Panel(log_text, title="Activity Log", border_style="dim")
 
+    # --- Layout Assembly ---
+    # Top: header (3 lines)
+    # Middle: strategy panel (3 lines)
+    # Body: left (markets + trades) | right (coin stats + activity log)
     layout.split_column(
         Layout(header, size=3),
+        Layout(stats_panel, size=4),
+        Layout(risk_panel, size=3),
         Layout(name="body"),
     )
     layout["body"].split_row(
         Layout(name="left", ratio=2),
-        Layout(log_panel, name="right", ratio=1),
+        Layout(name="right", ratio=1),
     )
     layout["left"].split_column(
         Layout(updown_table, ratio=1),
         Layout(trades_table, ratio=1),
+    )
+    layout["right"].split_column(
+        Layout(coin_table, ratio=1),
+        Layout(log_panel, ratio=2),
     )
     return layout
 

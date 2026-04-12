@@ -6,93 +6,108 @@
 
 ---
 
-## Trade Analysis (370 trades, 2026-04-10 — 1 day)
+## Trade Analysis (451 executed trades, 2026-04-10 to 2026-04-11)
 
 ### Overall
 | Metric | Value |
 |--------|-------|
-| Total trades | 370 |
-| Win rate | 76.6% |
-| Net P&L | +$28.24 |
-| ROI on risked | 3.9% |
-| Total risked | $730.73 |
-| Balance | $20.00 → $63.46 |
-| Max drawdown | $29.73 (57.2%) |
-| Max consecutive losses | 13 |
+| Total executed trades | 451 |
+| Win rate | 78.5% |
+| Net P&L | +$59.83 |
+| ROI on risked | 4.9% |
+| Total risked | $1,219.73 |
+| Avg trade size | $2.70 |
+| Avg profit/trade | $0.13 |
 
 ### By Coin
 | Coin | Trades | WR | P&L | ROI |
 |------|--------|----|-----|-----|
-| XRP | 66 | 84.8% | +$29.70 | +21.2% |
-| SOL | 62 | 79.0% | +$15.84 | +12.6% |
-| BNB | 52 | 78.8% | +$8.86 | +8.6% |
-| DOGE | 45 | 77.8% | +$6.44 | +6.9% |
-| HYPE | 43 | 81.4% | +$0.14 | +0.2% |
-| ETH | 50 | 72.0% | -$3.69 | -4.4% |
-| **BTC** | **50** | **60.0%** | **-$13.83** | **-17.0%** |
+| BNB | 70 | 84% | +$29.78 | Best |
+| XRP | 76 | 82% | +$12.53 | |
+| HYPE | 51 | 82% | -$2.05 | High WR but slightly negative |
+| SOL | 78 | 81% | +$18.47 | |
+| DOGE | 60 | 78% | +$5.24 | |
+| ETH | 60 | 75% | +$3.03 | Marginal |
+| **BTC** | **56** | **64%** | **-$7.17** | **Worst — money loser** |
 
 ### By Side
-| Side | Trades | WR | P&L | ROI |
-|------|--------|----|-----|-----|
-| YES | 165 | 81.2% | +$50.69 | +16.0% |
-| NO | 203 | 72.9% | -$7.23 | -1.8% |
+| Side | Trades | WR | P&L |
+|------|--------|----|-----|
+| YES | 211 | 82% | Positive |
+| NO | 240 | 75% | Weaker |
 
-### Biggest Losers (Coin x Side)
-| Segment | Trades | WR | P&L |
-|---------|--------|----|-----|
-| BTC NO | 29 | 48.3% | -$18.42 |
-| ETH NO | 27 | 66.7% | -$9.42 |
-| HYPE NO | 24 | 75.0% | -$6.08 |
-| BNB NO | 24 | 70.8% | -$2.10 |
+### By Market Type
+| Type | Trades | WR | P&L |
+|------|--------|----|-----|
+| 5m | 433 | 79% | +$62.75 |
+| 15m | 18 | 67% | -$2.92 |
 
 ### By Entry Price
-| Price Range | Trades | WR | P&L | ROI |
-|-------------|--------|----|-----|-----|
-| 0.50-0.62 | 99 | 54.5% | +$2.31 | +1.4% |
-| 0.62-0.75 | 78 | 82.1% | +$25.46 | +17.5% |
-| 0.75-0.88 | 191 | 85.9% | +$15.69 | +3.9% |
+| Price Range | Trades | WR | P&L |
+|-------------|--------|----|-----|
+| 0.50-0.60 | 90 | 58% | +$9.97 |
+| 0.60-0.70 | 47 | 70% | +$7.66 |
+| 0.70-0.80 | 103 | 82% | +$17.16 |
+| 0.80-0.90 | 211 | 88% | +$25.04 |
 
 ### By Seconds to Close
 | Window | Trades | WR | P&L | ROI |
 |--------|--------|----|-----|-----|
-| 5-20s | 14 | 85.7% | +$3.79 | +10.3% |
-| 20-35s | 48 | 87.5% | +$15.39 | +12.4% |
-| 35-50s | 65 | 87.7% | +$12.27 | +8.1% |
-| 50-80s | 43 | 88.4% | +$3.74 | +5.2% |
-| **80-120s** | **198** | **67.2%** | **+$8.27** | **+2.5%** |
+| 0-15s | 12 | 83% | +$7.41 | Best ROI |
+| 16-30s | 102 | 86% | +$18.30 | Sweet spot |
+| 31-60s | 139 | 88% | +$25.85 | Sweet spot |
+| 61-90s | 2 | 100% | +$0.53 | Too few |
+| **91s+** | **196** | **67%** | **+$7.74** | **Weak** |
 
-### By Edge
-| Edge | Trades | WR | P&L | ROI |
-|------|--------|----|-----|-----|
-| 5-7% | 324 | 74.4% | +$34.72 | +5.8% |
-| 7-10% | 36 | 94.4% | +$8.25 | +7.8% |
+### Chronological Performance (strategy improving over time)
+| Batch | WR | P&L | Period |
+|-------|----|-----|--------|
+| Trades 1-50 | 70% | +$0.32 | Early (no tuning) |
+| Trades 101-150 | 76% | +$22.83 | |
+| Trades 251-300 | 86% | +$4.19 | |
+| Trades 301-350 | 96% | +$26.82 | Best batch |
+| Trades 401-451 | 92% | +$26.56 | Recent |
 
 ---
 
 ## Key Findings
 
-1. **BTC NO is a money pit** — 48.3% WR, -$18.42. Must blacklist.
-2. **NO side overall is negative** — YES: +$50.69, NO: -$7.23. Require extra edge for NO trades.
-3. **Entry price 0.50-0.62 has no edge** — 54.5% WR across 99 trades. Widen skip band.
-4. **80-120s entries are weak** — 67.2% WR (half the dataset). The 20-50s sweet spot is 87%+ WR.
-5. **Higher edge = dramatically better** — 7-10% edge: 94.4% WR vs 74.4% at 5-7%.
-6. **57% max drawdown is unacceptable for real money** — need daily loss limits.
+1. **BTC is a money loser** — 64% WR, -$7.17. BTC NO specifically is worst segment (~48% WR historically).
+2. **NO side is weaker** — YES: 82% WR, NO: 75% WR. Require extra edge for NO trades.
+3. **Entry price <0.60 has no real edge** — 58% WR across 90 trades. Already tightened skip band to 0.40-0.60.
+4. **91s+ entries are weak** — 67% WR across 196 trades. Already tightened 5m window to 30s.
+5. **Higher edge = dramatically better** — 7-10% edge historically shows 94%+ WR.
+6. **15m markets underperform** — 67% WR vs 79% for 5m. Now supported but need separate tuning.
+7. **Strategy is improving** — early batches 70% WR, recent batches 92-96% WR.
+8. **Max drawdown still too high for real money** — need daily loss limits and smaller bet sizing.
 
 ---
+
+## Already Applied (2026-04-11)
+
+These filter changes were applied based on the 451-trade analysis:
+
+| Filter | Old Value | New Value | Rationale |
+|--------|-----------|-----------|-----------|
+| MAX_SECONDS_TO_CLOSE_5M | 45s (leaked to 120s) | 30s strict | 91s+ = 67% WR |
+| CRYPTO_SKIP_BAND | 0.38-0.62 | 0.40-0.60 | <0.60 entry = 58% WR |
+| BTC COIN_MIN_EDGE | 0.07 | 0.10 | 64% WR, -$7.17 |
+| 15m market support | Filtered out | Active (separate timing) | Expand opportunities |
+| Stale data guard | None | Skip if price >30s old | Real-money readiness |
+| Per-interval timing | Single window | 5m: 5-30s, 15m: 10-120s | Appropriate per type |
 
 ## Proposed Filter Changes (validate with 2-day data)
 
 | Filter | Current | Proposed | Rationale |
 |--------|---------|----------|-----------|
-| BTC NO side | Allowed | Blacklisted | 48.3% WR, -$18.42 |
-| Skip band | 0.38-0.62 | 0.35-0.65 | 0.50-0.62 entry = 54.5% WR |
-| Entry window | 5-45s (but 80-120s leak in) | 15-50s strict | 80-120s = 67.2% WR |
-| NO side edge premium | 0% | +3% extra edge required | NO side is -1.8% ROI |
+| BTC NO side | Allowed (high edge) | Blacklisted | Historically ~48% WR on NO side |
+| NO side edge premium | 0% | +3% extra edge required | NO side is 75% WR vs 82% YES |
 | MIN_EDGE | 0.05 | 0.05 (half size) / 0.07 (full size) | 7%+ edge = 94.4% WR |
-| BET_FRACTION | 0.15 | 0.05 (quarter-Kelly) | Reduce drawdown |
+| BET_FRACTION | 0.15 | 0.05 (quarter-Kelly) | Reduce drawdown for real money |
 | MAX_BET | $50 | $10 (initial live) | Capital preservation |
+| Tick rate in window | 5s adaptive | 2-3s when <30s to close | More entry opportunities in sweet spot |
 
-**Expected impact:** WR from 76.6% → 82%+, ROI from 3.9% → 10%+, max drawdown < 25%.
+**Expected impact:** WR from 78.5% → 85%+, ROI from 4.9% → 10%+, max drawdown < 25%.
 
 ---
 
@@ -127,6 +142,19 @@ Signal → RiskManager.check_trade_allowed()
        → RiskManager.record_trade()
 ```
 
+### Adaptive Tick Rate
+```
+Outside 30s window: 10s ticks (nothing actionable)
+Inside 30s window:  2-3s ticks (sweet spot, maximize entry opportunities)
+```
+
+**Rationale:** At 10s ticks, a 30s window gives only ~3 looks at a market. At 2-3s ticks, you get 10-15 looks, catching more favorable price movements during the high-WR sweet spot.
+
+**Rate limit considerations:**
+- CoinGecko free tier: 10-30 calls/min — at 2s ticks this burns through fast. Either fix OKX/Bybit SSL, get a CoinGecko key, or batch-warm once at window entry and only refresh Gamma prices on subsequent ticks.
+- Polymarket Gamma API: check rate limit headers before implementing.
+- Mitigation: warm prices once at 30s mark, then only poll Gamma market prices at 2-3s intervals (skip CEX calls since momentum is already established from the initial warm).
+
 ### Risk Controls (for real money)
 ```python
 DAILY_MAX_LOSS = 10.0         # stop if daily losses > $10
@@ -139,7 +167,7 @@ SLIPPAGE_BUFFER = 0.02        # add 2% to MIN_EDGE for live orders
 ### Scaling Plan
 | Stage | Timeline | Bankroll | Bet Size | Gate |
 |-------|----------|----------|----------|------|
-| 1. Validation | Week 1-2 | $50 | $2.50 | Real WR > 75%, slippage < 2% |
+| 1. Validation | Week 1-2 | $20 | $1.00 | Real WR > 75%, slippage < 2% |
 | 2. Confidence | Week 3-4 | $100 | $5.00 | Sharpe > 1.0 on daily returns |
 | 3. Scale | Month 2+ | $200-500 | $10-20 | 500+ real trades profitable |
 | 4. Steady state | Month 3+ | $500-1000 | $25-50 | Consistent monthly profit |
@@ -169,7 +197,7 @@ SLIPPAGE_BUFFER = 0.02        # add 2% to MIN_EDGE for live orders
 5. Balance stacking: orders must sum to <= balance per market
 
 ### Go-Live Checklist
-1. [ ] Fund Polygon wallet with USDC.e ($50)
+1. [ ] Fund Polygon wallet with USDC.e ($20)
 2. [ ] Log into polymarket.com with same wallet
 3. [ ] Complete one manual trade on UI
 4. [ ] Set token allowances (SDK helper)
@@ -184,9 +212,10 @@ SLIPPAGE_BUFFER = 0.02        # add 2% to MIN_EDGE for live orders
 
 ## Timeline
 
-- **2026-04-11:** Plan written, paper trading continues
-- **2026-04-13:** Re-analyze with 2-day dataset (~700+ trades)
-- **2026-04-13-14:** Implement filter changes + new modules
+- **2026-04-11:** Plan written, 15m support + reliability guards + data-driven tuning applied
+- **2026-04-12:** Paper trading continues with new filters (collecting 2-day data)
+- **2026-04-13:** Re-analyze with 2-day dataset (~700+ trades), validate proposed filters
+- **2026-04-13-14:** Implement remaining filters (BTC NO blacklist, NO edge premium, tick rate) + new modules (order_executor, risk_manager)
 - **2026-04-14-16:** Run 2-day simulation mode
 - **2026-04-16:** Analyze simulation, decide go/no-go
 - **2026-04-17+:** Go live with $50 if simulation passes
