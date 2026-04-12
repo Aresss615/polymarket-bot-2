@@ -25,12 +25,12 @@ GROQ_FALLBACK_MODEL = "llama-3.1-8b-instant"
 # --- Crypto UpDown Settings ---
 # 5-minute markets
 MIN_SECONDS_TO_CLOSE_5M = 5       # Skip markets closing in <5s
-MAX_SECONDS_TO_CLOSE_5M = 60      # 31-60s is 88% WR (best bucket); 91s+ excluded
+MAX_SECONDS_TO_CLOSE_5M = 35      # 31-60s is 88% WR (best bucket); tightened to 45s — user prefers later entries
 MIN_SECONDS_TO_TRADE_5M = 5       # Don't place trades with <5s remaining
 
 # 15-minute markets — wider window since they're longer duration
 MIN_SECONDS_TO_CLOSE_15M = 10     # Skip markets closing in <10s
-MAX_SECONDS_TO_CLOSE_15M = 60     # Was 120; 2 min too early, tighten to 60s
+MAX_SECONDS_TO_CLOSE_15M = 45     # Was 60; tightened to 45s to match 5m window
 MIN_SECONDS_TO_TRADE_15M = 10     # Higher cutoff — more time needed for execution
 
 # Legacy aliases used by market_fetcher fetch_active_markets (interval-agnostic)

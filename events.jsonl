@@ -1,0 +1,31 @@
+{"type": "settlement", "timestamp": "2026-04-12T14:54:49.171143+00:00", "market_slug": "doge-updown-5m-1776005100", "side": "NO", "status": "won", "entry_price": 0.825, "size": 1.0, "payout": 1.2121212121212122, "fees": 0.0, "pnl": 0.21212121212121215}
+{"type": "settlement", "timestamp": "2026-04-12T14:55:28.727600+00:00", "market_slug": "hype-updown-5m-1776005100", "side": "NO", "status": "won", "entry_price": 0.84, "size": 1.0, "payout": 1.1904761904761905, "fees": 0.0, "pnl": 0.19047619047619047}
+{"type": "risk_block", "timestamp": "2026-04-12T15:04:07.523943+00:00", "market_slug": "sol-updown-5m-1776006000", "reason": "exposure cap ($5.50 > $3.00)"}
+{"type": "risk_block", "timestamp": "2026-04-12T15:04:36.340279+00:00", "market_slug": "sol-updown-5m-1776006000", "reason": "exposure cap ($5.50 > $3.00)"}
+{"type": "risk_block", "timestamp": "2026-04-12T15:04:41.104207+00:00", "market_slug": "sol-updown-5m-1776006000", "reason": "exposure cap ($5.50 > $3.00)"}
+{"type": "risk_block", "timestamp": "2026-04-12T15:04:46.094611+00:00", "market_slug": "sol-updown-5m-1776006000", "reason": "exposure cap ($5.50 > $3.00)"}
+{"type": "risk_block", "timestamp": "2026-04-12T15:04:51.064129+00:00", "market_slug": "sol-updown-5m-1776006000", "reason": "exposure cap ($5.50 > $3.00)"}
+{"type": "settlement", "timestamp": "2026-04-12T15:06:16.129284+00:00", "market_slug": "eth-updown-5m-1776006000", "side": "YES", "status": "won", "entry_price": 0.9, "size": 4.5, "payout": 4.9838, "fees": 0.016199999999999996, "pnl": 0.48379999999999956}
+{"type": "risk_block", "timestamp": "2026-04-12T15:09:36.756126+00:00", "market_slug": "sol-updown-5m-1776006300", "reason": "exposure cap ($5.35 > $3.00)"}
+{"type": "risk_block", "timestamp": "2026-04-12T15:09:41.701646+00:00", "market_slug": "sol-updown-5m-1776006300", "reason": "exposure cap ($5.35 > $3.00)"}
+{"type": "risk_block", "timestamp": "2026-04-12T15:09:46.534421+00:00", "market_slug": "sol-updown-5m-1776006300", "reason": "exposure cap ($5.35 > $3.00)"}
+{"type": "risk_block", "timestamp": "2026-04-12T15:09:51.722682+00:00", "market_slug": "sol-updown-5m-1776006300", "reason": "exposure cap ($5.35 > $3.00)"}
+{"type": "risk_block", "timestamp": "2026-04-12T15:14:06.406794+00:00", "market_slug": "xrp-updown-5m-1776006600", "reason": "exposure cap ($5.35 > $3.00)"}
+{"type": "risk_block", "timestamp": "2026-04-12T15:14:16.495587+00:00", "market_slug": "xrp-updown-5m-1776006600", "reason": "exposure cap ($5.35 > $3.00)"}
+{"type": "risk_block", "timestamp": "2026-04-12T15:14:26.533947+00:00", "market_slug": "xrp-updown-5m-1776006600", "reason": "exposure cap ($5.35 > $3.00)"}
+{"type": "risk_block", "timestamp": "2026-04-12T15:14:36.634395+00:00", "market_slug": "xrp-updown-5m-1776006600", "reason": "exposure cap ($5.35 > $3.00)"}
+{"type": "risk_block", "timestamp": "2026-04-12T15:14:41.447019+00:00", "market_slug": "xrp-updown-5m-1776006600", "reason": "exposure cap ($5.35 > $3.00)"}
+{"type": "settlement", "timestamp": "2026-04-12T15:15:16.448289+00:00", "market_slug": "doge-updown-5m-1776006300", "side": "YES", "status": "won", "entry_price": 0.87, "size": 4.35, "payout": 4.979642, "fees": 0.020357999999999998, "pnl": 0.6296420000000005}
+{"type": "risk_block", "timestamp": "2026-04-12T15:24:17.292132+00:00", "market_slug": "bnb-updown-5m-1776007200", "reason": "exposure cap ($5.20 > $3.00)"}
+{"type": "risk_block", "timestamp": "2026-04-12T15:24:17.292369+00:00", "market_slug": "xrp-updown-5m-1776007200", "reason": "exposure cap ($5.20 > $3.00)"}
+{"type": "risk_block", "timestamp": "2026-04-12T15:24:27.907971+00:00", "market_slug": "bnb-updown-5m-1776007200", "reason": "exposure cap ($5.20 > $3.00)"}
+{"type": "risk_block", "timestamp": "2026-04-12T15:24:27.911313+00:00", "market_slug": "xrp-updown-5m-1776007200", "reason": "exposure cap ($5.20 > $3.00)"}
+{"type": "risk_block", "timestamp": "2026-04-12T15:24:36.862516+00:00", "market_slug": "bnb-updown-5m-1776007200", "reason": "exposure cap ($5.20 > $3.00)"}
+{"type": "risk_block", "timestamp": "2026-04-12T15:24:36.865534+00:00", "market_slug": "xrp-updown-5m-1776007200", "reason": "exposure cap ($5.20 > $3.00)"}
+{"type": "risk_block", "timestamp": "2026-04-12T15:24:41.919882+00:00", "market_slug": "bnb-updown-5m-1776007200", "reason": "exposure cap ($5.20 > $3.00)"}
+{"type": "risk_block", "timestamp": "2026-04-12T15:24:41.920213+00:00", "market_slug": "xrp-updown-5m-1776007200", "reason": "exposure cap ($5.20 > $3.00)"}
+{"type": "risk_block", "timestamp": "2026-04-12T15:24:46.859781+00:00", "market_slug": "bnb-updown-5m-1776007200", "reason": "exposure cap ($5.20 > $3.00)"}
+{"type": "risk_block", "timestamp": "2026-04-12T15:24:46.860353+00:00", "market_slug": "xrp-updown-5m-1776007200", "reason": "exposure cap ($5.20 > $3.00)"}
+{"type": "risk_block", "timestamp": "2026-04-12T15:24:51.873120+00:00", "market_slug": "bnb-updown-5m-1776007200", "reason": "exposure cap ($5.20 > $3.00)"}
+{"type": "risk_block", "timestamp": "2026-04-12T15:24:51.876355+00:00", "market_slug": "xrp-updown-5m-1776007200", "reason": "exposure cap ($5.20 > $3.00)"}
+{"type": "settlement", "timestamp": "2026-04-12T15:30:18.298946+00:00", "market_slug": "doge-updown-5m-1776007200", "side": "YES", "status": "won", "entry_price": 0.84, "size": 4.2, "payout": 4.9758, "fees": 0.0242, "pnl": 0.7757999999999994}

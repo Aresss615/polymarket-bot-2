@@ -170,7 +170,7 @@ class LiveExecutor(OrderExecutor):
                 side="BUY",
             )
             signed_order = self._client.create_order(order_args)
-            resp = self._client.post_order(signed_order, self._OrderType.GTC)
+            resp = self._client.post_order(signed_order, self._OrderType.FOK)
 
             latency_ms = (_time.time() - t0) * 1000
 
