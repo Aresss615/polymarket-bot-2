@@ -65,13 +65,13 @@ class TestNoSideEdgePremium:
 
     @patch("level_analyzer.get_price_momentum", return_value=-0.005)
     def test_no_requires_more_edge(self, mock_mom, mock_stale):
-        """NO side at same absolute edge as YES should be filtered due to +3% premium."""
+        """NO side requires +1% extra edge. Strong NO signals still pass."""
         # SOL at 0.18 DOWN → NO side, entry at 0.82
-        # This edge level would pass for YES but fails for NO
+        # With 1% NO premium (reduced from 3%), strong NO signals pass
         udm = _make_updown(coin="SOL", up_price=0.18, down_price=0.82)
         signal, reason = analyze_updown_market(udm)
-        assert signal is None
-        assert "skip" in reason
+        assert signal is not None
+        assert signal.side == "NO"
 
 
 @patch("level_analyzer.is_price_stale", return_value=False)

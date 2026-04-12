@@ -115,12 +115,93 @@ class SimulationExecutor(OrderExecutor):
 class LiveExecutor(OrderExecutor):
     """Real CLOB execution via py-clob-client.
 
-    Not yet implemented — requires wallet setup, token allowances,
-    and at least one manual trade on polymarket.com UI first.
+    Places aggressive limit orders (market-taking) on the Polymarket CLOB.
+    Requires:
+    - POLYMARKET_PRIVATE_KEY env var (EOA private key)
+    - Wallet funded with USDC.e on Polygon
+    - At least one manual trade completed on polymarket.com UI
     """
 
-    def place_order(self, signal: Signal, size: float, entry_price: float) -> OrderResult:
-        raise NotImplementedError(
-            "Live trading not yet enabled. "
-            "See LIVE_TRADING_PLAN.md for setup steps."
+    def __init__(self, private_key: str, chain_id: int = 137):
+        from py_clob_client.client import ClobClient
+        from py_clob_client.clob_types import OrderArgs, OrderType
+
+        self._client = ClobClient(
+            "https://clob.polymarket.com",
+            key=private_key,
+            chain_id=chain_id,
         )
+        self._client.set_api_creds(self._client.create_or_derive_api_creds())
+        self._OrderArgs = OrderArgs
+        self._OrderType = OrderType
+
+    def place_order(self, signal: Signal, size: float, entry_price: float) -> OrderResult:
+        import time as _time
+
+        token_idx = 0 if signal.side == "YES" else 1
+        if token_idx >= len(signal.market.token_ids):
+            return OrderResult(
+                filled=False, fill_price=entry_price, fill_size=0.0,
+                fees=0.0, slippage=0.0, latency_ms=0.0,
+                order_id="", status="rejected",
+                reason=f"no token_id for index {token_idx}",
+            )
+
+        token_id = signal.market.token_ids[token_idx]
+
+        # Aggressive limit: set price slightly above market to ensure fill
+        limit_price = round(min(entry_price + 0.02, 0.99), 2)
+
+        # Size in shares: USDC amount / price
+        shares = round(size / limit_price, 2)
+        if shares < 0.1:
+            return OrderResult(
+                filled=False, fill_price=entry_price, fill_size=0.0,
+                fees=0.0, slippage=0.0, latency_ms=0.0,
+                order_id="", status="rejected",
+                reason=f"shares too small: {shares}",
+            )
+
+        t0 = _time.time()
+        try:
+            order_args = self._OrderArgs(
+                token_id=token_id,
+                price=limit_price,
+                size=shares,
+                side="BUY",
+            )
+            signed_order = self._client.create_order(order_args)
+            resp = self._client.post_order(signed_order, self._OrderType.GTC)
+
+            latency_ms = (_time.time() - t0) * 1000
+
+            if resp.get("success") or resp.get("orderID"):
+                order_id = resp.get("orderID", resp.get("id", "unknown"))
+                fee_rate = polymarket_taker_fee(limit_price)
+                fees = size * fee_rate
+
+                return OrderResult(
+                    filled=True,
+                    fill_price=limit_price,
+                    fill_size=size,
+                    fees=fees,
+                    slippage=limit_price - entry_price,
+                    latency_ms=latency_ms,
+                    order_id=str(order_id),
+                    status="filled",
+                )
+            else:
+                return OrderResult(
+                    filled=False, fill_price=entry_price, fill_size=0.0,
+                    fees=0.0, slippage=0.0, latency_ms=latency_ms,
+                    order_id="", status="rejected",
+                    reason=str(resp.get("errorMsg", resp)),
+                )
+        except Exception as e:
+            latency_ms = (_time.time() - t0) * 1000
+            return OrderResult(
+                filled=False, fill_price=entry_price, fill_size=0.0,
+                fees=0.0, slippage=0.0, latency_ms=latency_ms,
+                order_id="", status="rejected",
+                reason=str(e),
+            )

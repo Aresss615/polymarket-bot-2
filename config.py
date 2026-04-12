@@ -9,6 +9,7 @@ load_dotenv()
 
 # --- Trading Mode ---
 TRADING_MODE = os.getenv("TRADING_MODE", "paper")  # "paper", "simulation", "live"
+_LIVE_BALANCE = float(os.getenv("LIVE_BALANCE", "5.0"))
 
 # --- API Endpoints ---
 GAMMA_API_URL = "https://gamma-api.polymarket.com"
@@ -24,7 +25,7 @@ GROQ_FALLBACK_MODEL = "llama-3.1-8b-instant"
 # --- Crypto UpDown Settings ---
 # 5-minute markets
 MIN_SECONDS_TO_CLOSE_5M = 5       # Skip markets closing in <5s
-MAX_SECONDS_TO_CLOSE_5M = 30      # Was 45; data shows 91s+ drops to 67% WR
+MAX_SECONDS_TO_CLOSE_5M = 60      # 31-60s is 88% WR (best bucket); 91s+ excluded
 MIN_SECONDS_TO_TRADE_5M = 5       # Don't place trades with <5s remaining
 
 # 15-minute markets — wider window since they're longer duration
@@ -46,7 +47,7 @@ MAX_BETS_PER_CYCLE = 5         # Max concurrent bets per 5-min cycle (raised: XR
 # --- Strategy Versioning ---
 # Bump this every time you change strategy parameters. Analytics will only
 # evaluate trades from the current version, preventing historical leakage.
-STRATEGY_VERSION = 8
+STRATEGY_VERSION = 9
 
 # Minimum trades in current patch before evaluating performance
 MIN_PATCH_TRADES_FOR_EVAL = 20
@@ -64,18 +65,14 @@ ADAPTIVE_EDGE_BOOST = 0.03           # require this much more edge when tighteni
 
 # Per-coin minimum edge overrides — based on historical win rate and profitability
 COIN_MIN_EDGE = {
-    "BTC": 0.08,   # 64% WR, -$7.17 — worst performer, effectively disabled
-    "ETH": 0.06,   # 79% WR, +$8.66
-    "DOGE": 0.06,  # 78% WR, +$0.13 — barely profitable, keep filter tight
-    "HYPE": 0.08,  # 82% WR but turned net negative (-$3.92), needs more edge
-    # XRP: 81% WR, +$4.11 — uses default 0.05
-    # SOL: 83% WR, +$25.55 — uses default 0.05
-    # BNB: 85% WR, +$22.98 — uses default 0.05
+    "BTC": 0.08,   # 64% WR, -$7.17 — keep high, plus BTC NO is blacklisted
+    # ETH, DOGE, HYPE: use default 0.05. Prior 0.06-0.08 overrides compounded
+    # with NO premium + fee deduction to create 10%+ floors, killing volume.
 }
 
 # --- Signal Adjustments (data-driven from 451-trade analysis) ---
-NO_SIDE_EDGE_PREMIUM = 0.03   # require 3% extra edge for NO trades (YES: 82% WR, NO: 75%)
-BTC_NO_BLACKLISTED = False     # block BTC NO trades entirely (historical ~48% WR)
+NO_SIDE_EDGE_PREMIUM = 0.01   # 1% extra; non-BTC NO was ~80% WR, BTC NO handled by blacklist
+BTC_NO_BLACKLISTED = True      # BTC NO ~48% WR historically — block entirely
 
 # --- Fee Model ---
 MAX_TAKER_FEE_RATE = 0.018    # 1.8% dynamic taker fee at price 0.50, lower at extremes
@@ -87,12 +84,18 @@ MAX_CONSECUTIVE_LOSSES = 5     # pause 1 cycle after this many consecutive losse
 MAX_EXPOSURE_PER_COIN = 10.0   # max $ exposure on any single coin
 SLIPPAGE_BUFFER = 0.02         # extra edge buffer for simulation/live modes
 
+# --- Live Trading ($5 bankroll) ---
+LIVE_MAX_BET = 1.00            # $1 max per trade with $5 bankroll
+LIVE_MIN_BET = 1.00            # $1 min per trade (Polymarket minimum)
+LIVE_DAILY_MAX_LOSS = 2.0      # stop at $2 daily loss (40% of bankroll)
+LIVE_MAX_OPEN_EXPOSURE = 3.0   # max $3 at risk simultaneously
+
 # --- Arbitrage Settings ---
 ARBITRAGE_CONFIDENCE_THRESHOLD = 0.85
 NEWS_POLL_INTERVAL = 300  # 5 minutes
 
 # --- Trading Settings ---
-STARTING_BALANCE = 20.0
+STARTING_BALANCE = _LIVE_BALANCE if TRADING_MODE == "live" else 20.0
 BET_FRACTION = 0.08       # base risk fraction per trade (was 0.15; reduced to prevent outsized losses)
 MIN_BET = 1.0             # never bet less than $1
 MAX_BET = 10.0            # never bet more than $10 (was $50; $20 losses took 23 wins to recover)
