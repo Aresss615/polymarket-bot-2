@@ -88,6 +88,41 @@ def test_fetch_active_markets_skips_bad_data(mock_get):
     assert len(markets) == 1
 
 
+@patch("market_fetcher.requests.get")
+def test_fetch_active_markets_filters_esports(mock_get):
+    data = [
+        {
+            "conditionId": "0xaaa",
+            "question": "Dota 2: Team A vs Team B",
+            "slug": "dota2-team-a-team-b-2026-04-13",
+            "outcomes": '["Yes","No"]',
+            "outcomePrices": '["0.5","0.5"]',
+            "clobTokenIds": '["0xy","0xn"]',
+            "endDate": "2026-04-30T21:00:00Z",
+            "active": True,
+        },
+        {
+            "conditionId": "0xbbb",
+            "question": "Will CPI come in below forecast?",
+            "slug": "us-cpi-below-forecast",
+            "outcomes": '["Yes","No"]',
+            "outcomePrices": '["0.44","0.56"]',
+            "clobTokenIds": '["0xy2","0xn2"]',
+            "endDate": "2026-04-30T21:00:00Z",
+            "active": True,
+        },
+    ]
+
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.json.return_value = data
+    mock_get.return_value = resp
+
+    markets = fetch_active_markets()
+    assert len(markets) == 1
+    assert markets[0].slug == "us-cpi-below-forecast"
+
+
 def test_find_updown_markets_matches_slug():
     now = datetime.now(timezone.utc)
     m1 = Market(
