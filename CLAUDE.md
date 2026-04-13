@@ -44,10 +44,10 @@ Synchronous engine loop with threading: engine runs in a background thread (10s 
 
 **Key modules:**
 - `config.py` — All constants, API URLs, thresholds, and dataclass models (Market, UpDownMarket, Article, Signal, Trade, OrderResult, RiskConfig). TRADING_MODE env var controls execution mode.
-- `order_executor.py` — Execution abstraction: PaperExecutor (instant fills), SimulationExecutor (fees/slippage/partial fills), LiveExecutor (stub)
+- `order_executor.py` — Execution abstraction: PaperExecutor (instant fills), SimulationExecutor (fees/slippage/partial fills), LiveExecutor with FOK->GTC fallback for partial liquidity
 - `risk_manager.py` — Trade gating: daily loss limit, open exposure cap, consecutive loss cooldown, per-coin exposure limit, global kill switch
 - `price_feed.py` — OKX primary, Bybit fallback, CoinGecko fallback for crypto prices
-- `market_fetcher.py` — Polymarket Gamma API with time-windowed fetching, slug-based updown detection
+- `market_fetcher.py` — Polymarket Gamma API with time-windowed fetching, slug-based updown detection, and esports market exclusion (Dota/CS2/LoL)
 - `news_fetcher.py` — Google News RSS via feedparser
 - `arbitrage_analyzer.py` — Calls Groq LLM to match headlines to markets
 - `level_analyzer.py` — Analyzes crypto updown markets using market-implied probability. Includes BTC NO blacklist, NO side edge premium (+3%), and fee-aware edge calculation
@@ -80,3 +80,8 @@ Requires `.env` file (see `.env.example`):
 - Engine tests require `evaluate_15m_mode` and JSONL logging functions to be mocked (see `_clean_engine` fixture in `test_engine.py`)
 - UpDown market slug format: `{coin}-updown-{interval}m-{id}` (e.g., `btc-updown-5m-12345`). Parsed by regex in `market_fetcher.py`, `dashboard.py`, and `risk_manager.py`
 - LiveExecutor is a stub — requires py-clob-client integration, wallet setup, and at least one manual trade on polymarket.com UI
+
+## Recent Fixes
+
+- 2026-04-13: Added market-level esports filter in `market_fetcher.py` to skip Dota/CS2/LoL/esports slugs/questions before strategy analysis.
+- 2026-04-13: Added LiveExecutor fallback in `order_executor.py` that retries FOK full-fill rejections with GTC to avoid HTTP 400 order-killed failures when full instant liquidity is unavailable.
