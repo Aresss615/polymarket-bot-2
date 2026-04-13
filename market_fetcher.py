@@ -21,6 +21,10 @@ from config import (
 UPDOWN_SLUG_RE = re.compile(
     r"^([a-z]+)-updown-(\d+)m-\d+$", re.IGNORECASE
 )
+EXCLUDED_MARKET_RE = re.compile(
+    r"(\bdota2?\b|\bcs2\b|counter[- ]?strike|league of legends|\blol\b|\besports?\b|e-sports?)",
+    re.IGNORECASE,
+)
 
 
 def _parse_json_or_list(value):
@@ -37,6 +41,11 @@ def _up_outcome_index(outcomes: list[str]) -> int:
         if "up" in label:
             return idx
     return 0
+
+
+def _is_excluded_market(question: str, slug: str) -> bool:
+    """Block known esports markets that the bot should never trade."""
+    return bool(EXCLUDED_MARKET_RE.search(f"{question} {slug}"))
 
 
 def fetch_active_markets() -> list[Market]:
@@ -63,6 +72,9 @@ def fetch_active_markets() -> list[Market]:
     markets = []
     for m in resp.json():
         try:
+            if _is_excluded_market(m.get("question", ""), m.get("slug", "")):
+                continue
+
             prices_raw = _parse_json_or_list(m.get("outcomePrices", "[]"))
             prices = [float(p) for p in prices_raw]
 
