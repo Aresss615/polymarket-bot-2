@@ -77,6 +77,24 @@ def test_live_executor_rejected_order(MockClient):
 
 
 @patch("py_clob_client.client.ClobClient", autospec=True)
+def test_live_executor_fok_retries_with_gtc(MockClient):
+    """FOK full-fill rejection should retry with GTC and succeed."""
+    executor, instance = _make_executor(MockClient)
+    instance.create_order.return_value = {"signed": True}
+    instance.post_order.side_effect = [
+        {"errorMsg": "order couldn't be fully filled. FOK orders are fully filled or killed."},
+        {"success": True, "orderID": "gtc-order-123"},
+    ]
+
+    signal = _make_signal(side="YES")
+    result = executor.place_order(signal, size=1.0, entry_price=0.80)
+
+    assert result.filled is True
+    assert result.order_id == "gtc-order-123"
+    assert instance.post_order.call_count == 2
+
+
+@patch("py_clob_client.client.ClobClient", autospec=True)
 def test_live_executor_exception(MockClient):
     """Network errors are caught and returned as rejected."""
     executor, instance = _make_executor(MockClient)
