@@ -2,7 +2,7 @@ import signal
 import sys
 import threading
 
-from config import TRADING_MODE, MAX_BET, DAILY_MAX_LOSS, RiskConfig, LIVE_MAX_BET, LIVE_MIN_BET
+from config import TRADING_MODE, DAILY_MAX_LOSS, LIVE_MAX_BET, LIVE_MIN_BET
 from engine import Engine
 from dashboard import run_dashboard
 from logger import init_csv
@@ -26,7 +26,7 @@ def main():
         funder = _os.getenv("POLYMARKET_FUNDER") or None
         print("\n*** LIVE TRADING MODE ***")
         print(f"This will use real money on Polymarket.")
-        print(f"Max bet: ${LIVE_MAX_BET}, Daily loss limit: $2.00")
+        print(f"Max bet: ${LIVE_MAX_BET}, Daily loss limit: ${DAILY_MAX_LOSS:.2f}")
         print("Type 'yes' to confirm:")
         if input().strip().lower() != "yes":
             print("Aborted.")
@@ -40,16 +40,8 @@ def main():
         executor = PaperExecutor()
         print("Starting in PAPER mode (instant fills, no fees)")
 
-    if TRADING_MODE == "live":
-        risk_config = RiskConfig(
-            daily_max_loss=2.0,
-            max_open_exposure=3.0,
-            max_consecutive_losses=3,
-            max_exposure_per_coin=2.0,
-        )
-        risk_manager = RiskManager(risk_config)
-    else:
-        risk_manager = RiskManager()
+    # Use the standard risk profile for all modes; live keeps only bet-size overrides above.
+    risk_manager = RiskManager()
     engine = Engine(executor=executor, risk_manager=risk_manager)
 
     def shutdown(sig, frame):
