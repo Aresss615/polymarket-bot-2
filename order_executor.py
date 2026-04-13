@@ -140,6 +140,14 @@ class LiveExecutor(OrderExecutor):
     def place_order(self, signal: Signal, size: float, entry_price: float) -> OrderResult:
         import time as _time
 
+        def _is_fok_full_fill_error(detail: str) -> bool:
+            text = str(detail).lower()
+            return (
+                "fok" in text
+                and "fully filled" in text
+                and "killed" in text
+            )
+
         token_idx = 0 if signal.side == "YES" else 1
         if token_idx >= len(signal.market.token_ids):
             return OrderResult(
@@ -172,6 +180,11 @@ class LiveExecutor(OrderExecutor):
             signed_order = self._client.create_order(order_args)
             resp = self._client.post_order(signed_order, self._OrderType.FOK)
 
+            # FOK rejects if full size cannot fill instantly. Retry with GTC so
+            # aggressive orders can still execute instead of being hard-killed.
+            if _is_fok_full_fill_error(resp.get("errorMsg", resp)):
+                resp = self._client.post_order(signed_order, self._OrderType.GTC)
+
             latency_ms = (_time.time() - t0) * 1000
 
             if resp.get("success") or resp.get("orderID"):
@@ -197,8 +210,32 @@ class LiveExecutor(OrderExecutor):
                     reason=str(resp.get("errorMsg", resp)),
                 )
         except Exception as e:
+            # Some clients raise HTTP 400 for FOK full-fill failure. Retry once
+            # with GTC before returning rejection.
+            if hasattr(e, 'status_code') and int(getattr(e, 'status_code', 0)) == 400:
+                try:
+                    err_msg = f"HTTP {e.status_code}: {getattr(e, 'error_msg', e)}"
+                    if _is_fok_full_fill_error(err_msg):
+                        resp = self._client.post_order(signed_order, self._OrderType.GTC)
+                        latency_ms = (_time.time() - t0) * 1000
+                        if resp.get("success") or resp.get("orderID"):
+                            order_id = resp.get("orderID", resp.get("id", "unknown"))
+                            fee_rate = polymarket_taker_fee(limit_price)
+                            fees = actual_size * fee_rate
+                            return OrderResult(
+                                filled=True,
+                                fill_price=limit_price,
+                                fill_size=actual_size,
+                                fees=fees,
+                                slippage=limit_price - entry_price,
+                                latency_ms=latency_ms,
+                                order_id=str(order_id),
+                                status="filled",
+                            )
+                except Exception:
+                    pass
+
             latency_ms = (_time.time() - t0) * 1000
-            # Extract detailed error from PolyApiException
             err_detail = repr(e)
             if hasattr(e, 'status_code'):
                 err_detail = f"HTTP {e.status_code}: {getattr(e, 'error_msg', e)}"
