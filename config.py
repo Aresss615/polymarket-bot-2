@@ -30,7 +30,7 @@ MIN_SECONDS_TO_TRADE_5M = 5       # Don't place trades with <5s remaining
 
 # 15-minute markets — wider window since they're longer duration
 MIN_SECONDS_TO_CLOSE_15M = 10     # Skip markets closing in <10s
-MAX_SECONDS_TO_CLOSE_15M = 45     # Was 60; tightened to 45s to match 5m window
+MAX_SECONDS_TO_CLOSE_15M = 20   # Was 60; tightened to 45s to match 5m window
 MIN_SECONDS_TO_TRADE_15M = 10     # Higher cutoff — more time needed for execution
 
 # Legacy aliases used by market_fetcher fetch_active_markets (interval-agnostic)
@@ -65,7 +65,7 @@ ADAPTIVE_EDGE_BOOST = 0.03           # require this much more edge when tighteni
 
 # Per-coin minimum edge overrides — based on historical win rate and profitability
 COIN_MIN_EDGE = {
-    "BTC": 0.08,   # 64% WR, -$7.17 — keep high, plus BTC NO is blacklisted
+    "BTC": 0.095,   # 64% WR, -$7.17 — keep high, plus BTC NO is blacklisted
     # ETH, DOGE, HYPE: use default 0.05. Prior 0.06-0.08 overrides compounded
     # with NO premium + fee deduction to create 10%+ floors, killing volume.
 }
@@ -78,7 +78,7 @@ BTC_NO_BLACKLISTED = True      # BTC NO ~48% WR historically — block entirely
 MAX_TAKER_FEE_RATE = 0.018    # 1.8% dynamic taker fee at price 0.50, lower at extremes
 
 # --- Risk Management ---
-DAILY_MAX_LOSS = 10.0          # stop trading if daily realized losses exceed this
+DAILY_MAX_LOSS = 20          # stop trading if daily realized losses exceed this
 MAX_OPEN_EXPOSURE = 25.0       # max $ at risk across all pending trades
 MAX_CONSECUTIVE_LOSSES = 5     # pause 1 cycle after this many consecutive losses
 MAX_EXPOSURE_PER_COIN = 10.0   # max $ exposure on any single coin
@@ -87,18 +87,18 @@ SLIPPAGE_BUFFER = 0.02         # extra edge buffer for simulation/live modes
 # --- Live Trading ($5 bankroll) ---
 LIVE_MAX_BET = 5.00            # Polymarket min is 5 shares; at 0.90 = $4.50
 LIVE_MIN_BET = 1.00            # base size (executor bumps to 5 shares minimum)
-LIVE_DAILY_MAX_LOSS = 2.0      # stop at $2 daily loss (40% of bankroll)
-LIVE_MAX_OPEN_EXPOSURE = 3.0   # max $3 at risk simultaneously
+LIVE_DAILY_MAX_LOSS = 6.0      # stop at $6 daily loss (40% of bankroll)
+LIVE_MAX_OPEN_EXPOSURE = 6.0   # max $6 at risk simultaneously
 
 # --- Arbitrage Settings ---
 ARBITRAGE_CONFIDENCE_THRESHOLD = 0.85
 NEWS_POLL_INTERVAL = 300  # 5 minutes
 
 # --- Trading Settings ---
-STARTING_BALANCE = _LIVE_BALANCE if TRADING_MODE == "live" else 20.0
+STARTING_BALANCE = _LIVE_BALANCE if TRADING_MODE == "live" else 11.0
 BET_FRACTION = 0.08       # base risk fraction per trade (was 0.15; reduced to prevent outsized losses)
 MIN_BET = 1.0             # never bet less than $1
-MAX_BET = 10.0            # never bet more than $10 (was $50; $20 losses took 23 wins to recover)
+MAX_BET = 5         # never bet more than $10 (was $50; $20 losses took 23 wins to recover)
 TICK_INTERVAL = 10.0      # seconds between ticks (fast for crypto updown)
 
 # --- Supported Coins (ticker -> OKX instrument ID) ---
