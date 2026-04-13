@@ -48,8 +48,8 @@ def analyze_updown_market(udm: UpDownMarket, extra_min_edge: float = 0.0) -> tup
         return None, f"{coin} skip: <2 outcome prices"
 
     # Stale data guard — don't trade on outdated price info
-    if is_price_stale(coin, max_age=60.0):
-        return None, f"{coin} skip: price data stale (>60s old)"
+    if is_price_stale(coin, max_age=30.0):
+        return None, f"{coin} skip: price data stale (>30s old)"
 
     # Recompute actual seconds remaining from end_date (the snapshot in
     # udm.seconds_to_close may be stale by the time we get here)
