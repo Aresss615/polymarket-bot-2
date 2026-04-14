@@ -358,6 +358,17 @@ class Engine:
             )
             if material_change:
                 changed = True
+                if result.status == "cancelled":
+                    log_order_event(
+                        "cancel",
+                        open_order.order_id,
+                        {
+                            "market_slug": open_order.market_slug,
+                            "side": open_order.side,
+                            "status": open_order.status,
+                            "reason": result.reason,
+                        },
+                    )
                 log_order_event(
                     "reconcile",
                     open_order.order_id,
@@ -370,6 +381,7 @@ class Engine:
                         "fill_shares": result.fill_shares,
                         "remaining_size": open_order.reserved_size,
                         "terminal": result.terminal,
+                        "reason": result.reason,
                     },
                 )
 

@@ -9,10 +9,22 @@ Three modes:
 import random
 import time
 import uuid
+from datetime import datetime, timezone
+import math
 from abc import ABC, abstractmethod
 from typing import Any
 
-from config import MAX_TAKER_FEE_RATE, OpenOrder, OrderResult, Signal
+from config import (
+    LIVE_MAKER_DRIFT_TICKS,
+    LIVE_MAKER_IMPROVEMENT_TICKS,
+    LIVE_MAKER_MAX_AGE_SECONDS,
+    LIVE_MAKER_MAX_SPREAD,
+    LIVE_MAKER_POST_ONLY,
+    MAX_TAKER_FEE_RATE,
+    OpenOrder,
+    OrderResult,
+    Signal,
+)
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -166,6 +178,11 @@ class LiveExecutor(OrderExecutor):
         return "fok" in text and "fully filled" in text and "killed" in text
 
     @staticmethod
+    def _is_post_only_reject(detail: str) -> bool:
+        text = str(detail).lower()
+        return ("post" in text and "only" in text) or "would match" in text or "would take" in text
+
+    @staticmethod
     def _error_text(payload: Any) -> str:
         if isinstance(payload, dict):
             for key in ("errorMsg", "error", "error_message", "message", "detail"):
@@ -184,6 +201,83 @@ class LiveExecutor(OrderExecutor):
     @staticmethod
     def _normalize_status(status: Any) -> str:
         return str(status or "").strip().lower()
+
+    @staticmethod
+    def _book_attr(payload: Any, field: str, default=None):
+        if isinstance(payload, dict):
+            return payload.get(field, default)
+        return getattr(payload, field, default)
+
+    def _book_price(self, level: Any) -> float:
+        return _safe_float(self._book_attr(level, "price"), 0.0)
+
+    @staticmethod
+    def _floor_to_tick(price: float, tick_size: float) -> float:
+        tick = max(tick_size, 0.01)
+        floored = math.floor((price + 1e-9) / tick) * tick
+        return round(max(tick, min(0.99, floored)), 2)
+
+    def _get_book_snapshot(self, token_id: str) -> dict:
+        try:
+            book = self._client.get_order_book(token_id)
+        except Exception:
+            return {}
+
+        bids = self._book_attr(book, "bids", []) or []
+        asks = self._book_attr(book, "asks", []) or []
+        best_bid = self._book_price(bids[0]) if bids else 0.0
+        best_ask = self._book_price(asks[0]) if asks else 0.0
+        tick_size = _safe_float(self._book_attr(book, "tick_size"), 0.01)
+        midpoint = 0.0
+        if best_bid > 0 and best_ask > 0:
+            midpoint = (best_bid + best_ask) / 2.0
+        elif best_bid > 0:
+            midpoint = best_bid
+        elif best_ask > 0:
+            midpoint = best_ask
+        spread = max(best_ask - best_bid, 0.0) if best_bid > 0 and best_ask > 0 else 0.0
+
+        return {
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "tick_size": tick_size,
+            "midpoint": midpoint,
+            "spread": spread,
+        }
+
+    def _maker_limit_price(self, entry_price: float, book: dict) -> float:
+        tick_size = max(book.get("tick_size") or 0.01, 0.01)
+        best_bid = book.get("best_bid", 0.0)
+        best_ask = book.get("best_ask", 0.0)
+
+        quote = entry_price
+        if best_ask > 0:
+            quote = min(quote, best_ask - tick_size)
+        if best_bid > 0:
+            quote = min(quote, best_bid + tick_size * LIVE_MAKER_IMPROVEMENT_TICKS)
+
+        quote = self._floor_to_tick(quote, tick_size)
+
+        if best_bid > 0 and best_ask > 0 and quote >= best_ask:
+            quote = self._floor_to_tick(best_bid, tick_size)
+        return quote
+
+    def _submit_limit_order(
+        self,
+        *,
+        token_id: str,
+        shares: float,
+        limit_price: float,
+        post_only: bool,
+    ) -> Any:
+        order_args = self._OrderArgs(
+            token_id=token_id,
+            price=limit_price,
+            size=shares,
+            side="BUY",
+        )
+        signed_order = self._client.create_order(order_args)
+        return self._client.post_order(signed_order, self._OrderType.GTC, post_only)
 
     def _make_rejection(
         self,
@@ -220,6 +314,7 @@ class LiveExecutor(OrderExecutor):
         shares: float,
         token_id: str,
         latency_ms: float,
+        raw_context: dict | None = None,
     ) -> OrderResult:
         if not isinstance(response, dict) or not (response.get("success") or response.get("orderID")):
             return self._make_rejection(
@@ -258,7 +353,7 @@ class LiveExecutor(OrderExecutor):
             needs_reconciliation=not terminal,
             terminal=terminal,
             raw_status=raw_status,
-            raw_response=response,
+            raw_response=raw_context or response,
         )
 
     def place_order(self, signal: Signal, size: float, entry_price: float) -> OrderResult:
@@ -274,8 +369,8 @@ class LiveExecutor(OrderExecutor):
 
         token_id = signal.market.token_ids[token_idx]
 
-        # Aggressive limit: preserve current live behavior in Phase 1.
-        limit_price = round(min(entry_price + 0.02, 0.99), 2)
+        book_snapshot = self._get_book_snapshot(token_id)
+        limit_price = self._maker_limit_price(entry_price, book_snapshot) if book_snapshot else round(min(entry_price, 0.99), 2)
         estimated_shares = size / limit_price if limit_price > 0 else 0.0
         if estimated_shares < 0.1:
             return self._make_rejection(
@@ -292,18 +387,29 @@ class LiveExecutor(OrderExecutor):
         actual_size = round(shares * limit_price, 2)
 
         t0 = time.time()
-        signed_order = None
         try:
-            order_args = self._OrderArgs(
+            response = self._submit_limit_order(
                 token_id=token_id,
-                price=limit_price,
-                size=shares,
-                side="BUY",
+                shares=shares,
+                limit_price=limit_price,
+                post_only=LIVE_MAKER_POST_ONLY,
             )
-            signed_order = self._client.create_order(order_args)
-            response = self._client.post_order(signed_order, self._OrderType.FOK)
-            if self._is_fok_full_fill_error(self._error_text(response)):
-                response = self._client.post_order(signed_order, self._OrderType.GTC)
+            if LIVE_MAKER_POST_ONLY and self._is_post_only_reject(self._error_text(response)):
+                retry_book = self._get_book_snapshot(token_id)
+                retry_tick = max(retry_book.get("tick_size") or 0.01, 0.01)
+                retry_price = self._floor_to_tick(max(retry_tick, limit_price - retry_tick), retry_tick)
+                if retry_book:
+                    retry_price = min(retry_price, self._maker_limit_price(entry_price, retry_book))
+                if retry_price > 0 and retry_price < limit_price:
+                    limit_price = retry_price
+                    book_snapshot = retry_book or book_snapshot
+                    response = self._submit_limit_order(
+                        token_id=token_id,
+                        shares=shares,
+                        limit_price=limit_price,
+                        post_only=LIVE_MAKER_POST_ONLY,
+                    )
+            actual_size = round(shares * limit_price, 2)
             latency_ms = (time.time() - t0) * 1000
             return self._normalize_submit_response(
                 response=response,
@@ -313,25 +419,14 @@ class LiveExecutor(OrderExecutor):
                 shares=shares,
                 token_id=token_id,
                 latency_ms=latency_ms,
+                raw_context={
+                    "submit": response,
+                    "book": book_snapshot,
+                    "post_only": LIVE_MAKER_POST_ONLY,
+                },
             )
         except Exception as exc:
             err_detail = self._error_text(exc)
-            if signed_order is not None and self._is_fok_full_fill_error(err_detail):
-                try:
-                    response = self._client.post_order(signed_order, self._OrderType.GTC)
-                    latency_ms = (time.time() - t0) * 1000
-                    return self._normalize_submit_response(
-                        response=response,
-                        entry_price=entry_price,
-                        limit_price=limit_price,
-                        actual_size=actual_size,
-                        shares=shares,
-                        token_id=token_id,
-                        latency_ms=latency_ms,
-                    )
-                except Exception as retry_error:
-                    err_detail = self._error_text(retry_error)
-
             latency_ms = (time.time() - t0) * 1000
             return self._make_rejection(
                 entry_price=entry_price,
@@ -350,6 +445,28 @@ class LiveExecutor(OrderExecutor):
             return True
         except Exception:
             return False
+
+    def _cancel_quote_reason(self, open_order: OpenOrder) -> str:
+        age_seconds = (datetime.now(timezone.utc) - open_order.created_at).total_seconds()
+        if age_seconds >= LIVE_MAKER_MAX_AGE_SECONDS:
+            return f"maker_quote_age>{LIVE_MAKER_MAX_AGE_SECONDS:.1f}s"
+
+        book = self._get_book_snapshot(open_order.token_id)
+        if not book:
+            return ""
+
+        spread = book.get("spread", 0.0)
+        tick_size = max(book.get("tick_size") or 0.01, 0.01)
+        midpoint = book.get("midpoint", 0.0)
+        best_bid = book.get("best_bid", 0.0)
+
+        if spread >= LIVE_MAKER_MAX_SPREAD:
+            return f"spread_widened>{LIVE_MAKER_MAX_SPREAD:.2f}"
+        if midpoint > 0 and midpoint <= open_order.limit_price - LIVE_MAKER_DRIFT_TICKS * tick_size:
+            return f"midpoint_drift<{midpoint:.2f}"
+        if best_bid > open_order.limit_price + tick_size:
+            return f"outbid_by_market>{best_bid:.2f}"
+        return ""
 
     def _get_order_payload(self, order_id: str) -> dict | None:
         try:
@@ -460,6 +577,15 @@ class LiveExecutor(OrderExecutor):
         else:
             status = "submitted"
 
+        cancel_reason = ""
+        if not terminal and delta_shares <= 0:
+            cancel_reason = self._cancel_quote_reason(open_order)
+            if cancel_reason and self.cancel_order(open_order.order_id):
+                terminal = True
+                status = "cancelled"
+                remaining_shares = 0.0
+                remaining_size = 0.0
+
         fill_price = open_order.limit_price
         if delta_shares > 0:
             fill_price = delta_cost / delta_shares
@@ -474,6 +600,7 @@ class LiveExecutor(OrderExecutor):
             latency_ms=latency_ms,
             order_id=open_order.order_id,
             status=status,
+            reason=cancel_reason,
             fill_shares=delta_shares,
             remaining_size=remaining_size,
             remaining_shares=remaining_shares,
@@ -487,5 +614,6 @@ class LiveExecutor(OrderExecutor):
             raw_response={
                 "order": order_payload or {},
                 "confirmed_trade_matches": match_count,
+                "cancel_reason": cancel_reason,
             },
         )

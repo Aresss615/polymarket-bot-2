@@ -94,6 +94,11 @@ LIVE_MAX_BET = 5.00            # Polymarket min is 5 shares; at 0.90 = $4.50
 LIVE_MIN_BET = 1.00            # base size (executor bumps to 5 shares minimum)
 LIVE_DAILY_MAX_LOSS = 6.0      # stop at $6 daily loss (40% of bankroll)
 LIVE_MAX_OPEN_EXPOSURE = 6.0   # max $6 at risk simultaneously
+LIVE_MAKER_POST_ONLY = True    # maker-first execution: avoid unnecessary taker fills
+LIVE_MAKER_IMPROVEMENT_TICKS = 1  # improve at most one tick over best bid
+LIVE_MAKER_MAX_AGE_SECONDS = 1.5  # cancel stale resting quotes quickly
+LIVE_MAKER_MAX_SPREAD = 0.04   # cancel if the spread widens beyond 4 cents
+LIVE_MAKER_DRIFT_TICKS = 2     # cancel if midpoint drifts away by 2+ ticks
 
 # --- Arbitrage Settings ---
 ARBITRAGE_CONFIDENCE_THRESHOLD = 0.85
