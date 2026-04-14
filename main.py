@@ -2,16 +2,35 @@ import signal
 import sys
 import threading
 
-from config import TRADING_MODE, DAILY_MAX_LOSS, LIVE_MAX_BET, LIVE_MIN_BET
+from config import (
+    LIVE_DAILY_MAX_LOSS,
+    LIVE_MAX_BET,
+    LIVE_MAX_OPEN_EXPOSURE,
+    LIVE_MIN_BET,
+    MAX_EXPOSURE_PER_COIN,
+    RiskConfig,
+    TRADING_MODE,
+)
 from engine import Engine
 from dashboard import run_dashboard
-from logger import init_csv
+from logger import init_csv, init_open_orders_csv
 from order_executor import PaperExecutor, SimulationExecutor, LiveExecutor
 from risk_manager import RiskManager
 
 
+def build_risk_config(mode: str) -> RiskConfig:
+    if mode == "live":
+        return RiskConfig(
+            daily_max_loss=LIVE_DAILY_MAX_LOSS,
+            max_open_exposure=LIVE_MAX_OPEN_EXPOSURE,
+            max_exposure_per_coin=min(MAX_EXPOSURE_PER_COIN, LIVE_MAX_OPEN_EXPOSURE),
+        )
+    return RiskConfig()
+
+
 def main():
     init_csv()
+    init_open_orders_csv()
 
     # Select executor based on TRADING_MODE env var
     if TRADING_MODE == "simulation":
@@ -26,7 +45,7 @@ def main():
         funder = _os.getenv("POLYMARKET_FUNDER") or None
         print("\n*** LIVE TRADING MODE ***")
         print(f"This will use real money on Polymarket.")
-        print(f"Max bet: ${LIVE_MAX_BET}, Daily loss limit: ${DAILY_MAX_LOSS:.2f}")
+        print(f"Max bet: ${LIVE_MAX_BET}, Daily loss limit: ${LIVE_DAILY_MAX_LOSS:.2f}")
         print("Type 'yes' to confirm:")
         if input().strip().lower() != "yes":
             print("Aborted.")
@@ -40,8 +59,8 @@ def main():
         executor = PaperExecutor()
         print("Starting in PAPER mode (instant fills, no fees)")
 
-    # Use the standard risk profile for all modes; live keeps only bet-size overrides above.
-    risk_manager = RiskManager()
+    # Live mode uses its tighter bankroll limits; paper/sim keep repo defaults.
+    risk_manager = RiskManager(build_risk_config(TRADING_MODE))
     engine = Engine(executor=executor, risk_manager=risk_manager)
 
     def shutdown(sig, frame):

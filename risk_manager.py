@@ -38,6 +38,17 @@ class RiskManager:
         self._kill_switch_reason: str = ""
         self._peak_equity: float = 0.0
 
+    @staticmethod
+    def _trade_timestamp(trade: Trade) -> datetime:
+        ts = trade.timestamp
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts.astimezone(timezone.utc)
+
+    @classmethod
+    def _trade_date(cls, trade: Trade):
+        return cls._trade_timestamp(trade).date()
+
     def _maybe_reset_daily(self):
         """Reset daily counters if a new UTC day has started."""
         now = datetime.now(timezone.utc)
@@ -63,6 +74,50 @@ class RiskManager:
     def observe_account_equity(self, account_equity: float | None):
         """Record the latest account-equity snapshot for drawdown checks."""
         self._observe_account_equity(account_equity)
+
+    def bootstrap_from_history(
+        self,
+        trades: list[Trade],
+        account_equity: float | None = None,
+    ) -> None:
+        """Restore daily risk state from persisted trade history.
+
+        This keeps restarts from silently clearing daily loss limits or
+        consecutive-loss cooldowns in the middle of a live session.
+        """
+        self._maybe_reset_daily()
+        self._observe_account_equity(account_equity)
+
+        today = datetime.now(timezone.utc).date()
+        settled_today = [
+            trade
+            for trade in trades
+            if trade.status in ("won", "lost") and self._trade_date(trade) == today
+        ]
+        settled_today.sort(key=self._trade_timestamp)
+
+        self._daily_losses = sum(trade.size for trade in settled_today if trade.status == "lost")
+
+        trailing_losses = 0
+        for trade in reversed(settled_today):
+            if trade.status == "lost":
+                trailing_losses += 1
+                continue
+            break
+
+        self._consecutive_losses = trailing_losses
+        if trailing_losses >= self.config.max_consecutive_losses:
+            self._cooldown_cycles_remaining = max(
+                self._cooldown_cycles_remaining,
+                self.config.consecutive_loss_cooldown_cycles,
+            )
+        else:
+            self._cooldown_cycles_remaining = 0
+
+        if self._daily_losses >= self.config.daily_max_loss * 2:
+            self.activate_kill_switch(
+                f"auto: daily losses ${self._daily_losses:.2f} >= 2x limit"
+            )
 
     @staticmethod
     def _open_order_exposure(open_orders: list[OpenOrder] | None) -> float:

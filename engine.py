@@ -1,5 +1,6 @@
 import time
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 
 from config import (
@@ -43,12 +44,16 @@ class Engine:
         self.markets = []
         self.updown_markets_found: list = []
         self.articles_found: list = []
+        self._pending_arb_signals: list[Signal] = []
+        self._news_future: Future | None = None
+        self._cache_warm_future: Future | None = None
+        self._background_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="engine-bg")
         self.tick_count = 0
         self.wins = 0
         self.losses = 0
         self.mode_15m = evaluate_15m_mode([])  # default until first tick
         self._load_history()
-        self.risk_manager.observe_account_equity(self.account_equity)
+        self.risk_manager.bootstrap_from_history(self.trades, account_equity=self.account_equity)
         if self.open_orders:
             self._reconcile_open_orders()
 
@@ -513,6 +518,59 @@ class Engine:
             return []
         return analyze_headlines(articles, self.markets)
 
+    def _run_news_refresh(self, markets_snapshot: list) -> tuple[list, list[Signal]]:
+        articles = fetch_google_news()
+        if not articles:
+            return [], []
+        signals = analyze_headlines(articles, markets_snapshot)
+        return articles, signals
+
+    def _submit_news_refresh(self) -> bool:
+        if self._news_future and not self._news_future.done():
+            return False
+
+        self._news_future = self._background_executor.submit(
+            self._run_news_refresh,
+            list(self.markets),
+        )
+        self.last_news_poll = time.time()
+        return True
+
+    def _consume_news_refresh(self):
+        if not self._news_future or not self._news_future.done():
+            return
+
+        future = self._news_future
+        self._news_future = None
+        try:
+            articles, signals = future.result()
+        except Exception as exc:
+            self._log(f"News refresh error: {exc}")
+            return
+
+        self.articles_found = articles or []
+        self._pending_arb_signals = signals or []
+        self._log(
+            f"News refresh ready: {len(self.articles_found)} articles, {len(self._pending_arb_signals)} arb signals"
+        )
+
+    def _start_background_price_warm(self, coins: set[str]):
+        if not coins:
+            return
+        if self._cache_warm_future and not self._cache_warm_future.done():
+            return
+        self._cache_warm_future = self._background_executor.submit(get_prices_batch, set(coins))
+
+    def _consume_background_price_warm(self):
+        if not self._cache_warm_future or not self._cache_warm_future.done():
+            return
+        try:
+            self._cache_warm_future.result()
+        except Exception:
+            pass
+        finally:
+            self._cache_warm_future = None
+
     def _warm_active_coins(self, coins: set[str]):
         """Warm price cache for active coins using a single batch API call."""
         get_prices_batch(coins)
@@ -522,6 +580,8 @@ class Engine:
         new_trades = []
         self.tick_count += 1
         self.risk_manager.on_cycle_start()
+        self._consume_news_refresh()
+        self._consume_background_price_warm()
 
         t0 = time.time()
         try:
@@ -585,32 +645,34 @@ class Engine:
 
         self.settle_trades()
 
+        if self._pending_arb_signals:
+            self.status = "Checking news arbitrage"
+            signals = list(self._pending_arb_signals)
+            self._pending_arb_signals.clear()
+            self._log(f"Processing {len(signals)} cached arb signal(s)")
+            active_slugs = {market.slug for market in self.markets}
+            for signal in signals:
+                if signal.market.slug not in active_slugs:
+                    self._log(f"  Arb skip: stale market {signal.market.slug}")
+                    continue
+                self._log(f"  Arb signal: {signal.side} on {signal.market.slug}")
+                trade = self._try_execute(signal)
+                if trade:
+                    self._log(f"  TRADE: {trade.side} {trade.market_slug}")
+                    new_trades.append(trade)
+
         now = time.time()
         secs_until_news = max(0, NEWS_POLL_INTERVAL - (now - self.last_news_poll))
         if secs_until_news == 0:
-            self.last_news_poll = now
-            self.status = "Checking news arbitrage"
-            try:
-                signals = self.check_arbitrage()
-                self._log(f"Fetched {len(self.articles_found)} articles, {len(signals)} arb signals")
-                for signal in signals:
-                    self._log(f"  Arb signal: {signal.side} on {signal.market.slug}")
-                    trade = self._try_execute(signal)
-                    if trade:
-                        self._log(f"  TRADE: {trade.side} {trade.market_slug}")
-                        new_trades.append(trade)
-            except Exception as e:
-                self._log(f"Arbitrage error: {e}")
-                self.status = "Arbitrage check error"
+            if self._submit_news_refresh():
+                self._log("News refresh started in background")
+            else:
+                self._log("News refresh already running")
         else:
             self._log(f"Next news poll in {secs_until_news:.0f}s")
 
-        try:
-            remaining = set(SUPPORTED_COINS.keys()) - {udm.coin for udm in self.updown_markets_found}
-            if remaining:
-                get_prices_batch(remaining)
-        except Exception:
-            pass
+        remaining = set(SUPPORTED_COINS.keys()) - {udm.coin for udm in self.updown_markets_found}
+        self._start_background_price_warm(remaining)
 
         tick_ms = (time.time() - tick_start) * 1000
         if tick_ms > 5000:
@@ -636,3 +698,4 @@ class Engine:
 
     def stop(self):
         self.running = False
+        self._background_executor.shutdown(wait=False, cancel_futures=True)
