@@ -73,6 +73,9 @@ COIN_MIN_EDGE = {
 # --- Signal Adjustments (data-driven from 451-trade analysis) ---
 NO_SIDE_EDGE_PREMIUM = 0.01   # 1% extra; non-BTC NO was ~80% WR, BTC NO handled by blacklist
 BTC_NO_BLACKLISTED = True      # BTC NO ~48% WR historically — block entirely
+MIN_NO_ENTRY_PRICE = 0.60      # confirmed NO fills below 0.60 entry were strongly negative
+MAX_NO_ENTRY_PRICE = 0.80      # confirmed NO fills at 0.80+ had negative EV after fees
+BLOCK_15M_NO = True            # current confirmed 15m NO segment underperforms
 
 # --- Fee Model ---
 MAX_TAKER_FEE_RATE = 0.018    # 1.8% dynamic taker fee at price 0.50, lower at extremes
@@ -83,6 +86,8 @@ MAX_OPEN_EXPOSURE = 25.0       # max $ at risk across all pending trades
 MAX_CONSECUTIVE_LOSSES = 10     # pause 1 cycle after this many consecutive losses
 MAX_EXPOSURE_PER_COIN = 10.0   # max $ exposure on any single coin
 SLIPPAGE_BUFFER = 0.02         # extra edge buffer for simulation/live modes
+MAX_DRAWDOWN_PCT = 0.25        # hard stop if account-equity drawdown exceeds 25%
+CONSECUTIVE_LOSS_COOLDOWN_CYCLES = 1  # finite pause after a loss streak
 
 # --- Live Trading ($5 bankroll) ---
 LIVE_MAX_BET = 5.00            # Polymarket min is 5 shares; at 0.90 = $4.50
@@ -251,3 +256,5 @@ class RiskConfig:
     max_open_exposure: float = MAX_OPEN_EXPOSURE
     max_consecutive_losses: int = MAX_CONSECUTIVE_LOSSES
     max_exposure_per_coin: float = MAX_EXPOSURE_PER_COIN
+    max_drawdown_pct: float = MAX_DRAWDOWN_PCT
+    consecutive_loss_cooldown_cycles: int = CONSECUTIVE_LOSS_COOLDOWN_CYCLES

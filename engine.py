@@ -48,6 +48,7 @@ class Engine:
         self.losses = 0
         self.mode_15m = evaluate_15m_mode([])  # default until first tick
         self._load_history()
+        self.risk_manager.observe_account_equity(self.account_equity)
         if self.open_orders:
             self._reconcile_open_orders()
 
@@ -104,6 +105,10 @@ class Engine:
     @property
     def available_balance(self) -> float:
         return max(0.0, self.balance - self.reserved_open_exposure)
+
+    @property
+    def account_equity(self) -> float:
+        return self.balance + sum(trade.size for trade in self.pending_trades) + self.reserved_open_exposure
 
     @property
     def active_order_markets(self) -> set[str]:
@@ -389,7 +394,13 @@ class Engine:
             return None
 
         size = self.bet_size(signal.confidence, self._entry_price_for_signal(signal))
-        risk_check = self.risk_manager.check_trade_allowed(signal, size, self.pending_trades)
+        risk_check = self.risk_manager.check_trade_allowed(
+            signal,
+            size,
+            self.pending_trades,
+            open_orders=self.open_orders,
+            account_equity=self.account_equity,
+        )
         if not risk_check.allowed:
             self._log(f"  Risk blocked: {risk_check.reason}")
             log_risk_block(signal.market.slug, risk_check.reason)
@@ -498,6 +509,7 @@ class Engine:
         tick_start = time.time()
         new_trades = []
         self.tick_count += 1
+        self.risk_manager.on_cycle_start()
 
         t0 = time.time()
         try:

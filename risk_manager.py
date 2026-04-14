@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from config import RiskConfig, Signal, Trade
+from config import OpenOrder, RiskConfig, Signal, Trade
 
 
 @dataclass
@@ -33,8 +33,10 @@ class RiskManager:
         self._daily_losses: float = 0.0
         self._daily_start: datetime = datetime.now(timezone.utc)
         self._consecutive_losses: int = 0
+        self._cooldown_cycles_remaining: int = 0
         self._kill_switch: bool = False
         self._kill_switch_reason: str = ""
+        self._peak_equity: float = 0.0
 
     def _maybe_reset_daily(self):
         """Reset daily counters if a new UTC day has started."""
@@ -43,14 +45,50 @@ class RiskManager:
             self._daily_losses = 0.0
             self._daily_start = now
 
+    def on_cycle_start(self):
+        """Advance any finite cooldowns at the top of a new engine cycle."""
+        if self._cooldown_cycles_remaining <= 0:
+            return
+
+        self._cooldown_cycles_remaining -= 1
+        if self._cooldown_cycles_remaining == 0:
+            self._consecutive_losses = 0
+
+    def _observe_account_equity(self, account_equity: float | None):
+        if account_equity is None or account_equity <= 0:
+            return
+        if account_equity > self._peak_equity:
+            self._peak_equity = account_equity
+
+    def observe_account_equity(self, account_equity: float | None):
+        """Record the latest account-equity snapshot for drawdown checks."""
+        self._observe_account_equity(account_equity)
+
+    @staticmethod
+    def _open_order_exposure(open_orders: list[OpenOrder] | None) -> float:
+        return sum(order.reserved_size for order in (open_orders or []))
+
     def check_trade_allowed(
-        self, signal: Signal, size: float, pending_trades: list[Trade]
+        self,
+        signal: Signal,
+        size: float,
+        pending_trades: list[Trade],
+        open_orders: list[OpenOrder] | None = None,
+        account_equity: float | None = None,
     ) -> RiskCheck:
         """Check if a trade is allowed by all risk rules.
 
         Returns RiskCheck with allowed=False and reason on first failure.
         """
         self._maybe_reset_daily()
+        self._observe_account_equity(account_equity)
+
+        if self._peak_equity > 0 and account_equity is not None:
+            drawdown_pct = max(0.0, (self._peak_equity - account_equity) / self._peak_equity)
+            if drawdown_pct >= self.config.max_drawdown_pct:
+                self.activate_kill_switch(
+                    f"drawdown {drawdown_pct:.0%} >= {self.config.max_drawdown_pct:.0%}"
+                )
 
         # 1. Kill switch
         if self._kill_switch:
@@ -64,7 +102,7 @@ class RiskManager:
             )
 
         # 3. Open exposure cap
-        open_exposure = sum(t.size for t in pending_trades)
+        open_exposure = sum(t.size for t in pending_trades) + self._open_order_exposure(open_orders)
         if open_exposure + size > self.config.max_open_exposure:
             return RiskCheck(
                 False,
@@ -72,10 +110,10 @@ class RiskManager:
             )
 
         # 4. Consecutive loss cooldown
-        if self._consecutive_losses >= self.config.max_consecutive_losses:
+        if self._cooldown_cycles_remaining > 0:
             return RiskCheck(
                 False,
-                f"consecutive loss cooldown ({self._consecutive_losses} losses)",
+                f"consecutive loss cooldown ({self._cooldown_cycles_remaining} cycle remaining)",
             )
 
         # 5. Per-coin exposure limit
@@ -84,6 +122,11 @@ class RiskManager:
             coin_exposure = sum(
                 t.size for t in pending_trades
                 if _extract_coin(t.market_slug) == coin
+            )
+            coin_exposure += sum(
+                order.reserved_size
+                for order in (open_orders or [])
+                if _extract_coin(order.market_slug) == coin
             )
             if coin_exposure + size > self.config.max_exposure_per_coin:
                 return RiskCheck(
@@ -101,6 +144,12 @@ class RiskManager:
             self._daily_losses += trade.size
             self._consecutive_losses += 1
 
+            if self._consecutive_losses >= self.config.max_consecutive_losses:
+                self._cooldown_cycles_remaining = max(
+                    self._cooldown_cycles_remaining,
+                    self.config.consecutive_loss_cooldown_cycles,
+                )
+
             # Auto kill switch at 2x daily loss
             if self._daily_losses >= self.config.daily_max_loss * 2:
                 self.activate_kill_switch(
@@ -108,6 +157,7 @@ class RiskManager:
                 )
         elif trade.status == "won":
             self._consecutive_losses = 0
+            self._cooldown_cycles_remaining = 0
 
     def activate_kill_switch(self, reason: str):
         self._kill_switch = True
@@ -136,3 +186,11 @@ class RiskManager:
     @property
     def consecutive_losses(self) -> int:
         return self._consecutive_losses
+
+    @property
+    def cooldown_cycles_remaining(self) -> int:
+        return self._cooldown_cycles_remaining
+
+    @property
+    def peak_equity(self) -> float:
+        return self._peak_equity

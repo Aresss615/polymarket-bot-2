@@ -27,6 +27,9 @@ from config import (
     COIN_MIN_EDGE,
     NO_SIDE_EDGE_PREMIUM,
     BTC_NO_BLACKLISTED,
+    MIN_NO_ENTRY_PRICE,
+    MAX_NO_ENTRY_PRICE,
+    BLOCK_15M_NO,
     MAX_TAKER_FEE_RATE,
 )
 from price_feed import get_price, get_price_momentum, is_price_stale
@@ -115,7 +118,8 @@ def analyze_updown_market(udm: UpDownMarket, extra_min_edge: float = 0.0) -> tup
         boost = 0.03 + strength * 0.15  # 0.03 to ~0.09
     else:
         # No price data or neutral — scale boost by strength, require strong signal
-        if strength < 0.20:
+        min_strength_without_price = 0.24 if udm.interval_minutes == 15 else 0.20
+        if strength < min_strength_without_price:
             return None, f"{coin} skip: weak signal ({strength:.0%}) without price confirmation"
         boost = 0.02 + strength * 0.15  # 0.05 at strength=0.20 to ~0.077 at 0.38
 
@@ -149,6 +153,15 @@ def analyze_updown_market(udm: UpDownMarket, extra_min_edge: float = 0.0) -> tup
     if 0.70 <= entry_price <= 0.80:
         min_edge = max(min_edge, 0.07 + extra_min_edge)
 
+    if side == "NO" and entry_price < MIN_NO_ENTRY_PRICE:
+        return None, f"{coin} skip: NO entry {entry_price:.0%} < {MIN_NO_ENTRY_PRICE:.0%} floor"
+
+    if side == "NO" and entry_price >= MAX_NO_ENTRY_PRICE:
+        return None, f"{coin} skip: NO entry {entry_price:.0%} >= {MAX_NO_ENTRY_PRICE:.0%} cap"
+
+    if side == "NO" and udm.interval_minutes == 15 and BLOCK_15M_NO:
+        return None, f"{coin} skip: 15m NO disabled (negative confirmed segment)"
+
     # NO side requires extra edge — YES: 82% WR vs NO: 75% historically
     if side == "NO":
         min_edge += NO_SIDE_EDGE_PREMIUM
@@ -161,9 +174,11 @@ def analyze_updown_market(udm: UpDownMarket, extra_min_edge: float = 0.0) -> tup
     if effective_edge < min_edge:
         return None, f"{coin} skip: edge {abs(edge):.1%} - fee {estimated_fee:.1%} = {effective_edge:.1%} < min {min_edge:.1%} (entry {entry_price:.0%})"
 
-    # Confidence scales with edge magnitude and time proximity
-    # Closer to expiry = higher confidence, but cap at min_seconds
-    time_factor = max(0.5, 1.0 - (actual_seconds - min_seconds) / 30.0)  # 1.0 at min_seconds, 0.5 at min_seconds+30s
+    # 15m entries decay faster: later entries monetized better in the confirmed logs.
+    if udm.interval_minutes == 15:
+        time_factor = max(0.35, 1.0 - (actual_seconds - min_seconds) / 12.0)
+    else:
+        time_factor = max(0.5, 1.0 - (actual_seconds - min_seconds) / 30.0)
     edge_factor = min(abs(edge) / 0.12, 1.0)
     confidence = edge_factor * time_factor
 
