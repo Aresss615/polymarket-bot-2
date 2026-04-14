@@ -1,4 +1,4 @@
-"""Tests for v8 signal improvements: BTC NO blacklist, NO premium, fee-aware edge."""
+"""Tests for signal restrictions: BTC NO blacklist, NO gating, fee-aware edge."""
 
 from unittest.mock import patch
 from datetime import datetime, timezone, timedelta
@@ -64,14 +64,20 @@ class TestNoSideEdgePremium:
         assert signal.side == "YES"
 
     @patch("level_analyzer.get_price_momentum", return_value=-0.005)
-    def test_no_requires_more_edge(self, mock_mom, mock_stale):
-        """NO side requires +1% extra edge. Strong NO signals still pass."""
-        # SOL at 0.18 DOWN → NO side, entry at 0.82
-        # With 1% NO premium (reduced from 3%), strong NO signals pass
+    def test_no_high_entry_is_blocked(self, mock_mom, mock_stale):
+        """High-price NO entries are blocked because confirmed EV was negative."""
         udm = _make_updown(coin="SOL", up_price=0.18, down_price=0.82)
         signal, reason = analyze_updown_market(udm)
-        assert signal is not None
-        assert signal.side == "NO"
+        assert signal is None
+        assert "NO entry" in reason
+
+    @patch("level_analyzer.get_price_momentum", return_value=-0.005)
+    def test_15m_no_is_blocked(self, mock_mom, mock_stale):
+        """15m NO stays disabled until the confirmed segment improves."""
+        udm = _make_updown(coin="SOL", up_price=0.22, down_price=0.78, interval=15)
+        signal, reason = analyze_updown_market(udm)
+        assert signal is None
+        assert "15m NO disabled" in reason
 
 
 @patch("level_analyzer.is_price_stale", return_value=False)

@@ -43,15 +43,11 @@ def test_signal_yes_when_market_favors_up_with_confirmation(mock_mom):
 
 @patch("level_analyzer.get_price_momentum", return_value=-0.002)
 def test_no_side_requires_extra_edge(mock_mom):
-    """NO side requires 1% extra edge (reduced from 3%). Strong NO signals pass.
-
-    UP at 0.18 with negative momentum -> strong DOWN signal -> buy NO.
-    With reduced NO premium (1%), this trade should pass.
-    """
+    """High-price NO entries are filtered because confirmed EV was negative."""
     udm = _make_updown(coin="SOL", up_price=0.18, down_price=0.82)
     signal, reason = analyze_updown_market(udm)
-    assert signal is not None
-    assert signal.side == "NO"
+    assert signal is None
+    assert "NO entry" in reason
 
 
 @patch("level_analyzer.get_price_momentum", return_value=None)
@@ -138,8 +134,7 @@ def test_no_signal_insufficient_prices(mock_mom):
 
 @patch("level_analyzer.get_price_momentum", return_value=None)
 def test_strong_signal_no_momentum_still_trades(mock_mom):
-    """Very strong signal (83%) without price data still trades.
-    strength=0.33, boost=0.02+0.33*0.15=0.070, entry=0.83 (above 0.80 floor)."""
+    """Very strong YES signal without price data still trades."""
     udm = _make_updown(coin="SOL", up_price=0.83, down_price=0.17)
     signal, reason = analyze_updown_market(udm)
     assert signal is not None
@@ -148,7 +143,7 @@ def test_strong_signal_no_momentum_still_trades(mock_mom):
 
 @patch("level_analyzer.get_price_momentum", return_value=0.001)
 def test_moderate_signal_with_momentum_trades(mock_mom):
-    """Strong signal (83%) with price confirmation -> trade (entry 0.83, enough edge after fees)."""
+    """Strong YES signal with price confirmation still trades."""
     udm = _make_updown(coin="SOL", up_price=0.83, down_price=0.17)
     signal, reason = analyze_updown_market(udm)
     assert signal is not None
@@ -228,3 +223,12 @@ def test_15m_uses_higher_min_seconds(mock_mom):
     signal, reason = analyze_updown_market(udm_15m)
     assert signal is None
     assert "left" in reason  # "8s left < 10s min"
+
+@patch("level_analyzer.get_price_momentum", return_value=-0.002)
+def test_15m_no_is_disabled(mock_mom):
+    udm = _make_updown(coin="SOL", up_price=0.22, down_price=0.78, secs=14)
+    udm.interval_minutes = 15
+    udm.market.slug = "sol-updown-15m-123"
+    signal, reason = analyze_updown_market(udm)
+    assert signal is None
+    assert "15m NO disabled" in reason
