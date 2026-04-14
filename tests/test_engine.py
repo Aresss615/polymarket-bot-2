@@ -460,6 +460,61 @@ def test_zero_fill_cancel_releases_reserved_exposure():
     assert "btc-updown-5m-123" not in engine.traded_markets
 
 
+def test_reconciliation_logs_explicit_cancel_event():
+    executor = StubExecutor(
+        place_results=[
+            _make_result(
+                filled=False,
+                fill_size=0.0,
+                fill_shares=0.0,
+                fill_price=0.58,
+                order_id="live-1",
+                status="submitted",
+                requested_size=2.90,
+                requested_shares=5.0,
+                reserved_size=2.90,
+                remaining_size=2.90,
+                remaining_shares=5.0,
+                needs_reconciliation=True,
+                terminal=False,
+                raw_status="live",
+            )
+        ],
+        reconcile_results={
+            "live-1": [
+                _make_result(
+                    filled=False,
+                    fill_size=0.0,
+                    fill_shares=0.0,
+                    fill_price=0.58,
+                    order_id="live-1",
+                    status="cancelled",
+                    reason="maker_quote_age>1.5s",
+                    requested_size=2.90,
+                    requested_shares=5.0,
+                    reserved_size=0.0,
+                    remaining_size=0.0,
+                    remaining_shares=0.0,
+                    needs_reconciliation=False,
+                    terminal=True,
+                    raw_status="cancelled",
+                )
+            ]
+        },
+    )
+    with patch("engine.log_order_event") as mock_order_event:
+        engine = Engine(executor=executor)
+        trade = engine.execute_paper_trade(_make_signal())
+
+    assert trade is None
+    assert engine.open_orders == []
+    cancel_calls = [
+        call for call in mock_order_event.call_args_list
+        if call.args and call.args[0] == "cancel"
+    ]
+    assert cancel_calls, "expected a cancel lifecycle event"
+
+
 def test_restart_reconciliation_does_not_double_book_existing_fill():
     existing_trade = _make_trade()
     existing_open_order = _make_open_order(
