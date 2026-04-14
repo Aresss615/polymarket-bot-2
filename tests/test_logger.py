@@ -1,7 +1,15 @@
 from datetime import datetime, timezone
 
-from config import Trade
-from logger import init_csv, log_trade, read_trades, CSV_FIELDS
+from config import OpenOrder, Trade
+from logger import (
+    CSV_FIELDS,
+    init_csv,
+    init_open_orders_csv,
+    log_trade,
+    read_open_orders,
+    read_trades,
+    save_open_orders,
+)
 
 
 def _make_trade(**overrides):
@@ -19,6 +27,37 @@ def _make_trade(**overrides):
     )
     defaults.update(overrides)
     return Trade(**defaults)
+
+
+def _make_open_order(**overrides):
+    defaults = dict(
+        order_id="order-123",
+        created_at=datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc),
+        updated_at=datetime(2026, 4, 10, 12, 1, tzinfo=timezone.utc),
+        market_slug="btc-updown-5m-123",
+        question="BTC Up or Down?",
+        condition_id="0xbtc",
+        token_id="0xtoken",
+        strategy="updown",
+        side="YES",
+        confidence=0.95,
+        reason="test reason",
+        end_date=datetime(2026, 4, 10, 12, 5, tzinfo=timezone.utc),
+        market_type="5m",
+        strategy_version=9,
+        executor_type="LiveExecutor",
+        limit_price=0.58,
+        requested_size=2.90,
+        requested_shares=5.0,
+        reserved_size=1.74,
+        confirmed_fill_size=1.16,
+        confirmed_fill_shares=2.0,
+        confirmed_fees=0.01,
+        status="partial",
+        raw_status="live",
+    )
+    defaults.update(overrides)
+    return OpenOrder(**defaults)
 
 
 def test_init_csv_creates_header(tmp_csv):
@@ -60,7 +99,12 @@ def test_read_trades_empty(tmp_csv):
 
 
 def test_read_trades_roundtrip(tmp_csv):
-    original = _make_trade(status="won", payout=16.67)
+    original = _make_trade(
+        status="won",
+        payout=16.67,
+        order_id="order-abc",
+        executor_type="LiveExecutor",
+    )
     log_trade(original, tmp_csv)
     trades = read_trades(tmp_csv)
     assert len(trades) == 1
@@ -71,6 +115,8 @@ def test_read_trades_roundtrip(tmp_csv):
     assert trades[0].status == "won"
     assert abs(trades[0].payout - 16.67) < 0.01
     assert trades[0].end_date == original.end_date
+    assert trades[0].order_id == "order-abc"
+    assert trades[0].executor_type == "LiveExecutor"
 
 
 def test_csv_fields_match_trade():
@@ -87,6 +133,8 @@ def test_read_trades_legacy_csv_without_end_date(tmp_csv):
     trades = read_trades(tmp_csv)
     assert len(trades) == 1
     assert trades[0].end_date is None
+    assert trades[0].order_id == ""
+    assert trades[0].executor_type == ""
 
 
 def test_market_type_field_round_trip(tmp_csv):
@@ -133,3 +181,33 @@ def test_market_type_defaults_to_5m(tmp_csv):
     trades = read_trades(path=tmp_csv)
     assert len(trades) == 1
     assert trades[0].market_type == "5m"
+
+
+def test_init_open_orders_csv_creates_header(tmp_path):
+    path = tmp_path / "open_orders.csv"
+    init_open_orders_csv(path)
+    content = path.read_text()
+    assert "order_id" in content
+    assert "reserved_size" in content
+    assert "confirmed_fill_size" in content
+
+
+def test_open_orders_roundtrip(tmp_path):
+    path = tmp_path / "open_orders.csv"
+    original = _make_open_order()
+
+    save_open_orders([original], path)
+    orders = read_open_orders(path)
+
+    assert len(orders) == 1
+    assert orders[0].order_id == original.order_id
+    assert orders[0].market_slug == original.market_slug
+    assert orders[0].reserved_size == original.reserved_size
+    assert orders[0].confirmed_fill_size == original.confirmed_fill_size
+    assert orders[0].executor_type == original.executor_type
+    assert orders[0].status == "partial"
+
+
+def test_read_open_orders_empty(tmp_path):
+    path = tmp_path / "missing_open_orders.csv"
+    assert read_open_orders(path) == []
