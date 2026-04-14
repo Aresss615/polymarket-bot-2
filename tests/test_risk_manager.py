@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from config import Market, OpenOrder, Signal, Trade, RiskConfig
 from risk_manager import RiskManager
@@ -18,9 +18,9 @@ def _make_signal(slug="btc-updown-5m-1"):
     return Signal(market=market, strategy="updown", side="YES", confidence=0.8, reason="test")
 
 
-def _make_trade(slug="btc-updown-5m-1", size=5.0, status="pending"):
+def _make_trade(slug="btc-updown-5m-1", size=5.0, status="pending", timestamp=None):
     return Trade(
-        timestamp=datetime.now(timezone.utc),
+        timestamp=timestamp or datetime.now(timezone.utc),
         market_slug=slug,
         question="Test?",
         strategy="updown",
@@ -95,6 +95,52 @@ class TestDailyLossLimit:
         rm._daily_losses = 0.0
         check = rm.check_trade_allowed(_make_signal(), size=1.0, pending_trades=[])
         assert check.allowed is True
+
+    def test_bootstrap_from_history_restores_today_losses_and_cooldown(self):
+        now = datetime.now(timezone.utc)
+        trades = [
+            _make_trade(size=2.0, status="won", timestamp=now - timedelta(hours=2)),
+            _make_trade(size=3.0, status="lost", timestamp=now - timedelta(hours=1)),
+            _make_trade(size=4.0, status="lost", timestamp=now),
+        ]
+        rm = RiskManager(
+            RiskConfig(
+                daily_max_loss=999.0,
+                max_consecutive_losses=2,
+                consecutive_loss_cooldown_cycles=3,
+            )
+        )
+
+        rm.bootstrap_from_history(trades, account_equity=42.0)
+
+        assert rm.daily_pnl == -7.0
+        assert rm.consecutive_losses == 2
+        assert rm.cooldown_cycles_remaining == 3
+        assert rm.peak_equity == 42.0
+
+    def test_bootstrap_from_history_ignores_prior_day_losses(self):
+        now = datetime.now(timezone.utc)
+        trades = [
+            _make_trade(size=9.0, status="lost", timestamp=now - timedelta(days=1)),
+            _make_trade(size=4.0, status="lost", timestamp=now),
+        ]
+        rm = RiskManager(RiskConfig(daily_max_loss=999.0))
+
+        rm.bootstrap_from_history(trades)
+
+        assert rm.daily_pnl == -4.0
+
+    def test_bootstrap_from_history_restores_kill_switch(self):
+        now = datetime.now(timezone.utc)
+        trades = [
+            _make_trade(size=6.0, status="lost", timestamp=now - timedelta(minutes=10)),
+            _make_trade(size=5.0, status="lost", timestamp=now),
+        ]
+        rm = RiskManager(RiskConfig(daily_max_loss=5.0, max_consecutive_losses=10))
+
+        rm.bootstrap_from_history(trades)
+
+        assert rm.kill_switch_active is True
 
 
 class TestExposureCap:

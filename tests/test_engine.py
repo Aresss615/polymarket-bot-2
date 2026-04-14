@@ -1,5 +1,7 @@
 from collections import defaultdict
+from concurrent.futures import Future
 from datetime import datetime, timedelta, timezone
+import time
 from unittest.mock import patch
 
 import pytest
@@ -7,6 +9,7 @@ import pytest
 from config import (
     MAX_BET,
     MIN_BET,
+    NEWS_POLL_INTERVAL,
     STARTING_BALANCE,
     STRATEGY_VERSION,
     TICK_INTERVAL,
@@ -47,6 +50,19 @@ class StubExecutor(OrderExecutor):
     def reconcile_order(self, open_order: OpenOrder) -> OrderResult | None:
         if self.reconcile_results[open_order.order_id]:
             return self.reconcile_results[open_order.order_id].pop(0)
+        return None
+
+
+class PendingExecutor:
+    def __init__(self):
+        self.submissions = []
+
+    def submit(self, fn, *args, **kwargs):
+        future = Future()
+        self.submissions.append((fn, args, kwargs, future))
+        return future
+
+    def shutdown(self, **kwargs):
         return None
 
 
@@ -637,6 +653,58 @@ def test_settlement_timeout_logs_structured_event():
         snapshot_event="settlement",
     )
     mock_save.assert_called_once()
+
+
+def test_tick_starts_news_refresh_in_background_without_inline_fetch():
+    engine = Engine(executor=StubExecutor())
+    pending_executor = PendingExecutor()
+    engine._background_executor = pending_executor
+    engine.last_news_poll = time.time() - NEWS_POLL_INTERVAL - 1
+    market = _make_market()
+
+    with (
+        patch("engine.fetch_active_markets", return_value=[market]),
+        patch("engine.find_updown_markets", return_value=[]),
+        patch.object(engine, "_start_background_price_warm"),
+        patch("engine.fetch_google_news") as mock_news,
+        patch("engine.analyze_headlines") as mock_analyze,
+    ):
+        trades = engine.tick()
+
+    assert trades == []
+    assert len(pending_executor.submissions) == 1
+    submitted_fn, submitted_args, _, future = pending_executor.submissions[0]
+    assert submitted_fn.__func__ is Engine._run_news_refresh
+    assert submitted_args == ([market],)
+    assert engine._news_future is future
+    assert future.done() is False
+    mock_news.assert_not_called()
+    mock_analyze.assert_not_called()
+
+
+def test_tick_consumes_completed_news_refresh_and_executes_cached_signals():
+    engine = Engine(executor=StubExecutor())
+    market = _make_market()
+    signal = _make_signal(market=market, strategy="arbitrage")
+    trade = _make_trade(market_slug=market.slug, strategy="arbitrage", order_id="arb-1")
+    future = Future()
+    future.set_result(([{"title": "headline"}], [signal]))
+    engine._news_future = future
+    engine.last_news_poll = time.time()
+
+    with (
+        patch("engine.fetch_active_markets", return_value=[market]),
+        patch("engine.find_updown_markets", return_value=[]),
+        patch.object(engine, "_start_background_price_warm"),
+        patch.object(engine, "_try_execute", return_value=trade) as mock_try_execute,
+    ):
+        trades = engine.tick()
+
+    assert trades == [trade]
+    assert engine._news_future is None
+    assert engine.articles_found == [{"title": "headline"}]
+    assert engine._pending_arb_signals == []
+    mock_try_execute.assert_called_once_with(signal)
 
 
 def test_bet_size_scales_with_confidence():
