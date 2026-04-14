@@ -3,29 +3,30 @@ from collections import deque
 from datetime import datetime, timezone
 
 from config import (
-    Signal,
-    Trade,
+    BET_FRACTION,
+    MAX_BET,
+    MAX_BETS_PER_CYCLE,
+    MIN_BET,
+    NEWS_POLL_INTERVAL,
+    OpenOrder,
     RiskConfig,
     STARTING_BALANCE,
-    BET_FRACTION,
-    MIN_BET,
-    MAX_BET,
-    NEWS_POLL_INTERVAL,
-    TICK_INTERVAL,
-    MAX_BETS_PER_CYCLE,
-    SUPPORTED_COINS,
     STRATEGY_VERSION,
+    SUPPORTED_COINS,
+    TICK_INTERVAL,
+    Signal,
+    Trade,
 )
 from strategy_eval import evaluate_15m_mode
-from market_fetcher import fetch_active_markets, find_updown_markets, fetch_resolved_market
+from market_fetcher import fetch_active_markets, fetch_resolved_market, find_updown_markets
 from news_fetcher import fetch_google_news
 from level_analyzer import analyze_updown_market
 from arbitrage_analyzer import analyze_headlines
-from logger import log_trade, read_trades, save_trades
-from price_feed import get_price, get_prices_batch
+from logger import read_open_orders, read_trades, save_open_orders, save_trades
+from price_feed import get_prices_batch
 from order_executor import OrderExecutor, PaperExecutor
 from risk_manager import RiskManager
-from trade_logger import log_trade_jsonl, log_settlement, log_risk_block
+from trade_logger import log_order_event, log_risk_block, log_settlement, log_trade_jsonl
 
 
 class Engine:
@@ -33,6 +34,7 @@ class Engine:
         self.executor = executor or PaperExecutor()
         self.risk_manager = risk_manager or RiskManager(RiskConfig())
         self.trades: list[Trade] = []
+        self.open_orders: list[OpenOrder] = []
         self.traded_markets: set[str] = set()
         self.last_news_poll: float = time.time()
         self.running = False
@@ -46,24 +48,32 @@ class Engine:
         self.losses = 0
         self.mode_15m = evaluate_15m_mode([])  # default until first tick
         self._load_history()
+        if self.open_orders:
+            self._reconcile_open_orders()
 
     def _load_history(self):
-        """Restore state from trades CSV."""
+        """Restore confirmed positions and any persisted open live orders."""
         self.balance = STARTING_BALANCE
-        past_trades = read_trades()
-        if not past_trades:
-            return
+        self.trades = read_trades()
+        self.open_orders = read_open_orders()
 
-        self.trades = past_trades
-        for t in self.trades:
-            self.traded_markets.add(t.market_slug)
-            self.balance -= t.size
-            if t.status == "won":
-                self.balance += t.payout
+        for trade in self.trades:
+            self.traded_markets.add(trade.market_slug)
+            self.balance -= trade.size
+            if trade.status == "won":
+                self.balance += trade.payout
                 self.wins += 1
-            elif t.status == "lost":
+            elif trade.status == "lost":
                 self.losses += 1
-        self._log(f"Loaded {len(self.trades)} trades ({self.wins}W/{self.losses}L), balance ${self.balance:.2f}")
+
+        if self.trades:
+            self._log(
+                f"Loaded {len(self.trades)} trades ({self.wins}W/{self.losses}L), balance ${self.balance:.2f}"
+            )
+        if self.open_orders:
+            self._log(
+                f"Restored {len(self.open_orders)} open orders, ${self.reserved_open_exposure:.2f} reserved"
+            )
 
     def _log(self, msg: str):
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
@@ -83,89 +93,302 @@ class Engine:
     def total_pnl(self) -> float:
         return sum(t.payout - t.size for t in self.trades if t.status != "pending")
 
-    def bet_size(self, confidence: float, entry_price: float) -> float:
-        """Size based on payout asymmetry, not just confidence.
-
-        At high entry prices (0.85), one loss wipes ~6 wins because
-        win profit is only 17.6% of the bet while a loss is 100%.
-        This scales risk inversely with how many wins it takes to
-        recover a single loss at a given entry price.
-        """
-        # Wins needed to recover one loss: entry / (1 - entry)
-        # e.g., 0.85 → 5.67, 0.75 → 3.0, 0.65 → 1.86, 0.55 → 1.22
-        wins_to_recover = entry_price / (1.0 - entry_price)
-
-        # Bet less when recovery is harder. At 3 wins to recover → scale=1.0
-        risk_scale = min(1.5, 3.0 / wins_to_recover)
-
-        # Mild linear confidence scaling (NOT exponential)
-        conf_scale = 0.6 + confidence * 0.8  # range [0.6, 1.4]
-
-        fraction = BET_FRACTION * risk_scale * conf_scale
-        raw = self.balance * fraction
-        return max(MIN_BET, min(MAX_BET, raw))
-
     @property
     def pending_trades(self) -> list[Trade]:
         return [t for t in self.trades if t.status == "pending"]
 
-    def execute_paper_trade(self, signal: Signal) -> Trade:
-        """Execute a trade through the configured executor.
+    @property
+    def reserved_open_exposure(self) -> float:
+        return sum(order.reserved_size for order in self.open_orders)
 
-        Named execute_paper_trade for backwards compatibility, but routes
-        through self.executor (Paper, Simulation, or Live).
-        """
+    @property
+    def available_balance(self) -> float:
+        return max(0.0, self.balance - self.reserved_open_exposure)
+
+    @property
+    def active_order_markets(self) -> set[str]:
+        return {order.market_slug for order in self.open_orders}
+
+    def bet_size(self, confidence: float, entry_price: float) -> float:
+        """Size based on payout asymmetry, not just confidence."""
+        wins_to_recover = entry_price / (1.0 - entry_price)
+        risk_scale = min(1.5, 3.0 / wins_to_recover)
+        conf_scale = 0.6 + confidence * 0.8  # range [0.6, 1.4]
+        fraction = BET_FRACTION * risk_scale * conf_scale
+        raw = self.available_balance * fraction
+        return max(MIN_BET, min(MAX_BET, raw))
+
+    @staticmethod
+    def _market_type_from_slug(slug: str) -> str:
+        return "15m" if "-15m-" in slug else "5m"
+
+    @staticmethod
+    def _entry_price_for_signal(signal: Signal) -> float:
         price_idx = 0 if signal.side == "YES" else 1
-        entry_price = (
+        return (
             signal.market.outcome_prices[price_idx]
             if len(signal.market.outcome_prices) > price_idx
             else 0.5
         )
 
-        size = self.bet_size(signal.confidence, entry_price)
+    def _find_trade_by_order_id(self, order_id: str) -> Trade | None:
+        if not order_id:
+            return None
+        return next((trade for trade in self.trades if trade.order_id == order_id), None)
 
-        # Route through executor
-        result = self.executor.place_order(signal, size, entry_price)
-
-        if not result.filled:
-            self._log(f"  Order rejected: {result.reason}")
+    def _record_trade_fill(
+        self,
+        *,
+        market_slug: str,
+        question: str,
+        strategy: str,
+        side: str,
+        confidence: float,
+        reason: str,
+        end_date,
+        market_type: str,
+        executor_type: str,
+        order_id: str,
+        result,
+    ) -> Trade | None:
+        fill_shares = result.fill_shares
+        if fill_shares <= 0 and result.fill_price > 0:
+            fill_shares = result.fill_size / result.fill_price
+        if result.fill_size <= 0 or fill_shares <= 0:
             return None
 
-        # Detect market type from slug
-        market_type = "15m" if "-15m-" in signal.market.slug else "5m"
-        trade = Trade(
-            timestamp=datetime.now(timezone.utc),
+        trade = self._find_trade_by_order_id(order_id)
+        is_new = trade is None
+        if trade is None:
+            trade = Trade(
+                timestamp=datetime.now(timezone.utc),
+                market_slug=market_slug,
+                question=question,
+                strategy=strategy,
+                side=side,
+                entry_price=result.fill_price,
+                size=result.fill_size,
+                confidence=confidence,
+                reason=reason,
+                end_date=end_date,
+                market_type=market_type,
+                strategy_version=STRATEGY_VERSION,
+                fees=result.fees,
+                fill_price=result.fill_price,
+                order_id=order_id,
+                executor_type=executor_type,
+            )
+            self.trades.append(trade)
+            self.traded_markets.add(market_slug)
+        else:
+            existing_shares = trade.size / trade.entry_price if trade.entry_price > 0 else 0.0
+            total_cost = trade.size + result.fill_size
+            total_shares = existing_shares + fill_shares
+            avg_price = total_cost / total_shares if total_shares > 0 else result.fill_price
+            trade.size = total_cost
+            trade.entry_price = avg_price
+            trade.fill_price = avg_price
+            trade.fees += result.fees
+            trade.executor_type = trade.executor_type or executor_type
+
+        self.balance -= result.fill_size
+        if is_new:
+            from logger import log_trade
+
+            log_trade(trade)
+        else:
+            save_trades(self.trades)
+        log_trade_jsonl(trade, result, executor_type=executor_type, snapshot_event="fill")
+        return trade
+
+    def _create_open_order(self, signal: Signal, result) -> OpenOrder:
+        now = datetime.now(timezone.utc)
+        return OpenOrder(
+            order_id=result.order_id,
+            created_at=now,
+            updated_at=now,
             market_slug=signal.market.slug,
             question=signal.market.question,
+            condition_id=signal.market.condition_id,
+            token_id=result.token_id,
             strategy=signal.strategy,
             side=signal.side,
-            entry_price=result.fill_price,
-            size=result.fill_size,
             confidence=signal.confidence,
             reason=signal.reason,
             end_date=signal.market.end_date,
-            market_type=market_type,
+            market_type=self._market_type_from_slug(signal.market.slug),
             strategy_version=STRATEGY_VERSION,
-            fees=result.fees,
-            fill_price=result.fill_price,
+            executor_type=type(self.executor).__name__,
+            limit_price=result.fill_price,
+            requested_size=result.requested_size or result.reserved_size,
+            requested_shares=result.requested_shares,
+            reserved_size=result.remaining_size or result.reserved_size,
+            status=result.status,
+            raw_status=result.raw_status or result.status,
         )
-        self.trades.append(trade)
-        self.traded_markets.add(signal.market.slug)
-        self.balance -= result.fill_size
-        log_trade(trade)
-        log_trade_jsonl(trade, result, executor_type=type(self.executor).__name__)
+
+    def execute_paper_trade(self, signal: Signal) -> Trade | None:
+        """Execute a trade through the configured executor.
+
+        Named execute_paper_trade for backwards compatibility, but routes
+        through self.executor (Paper, Simulation, or Live).
+        """
+        entry_price = self._entry_price_for_signal(signal)
+        size = self.bet_size(signal.confidence, entry_price)
+        result = self.executor.place_order(signal, size, entry_price)
+
+        if result.fill_size > 0:
+            trade = self._record_trade_fill(
+                market_slug=signal.market.slug,
+                question=signal.market.question,
+                strategy=signal.strategy,
+                side=signal.side,
+                confidence=signal.confidence,
+                reason=signal.reason,
+                end_date=signal.market.end_date,
+                market_type=self._market_type_from_slug(signal.market.slug),
+                executor_type=type(self.executor).__name__,
+                order_id=result.order_id,
+                result=result,
+            )
+        else:
+            trade = None
+
+        if result.needs_reconciliation:
+            open_order = self._create_open_order(signal, result)
+            self.open_orders = [o for o in self.open_orders if o.order_id != open_order.order_id]
+            self.open_orders.append(open_order)
+            save_open_orders(self.open_orders)
+            log_order_event(
+                "submit",
+                open_order.order_id,
+                {
+                    "market_slug": open_order.market_slug,
+                    "side": open_order.side,
+                    "status": open_order.status,
+                    "raw_status": open_order.raw_status,
+                    "requested_size": open_order.requested_size,
+                    "reserved_size": open_order.reserved_size,
+                },
+            )
+            reconciled = self._reconcile_open_orders(order_ids={open_order.order_id})
+            return reconciled[-1] if reconciled else trade
+
+        if not result.filled:
+            self._log(f"  Order rejected: {result.reason}")
+            log_order_event(
+                "reject",
+                result.order_id,
+                {
+                    "market_slug": signal.market.slug,
+                    "side": signal.side,
+                    "status": result.status,
+                    "reason": result.reason,
+                },
+            )
+            return None
+
         return trade
+
+    def _reconcile_open_orders(
+        self,
+        *,
+        order_ids: set[str] | None = None,
+        max_orders: int | None = None,
+    ) -> list[Trade]:
+        if not self.open_orders:
+            return []
+
+        reconciled_trades: list[Trade] = []
+        changed = False
+        count = 0
+
+        for open_order in list(self.open_orders):
+            if order_ids is not None and open_order.order_id not in order_ids:
+                continue
+            if max_orders is not None and count >= max_orders:
+                break
+            count += 1
+
+            result = self.executor.reconcile_order(open_order)
+            if result is None:
+                continue
+
+            previous_status = open_order.status
+            previous_raw_status = open_order.raw_status
+            previous_reserved = open_order.reserved_size
+
+            trade = None
+            if result.fill_size > 0:
+                trade = self._record_trade_fill(
+                    market_slug=open_order.market_slug,
+                    question=open_order.question,
+                    strategy=open_order.strategy,
+                    side=open_order.side,
+                    confidence=open_order.confidence,
+                    reason=open_order.reason,
+                    end_date=open_order.end_date,
+                    market_type=open_order.market_type,
+                    executor_type=open_order.executor_type,
+                    order_id=open_order.order_id,
+                    result=result,
+                )
+                if trade:
+                    reconciled_trades.append(trade)
+
+            open_order.confirmed_fill_size += result.fill_size
+            open_order.confirmed_fill_shares += result.fill_shares
+            open_order.confirmed_fees += result.fees
+            open_order.reserved_size = result.remaining_size
+            open_order.status = result.status
+            open_order.raw_status = result.raw_status or result.status
+            open_order.updated_at = datetime.now(timezone.utc)
+
+            material_change = (
+                result.fill_size > 0
+                or result.terminal
+                or previous_status != open_order.status
+                or previous_raw_status != open_order.raw_status
+                or abs(previous_reserved - open_order.reserved_size) > 1e-9
+            )
+            if material_change:
+                changed = True
+                log_order_event(
+                    "reconcile",
+                    open_order.order_id,
+                    {
+                        "market_slug": open_order.market_slug,
+                        "side": open_order.side,
+                        "status": open_order.status,
+                        "raw_status": open_order.raw_status,
+                        "fill_size": result.fill_size,
+                        "fill_shares": result.fill_shares,
+                        "remaining_size": open_order.reserved_size,
+                        "terminal": result.terminal,
+                    },
+                )
+
+            if result.terminal or result.remaining_size <= 1e-9:
+                self.open_orders.remove(open_order)
+                changed = True
+
+        if changed:
+            save_open_orders(self.open_orders)
+
+        return reconciled_trades
 
     def _try_execute(self, signal: Signal) -> Trade | None:
         if signal.market.slug in self.traded_markets:
             self._log(f"  Skip (already traded): {signal.market.slug}")
             return None
-        if self.balance < MIN_BET:
-            self._log(f"  Skip (balance ${self.balance:.2f} < min ${MIN_BET})")
+        if signal.market.slug in self.active_order_markets:
+            self._log(f"  Skip (order already live): {signal.market.slug}")
+            return None
+        if self.available_balance < MIN_BET:
+            self._log(f"  Skip (available ${self.available_balance:.2f} < min ${MIN_BET})")
             return None
 
-        # Risk manager gate
-        size = self.bet_size(signal.confidence, signal.market.outcome_prices[0] if signal.side == "YES" else signal.market.outcome_prices[1] if len(signal.market.outcome_prices) > 1 else 0.5)
+        size = self.bet_size(signal.confidence, self._entry_price_for_signal(signal))
         risk_check = self.risk_manager.check_trade_allowed(signal, size, self.pending_trades)
         if not risk_check.allowed:
             self._log(f"  Risk blocked: {risk_check.reason}")
@@ -175,50 +398,39 @@ class Engine:
         return self.execute_paper_trade(signal)
 
     def settle_trades(self, max_checks: int = 3):
-        """Settle pending trades whose markets have been resolved on Polymarket.
-
-        Queries the Gamma API for each pending trade's market to check
-        if it has been resolved (outcome prices are exactly 1/0).
-        Caps API calls per tick to avoid blocking the trading loop.
-        """
+        """Settle pending trades whose markets have been resolved on Polymarket."""
         now = datetime.now(timezone.utc)
         settled = False
         api_calls = 0
+
         for trade in self.trades:
             if trade.status != "pending":
                 continue
-            if trade.end_date is not None:
-                # Wait at least 10s past expiry for Gamma to index
-                # Chainlink settles in ~1-5s, Gamma indexes in ~5-15s
-                if (now - trade.end_date).total_seconds() < 10:
-                    continue
+            if trade.end_date is not None and (now - trade.end_date).total_seconds() < 10:
+                continue
 
             if api_calls >= max_checks:
-                break  # remaining pending trades checked next tick
+                break
             api_calls += 1
 
             resolved = fetch_resolved_market(trade.market_slug)
             if resolved is None:
-                # Not yet resolved — check again next tick
-                # Give up after 10 minutes past expiry (if expiry is known)
                 if trade.end_date and (now - trade.end_date).total_seconds() > 600:
                     trade.status = "lost"
                     trade.payout = 0.0
                     self.losses += 1
                     self.risk_manager.record_trade_result(trade)
                     self._log(f"LOSS (unresolved after 10m): {trade.market_slug}")
+                    log_settlement(trade)
+                    log_trade_jsonl(trade, executor_type=trade.executor_type or type(self.executor).__name__, snapshot_event="settlement")
                     settled = True
                 continue
 
             outcomes = resolved["outcomes"]
             prices = resolved["outcome_prices"]
-
-            # Find which outcome won (price == 1.0)
             winning_idx = prices.index(1.0)
             winning_outcome = outcomes[winning_idx].strip().upper()
 
-            # Map outcome labels to YES/NO for updown markets
-            # "Up" = YES (first outcome), "Down" = NO (second outcome)
             if winning_outcome in ("UP", "YES"):
                 winning_side = "YES"
             elif winning_outcome in ("DOWN", "NO"):
@@ -237,8 +449,14 @@ class Engine:
                 trade.status = "lost"
                 self.losses += 1
                 self._log(f"LOSS: {trade.market_slug} -${trade.size:.2f}")
+
             self.risk_manager.record_trade_result(trade)
             log_settlement(trade)
+            log_trade_jsonl(
+                trade,
+                executor_type=trade.executor_type or type(self.executor).__name__,
+                snapshot_event="settlement",
+            )
             settled = True
 
         if settled:
@@ -250,14 +468,14 @@ class Engine:
         extra_edge = mode.edge_boost if mode and mode.tightened else 0.0
         extra_conf = mode.confidence_boost if mode and mode.tightened else 0.0
         for udm in self.updown_markets_found:
-            # Apply adaptive tightening for 15m markets
             edge_boost = extra_edge if udm.interval_minutes == 15 else 0.0
             conf_boost = extra_conf if udm.interval_minutes == 15 else 0.0
             signal, reason = analyze_updown_market(udm, extra_min_edge=edge_boost)
             if signal:
-                # Require higher confidence when tightened
                 if conf_boost > 0 and signal.confidence < conf_boost:
-                    self._log(f"  {udm.coin} skip: confidence {signal.confidence:.0%} < tightened min {conf_boost:.0%}")
+                    self._log(
+                        f"  {udm.coin} skip: confidence {signal.confidence:.0%} < tightened min {conf_boost:.0%}"
+                    )
                     continue
                 signals.append(signal)
             else:
@@ -281,8 +499,6 @@ class Engine:
         new_trades = []
         self.tick_count += 1
 
-        # === CRITICAL PATH: fetch → warm active coins → analyze → trade ===
-        # Market fetch first — this is the time-sensitive operation
         t0 = time.time()
         try:
             self.status = "Fetching markets"
@@ -294,7 +510,11 @@ class Engine:
             self.status = "Market fetch error"
             return new_trades
 
-        # Find updown markets and warm prices ONLY for coins that need analysis
+        reconciled = self._reconcile_open_orders()
+        if reconciled:
+            new_trades.extend(reconciled)
+            self._log(f"Reconciled {len(reconciled)} confirmed fill(s)")
+
         self.status = "Checking updown markets"
         try:
             all_updown = find_updown_markets(self.markets)
@@ -305,16 +525,19 @@ class Engine:
             self.updown_markets_found = all_updown
             udm_5m = [u for u in self.updown_markets_found if u.interval_minutes == 5]
             udm_15m = [u for u in self.updown_markets_found if u.interval_minutes == 15]
-            self._log(f"Found {len(udm_5m)} 5m + {len(udm_15m)} 15m updown markets | {mode_15m.reason}")
+            self._log(
+                f"Found {len(udm_5m)} 5m + {len(udm_15m)} 15m updown markets | {mode_15m.reason}"
+            )
 
-            # Warm prices for all active updown markets (both 5m and 15m)
             active_coins = {udm.coin for udm in self.updown_markets_found}
             if active_coins:
                 t0 = time.time()
                 self._warm_active_coins(active_coins)
                 warm_ms = (time.time() - t0) * 1000
                 if warm_ms > 2000:
-                    self._log(f"  Price warming slow: {warm_ms:.0f}ms for {len(active_coins)} coins")
+                    self._log(
+                        f"  Price warming slow: {warm_ms:.0f}ms for {len(active_coins)} coins"
+                    )
 
             signals = self.check_updown_markets()
             self._log(f"UpDown signals: {len(signals)}")
@@ -326,19 +549,18 @@ class Engine:
                     break
                 trade = self._try_execute(signal)
                 if trade:
-                    self._log(f"  TRADE: {trade.side} {trade.market_slug} @ ${trade.entry_price:.2f}, ${trade.size:.2f}")
+                    self._log(
+                        f"  TRADE: {trade.side} {trade.market_slug} @ ${trade.entry_price:.2f}, ${trade.size:.2f}"
+                    )
                     new_trades.append(trade)
+                if trade or signal.market.slug in self.active_order_markets:
                     cycle_bets += 1
         except Exception as e:
             self._log(f"UpDown check error: {e}")
             self.status = "UpDown check error"
 
-        # === NON-CRITICAL PATH: settle, news, background warming ===
-
-        # Settle expired trades (cap per tick to avoid blocking)
         self.settle_trades()
 
-        # Check news on interval
         now = time.time()
         secs_until_news = max(0, NEWS_POLL_INTERVAL - (now - self.last_news_poll))
         if secs_until_news == 0:
@@ -359,7 +581,6 @@ class Engine:
         else:
             self._log(f"Next news poll in {secs_until_news:.0f}s")
 
-        # Background: warm remaining coins for momentum history (single batch call)
         try:
             remaining = set(SUPPORTED_COINS.keys()) - {udm.coin for udm in self.updown_markets_found}
             if remaining:
@@ -376,7 +597,7 @@ class Engine:
     def _adaptive_interval(self) -> float:
         """Shorter tick interval when markets are approaching expiry."""
         if any(udm.seconds_to_close <= 30 for udm in self.updown_markets_found):
-            return 5.0  # poll faster near expiry
+            return 5.0
         return TICK_INTERVAL
 
     def run(self, interval: float = TICK_INTERVAL):

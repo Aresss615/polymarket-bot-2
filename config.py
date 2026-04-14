@@ -80,7 +80,7 @@ MAX_TAKER_FEE_RATE = 0.018    # 1.8% dynamic taker fee at price 0.50, lower at e
 # --- Risk Management ---
 DAILY_MAX_LOSS = 20          # stop trading if daily realized losses exceed this
 MAX_OPEN_EXPOSURE = 25.0       # max $ at risk across all pending trades
-MAX_CONSECUTIVE_LOSSES = 5     # pause 1 cycle after this many consecutive losses
+MAX_CONSECUTIVE_LOSSES = 10     # pause 1 cycle after this many consecutive losses
 MAX_EXPOSURE_PER_COIN = 10.0   # max $ exposure on any single coin
 SLIPPAGE_BUFFER = 0.02         # extra edge buffer for simulation/live modes
 
@@ -95,7 +95,7 @@ ARBITRAGE_CONFIDENCE_THRESHOLD = 0.85
 NEWS_POLL_INTERVAL = 300  # 5 minutes
 
 # --- Trading Settings ---
-STARTING_BALANCE = _LIVE_BALANCE if TRADING_MODE == "live" else 11.0
+STARTING_BALANCE = _LIVE_BALANCE if TRADING_MODE == "live" else 50.0
 BET_FRACTION = 0.08       # base risk fraction per trade (was 0.15; reduced to prevent outsized losses)
 MIN_BET = 1.0             # never bet less than $1
 MAX_BET = 5         # never bet more than $10 (was $50; $20 losses took 23 wins to recover)
@@ -123,6 +123,7 @@ SUPPORTED_COINS = {
 
 # --- File Paths ---
 TRADES_CSV = Path("trades.csv")
+OPEN_ORDERS_CSV = Path("open_orders.csv")
 
 
 # --- Data Models ---
@@ -184,6 +185,8 @@ class Trade:
     strategy_version: int = 0  # patch version that generated this trade
     fees: float = 0.0          # execution fees charged
     fill_price: float | None = None  # actual fill price (None = same as entry_price)
+    order_id: str = ""
+    executor_type: str = ""
 
 
 @dataclass
@@ -198,6 +201,47 @@ class OrderResult:
     order_id: str
     status: str       # "filled", "partial", "rejected"
     reason: str = ""  # rejection reason if applicable
+    fill_shares: float = 0.0
+    remaining_size: float = 0.0
+    remaining_shares: float = 0.0
+    reserved_size: float = 0.0
+    requested_size: float = 0.0
+    requested_shares: float = 0.0
+    token_id: str = ""
+    needs_reconciliation: bool = False
+    terminal: bool = True
+    raw_status: str = ""
+    raw_response: dict = field(default_factory=dict)
+
+
+@dataclass
+class OpenOrder:
+    """Persisted live order state awaiting reconciliation."""
+
+    order_id: str
+    created_at: datetime
+    updated_at: datetime
+    market_slug: str
+    question: str
+    condition_id: str
+    token_id: str
+    strategy: str
+    side: str
+    confidence: float
+    reason: str
+    end_date: datetime | None
+    market_type: str
+    strategy_version: int
+    executor_type: str
+    limit_price: float
+    requested_size: float
+    requested_shares: float
+    reserved_size: float
+    confirmed_fill_size: float = 0.0
+    confirmed_fill_shares: float = 0.0
+    confirmed_fees: float = 0.0
+    status: str = "submitted"
+    raw_status: str = ""
 
 
 @dataclass

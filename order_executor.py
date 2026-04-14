@@ -3,14 +3,25 @@
 Three modes:
 - PaperExecutor: instant fill at quoted price, zero fees (current behavior)
 - SimulationExecutor: realistic fills with fees, slippage, partial fills
-- LiveExecutor: stub for real CLOB execution (not yet implemented)
+- LiveExecutor: real CLOB execution with reconciliation-aware order state
 """
 
 import random
+import time
 import uuid
 from abc import ABC, abstractmethod
+from typing import Any
 
-from config import OrderResult, Signal, MAX_TAKER_FEE_RATE
+from config import MAX_TAKER_FEE_RATE, OpenOrder, OrderResult, Signal
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value in (None, ""):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 class OrderExecutor(ABC):
@@ -20,6 +31,14 @@ class OrderExecutor(ABC):
     def place_order(self, signal: Signal, size: float, entry_price: float) -> OrderResult:
         """Execute an order and return the result."""
 
+    def reconcile_order(self, open_order: OpenOrder) -> OrderResult | None:
+        """Fetch the latest order state and any newly confirmed fills."""
+        return None
+
+    def cancel_order(self, order_id: str) -> bool:
+        """Cancel an existing order if the executor supports it."""
+        return False
+
 
 class PaperExecutor(OrderExecutor):
     """Instant fill at quoted price with zero fees.
@@ -28,6 +47,7 @@ class PaperExecutor(OrderExecutor):
     """
 
     def place_order(self, signal: Signal, size: float, entry_price: float) -> OrderResult:
+        shares = size / entry_price if entry_price > 0 else 0.0
         return OrderResult(
             filled=True,
             fill_price=entry_price,
@@ -37,6 +57,9 @@ class PaperExecutor(OrderExecutor):
             latency_ms=0.0,
             order_id=f"paper-{uuid.uuid4().hex[:8]}",
             status="filled",
+            fill_shares=shares,
+            requested_size=size,
+            requested_shares=shares,
         )
 
 
@@ -45,7 +68,7 @@ def polymarket_taker_fee(price: float) -> float:
 
     Fee is highest (1.8%) at price 0.50 and decreases toward extremes.
     Formula: fee_rate = MAX_TAKER_FEE_RATE * (1 - 2 * |price - 0.50|)
-    Examples: price 0.50 → 1.8%, price 0.75 → 0.9%, price 0.85 → 0.54%
+    Examples: price 0.50 -> 1.8%, price 0.75 -> 0.9%, price 0.85 -> 0.54%
     """
     return max(0.0, MAX_TAKER_FEE_RATE * (1.0 - 2.0 * abs(price - 0.50)))
 
@@ -64,6 +87,8 @@ class SimulationExecutor(OrderExecutor):
         self._rng = random.Random(seed)
 
     def place_order(self, signal: Signal, size: float, entry_price: float) -> OrderResult:
+        requested_shares = size / entry_price if entry_price > 0 else 0.0
+
         # 2% rejection
         if self._rng.random() < 0.02:
             return OrderResult(
@@ -76,15 +101,15 @@ class SimulationExecutor(OrderExecutor):
                 order_id=f"sim-{uuid.uuid4().hex[:8]}",
                 status="rejected",
                 reason="simulated rejection (rate limit / stale)",
+                requested_size=size,
+                requested_shares=requested_shares,
             )
 
         # Fee calculation
         fee_rate = polymarket_taker_fee(entry_price)
-        fees = size * fee_rate
 
         # Adverse slippage: 0.5-1.5% of entry price
         slippage_pct = self._rng.uniform(0.005, 0.015)
-        # Slippage always makes the fill worse (higher price for buys)
         slippage = entry_price * slippage_pct
         fill_price = min(entry_price + slippage, 0.99)
 
@@ -97,7 +122,7 @@ class SimulationExecutor(OrderExecutor):
             fill_size = size
             status = "filled"
 
-        # Adjust fees for actual fill size
+        fill_shares = fill_size / fill_price if fill_price > 0 else 0.0
         fees = fill_size * fee_rate
 
         return OrderResult(
@@ -109,22 +134,18 @@ class SimulationExecutor(OrderExecutor):
             latency_ms=self._rng.uniform(50, 300),
             order_id=f"sim-{uuid.uuid4().hex[:8]}",
             status=status,
+            fill_shares=fill_shares,
+            requested_size=size,
+            requested_shares=requested_shares,
         )
 
 
 class LiveExecutor(OrderExecutor):
-    """Real CLOB execution via py-clob-client.
-
-    Places aggressive limit orders (market-taking) on the Polymarket CLOB.
-    Requires:
-    - POLYMARKET_PRIVATE_KEY env var (EOA private key)
-    - Wallet funded with USDC.e on Polygon
-    - At least one manual trade completed on polymarket.com UI
-    """
+    """Real CLOB execution via py-clob-client with explicit reconciliation."""
 
     def __init__(self, private_key: str, chain_id: int = 137, funder: str = None):
         from py_clob_client.client import ClobClient
-        from py_clob_client.clob_types import OrderArgs, OrderType
+        from py_clob_client.clob_types import OpenOrderParams, OrderArgs, OrderType, TradeParams
 
         self._client = ClobClient(
             "https://clob.polymarket.com",
@@ -136,40 +157,142 @@ class LiveExecutor(OrderExecutor):
         self._client.set_api_creds(self._client.create_or_derive_api_creds())
         self._OrderArgs = OrderArgs
         self._OrderType = OrderType
+        self._OpenOrderParams = OpenOrderParams
+        self._TradeParams = TradeParams
 
-    def place_order(self, signal: Signal, size: float, entry_price: float) -> OrderResult:
-        import time as _time
+    @staticmethod
+    def _is_fok_full_fill_error(detail: str) -> bool:
+        text = str(detail).lower()
+        return "fok" in text and "fully filled" in text and "killed" in text
 
-        def _is_fok_full_fill_error(detail: str) -> bool:
-            text = str(detail).lower()
-            return (
-                "fok" in text
-                and "fully filled" in text
-                and "killed" in text
+    @staticmethod
+    def _error_text(payload: Any) -> str:
+        if isinstance(payload, dict):
+            for key in ("errorMsg", "error", "error_message", "message", "detail"):
+                value = payload.get(key)
+                if value:
+                    return str(value)
+        for key in ("error_msg", "error", "message", "detail", "msg"):
+            value = getattr(payload, key, None)
+            if value:
+                return str(value)
+        status_code = getattr(payload, "status_code", None)
+        if status_code is not None:
+            return f"HTTP {status_code}: {getattr(payload, 'error_msg', payload)}"
+        return str(payload)
+
+    @staticmethod
+    def _normalize_status(status: Any) -> str:
+        return str(status or "").strip().lower()
+
+    def _make_rejection(
+        self,
+        *,
+        entry_price: float,
+        latency_ms: float,
+        reason: str,
+        requested_size: float,
+        requested_shares: float,
+        token_id: str = "",
+    ) -> OrderResult:
+        return OrderResult(
+            filled=False,
+            fill_price=entry_price,
+            fill_size=0.0,
+            fees=0.0,
+            slippage=0.0,
+            latency_ms=latency_ms,
+            order_id="",
+            status="rejected",
+            reason=reason,
+            requested_size=requested_size,
+            requested_shares=requested_shares,
+            token_id=token_id,
+        )
+
+    def _normalize_submit_response(
+        self,
+        *,
+        response: Any,
+        entry_price: float,
+        limit_price: float,
+        actual_size: float,
+        shares: float,
+        token_id: str,
+        latency_ms: float,
+    ) -> OrderResult:
+        if not isinstance(response, dict) or not (response.get("success") or response.get("orderID")):
+            return self._make_rejection(
+                entry_price=entry_price,
+                latency_ms=latency_ms,
+                reason=self._error_text(response),
+                requested_size=actual_size,
+                requested_shares=shares,
+                token_id=token_id,
             )
 
+        order_id = str(response.get("orderID", response.get("id", "")))
+        raw_status = self._normalize_status(response.get("status"))
+        terminal_statuses = {"cancelled", "canceled", "failed", "rejected", "expired"}
+        terminal = raw_status in terminal_statuses
+        normalized_status = "submitted" if not terminal else ("cancelled" if "cancel" in raw_status else "rejected")
+        reserved_size = 0.0 if terminal else actual_size
+        remaining_shares = 0.0 if terminal else shares
+        remaining_size = 0.0 if terminal else actual_size
+
+        return OrderResult(
+            filled=False,
+            fill_price=limit_price,
+            fill_size=0.0,
+            fees=0.0,
+            slippage=limit_price - entry_price,
+            latency_ms=latency_ms,
+            order_id=order_id,
+            status=normalized_status,
+            requested_size=actual_size,
+            requested_shares=shares,
+            token_id=token_id,
+            reserved_size=reserved_size,
+            remaining_size=remaining_size,
+            remaining_shares=remaining_shares,
+            needs_reconciliation=not terminal,
+            terminal=terminal,
+            raw_status=raw_status,
+            raw_response=response,
+        )
+
+    def place_order(self, signal: Signal, size: float, entry_price: float) -> OrderResult:
         token_idx = 0 if signal.side == "YES" else 1
         if token_idx >= len(signal.market.token_ids):
-            return OrderResult(
-                filled=False, fill_price=entry_price, fill_size=0.0,
-                fees=0.0, slippage=0.0, latency_ms=0.0,
-                order_id="", status="rejected",
+            return self._make_rejection(
+                entry_price=entry_price,
+                latency_ms=0.0,
                 reason=f"no token_id for index {token_idx}",
+                requested_size=size,
+                requested_shares=0.0,
             )
 
         token_id = signal.market.token_ids[token_idx]
 
-        # Aggressive limit: set price slightly above market to ensure fill
+        # Aggressive limit: preserve current live behavior in Phase 1.
         limit_price = round(min(entry_price + 0.02, 0.99), 2)
+        estimated_shares = size / limit_price if limit_price > 0 else 0.0
+        if estimated_shares < 0.1:
+            return self._make_rejection(
+                entry_price=entry_price,
+                latency_ms=0.0,
+                reason=f"shares too small ({estimated_shares:.3f} < 0.1)",
+                requested_size=size,
+                requested_shares=estimated_shares,
+                token_id=token_id,
+            )
 
-        # Size in shares: USDC amount / price
-        # Polymarket minimum order size is 5 shares
-        MIN_SHARES = 5.0
-        shares = max(round(size / limit_price, 2), MIN_SHARES)
-        # Recalculate actual USDC cost from adjusted shares
+        min_shares = 5.0
+        shares = max(round(size / limit_price, 2), min_shares)
         actual_size = round(shares * limit_price, 2)
 
-        t0 = _time.time()
+        t0 = time.time()
+        signed_order = None
         try:
             order_args = self._OrderArgs(
                 token_id=token_id,
@@ -178,70 +301,191 @@ class LiveExecutor(OrderExecutor):
                 side="BUY",
             )
             signed_order = self._client.create_order(order_args)
-            resp = self._client.post_order(signed_order, self._OrderType.FOK)
-
-            # FOK rejects if full size cannot fill instantly. Retry with GTC so
-            # aggressive orders can still execute instead of being hard-killed.
-            if _is_fok_full_fill_error(resp.get("errorMsg", resp)):
-                resp = self._client.post_order(signed_order, self._OrderType.GTC)
-
-            latency_ms = (_time.time() - t0) * 1000
-
-            if resp.get("success") or resp.get("orderID"):
-                order_id = resp.get("orderID", resp.get("id", "unknown"))
-                fee_rate = polymarket_taker_fee(limit_price)
-                fees = actual_size * fee_rate
-
-                return OrderResult(
-                    filled=True,
-                    fill_price=limit_price,
-                    fill_size=actual_size,
-                    fees=fees,
-                    slippage=limit_price - entry_price,
-                    latency_ms=latency_ms,
-                    order_id=str(order_id),
-                    status="filled",
-                )
-            else:
-                return OrderResult(
-                    filled=False, fill_price=entry_price, fill_size=0.0,
-                    fees=0.0, slippage=0.0, latency_ms=latency_ms,
-                    order_id="", status="rejected",
-                    reason=str(resp.get("errorMsg", resp)),
-                )
-        except Exception as e:
-            # Some clients raise HTTP 400 for FOK full-fill failure. Retry once
-            # with GTC before returning rejection.
-            if hasattr(e, 'status_code') and int(getattr(e, 'status_code', 0)) == 400:
-                try:
-                    err_msg = f"HTTP {e.status_code}: {getattr(e, 'error_msg', e)}"
-                    if _is_fok_full_fill_error(err_msg):
-                        resp = self._client.post_order(signed_order, self._OrderType.GTC)
-                        latency_ms = (_time.time() - t0) * 1000
-                        if resp.get("success") or resp.get("orderID"):
-                            order_id = resp.get("orderID", resp.get("id", "unknown"))
-                            fee_rate = polymarket_taker_fee(limit_price)
-                            fees = actual_size * fee_rate
-                            return OrderResult(
-                                filled=True,
-                                fill_price=limit_price,
-                                fill_size=actual_size,
-                                fees=fees,
-                                slippage=limit_price - entry_price,
-                                latency_ms=latency_ms,
-                                order_id=str(order_id),
-                                status="filled",
-                            )
-                except Exception:
-                    pass
-
-            latency_ms = (_time.time() - t0) * 1000
-            err_detail = repr(e)
-            if hasattr(e, 'status_code'):
-                err_detail = f"HTTP {e.status_code}: {getattr(e, 'error_msg', e)}"
-            return OrderResult(
-                filled=False, fill_price=entry_price, fill_size=0.0,
-                fees=0.0, slippage=0.0, latency_ms=latency_ms,
-                order_id="", status="rejected",
-                reason=err_detail,
+            response = self._client.post_order(signed_order, self._OrderType.FOK)
+            if self._is_fok_full_fill_error(self._error_text(response)):
+                response = self._client.post_order(signed_order, self._OrderType.GTC)
+            latency_ms = (time.time() - t0) * 1000
+            return self._normalize_submit_response(
+                response=response,
+                entry_price=entry_price,
+                limit_price=limit_price,
+                actual_size=actual_size,
+                shares=shares,
+                token_id=token_id,
+                latency_ms=latency_ms,
             )
+        except Exception as exc:
+            err_detail = self._error_text(exc)
+            if signed_order is not None and self._is_fok_full_fill_error(err_detail):
+                try:
+                    response = self._client.post_order(signed_order, self._OrderType.GTC)
+                    latency_ms = (time.time() - t0) * 1000
+                    return self._normalize_submit_response(
+                        response=response,
+                        entry_price=entry_price,
+                        limit_price=limit_price,
+                        actual_size=actual_size,
+                        shares=shares,
+                        token_id=token_id,
+                        latency_ms=latency_ms,
+                    )
+                except Exception as retry_error:
+                    err_detail = self._error_text(retry_error)
+
+            latency_ms = (time.time() - t0) * 1000
+            return self._make_rejection(
+                entry_price=entry_price,
+                latency_ms=latency_ms,
+                reason=err_detail,
+                requested_size=actual_size,
+                requested_shares=shares,
+                token_id=token_id,
+            )
+
+    def cancel_order(self, order_id: str) -> bool:
+        try:
+            response = self._client.cancel(order_id)
+            if isinstance(response, dict):
+                return not bool(response.get("errorMsg") or response.get("error"))
+            return True
+        except Exception:
+            return False
+
+    def _get_order_payload(self, order_id: str) -> dict | None:
+        try:
+            payload = self._client.get_order(order_id)
+            if isinstance(payload, dict) and payload:
+                return payload
+        except Exception:
+            pass
+
+        try:
+            results = self._client.get_orders(self._OpenOrderParams(id=order_id))
+            if results:
+                return results[0]
+        except Exception:
+            pass
+        return None
+
+    def _matching_trade_totals(self, open_order: OpenOrder) -> tuple[float, float, float, int]:
+        confirmed_shares = 0.0
+        confirmed_cost = 0.0
+        confirmed_fees = 0.0
+        matches = 0
+
+        try:
+            trades = self._client.get_trades(
+                self._TradeParams(
+                    market=open_order.condition_id,
+                    asset_id=open_order.token_id,
+                )
+            )
+        except Exception:
+            return confirmed_shares, confirmed_cost, confirmed_fees, matches
+
+        for trade in trades or []:
+            status = str(trade.get("status", "")).upper()
+            if "CONFIRMED" not in status:
+                continue
+
+            matched_shares = 0.0
+            price = _safe_float(trade.get("price"), open_order.limit_price)
+            fee_rate_bps = _safe_float(trade.get("fee_rate_bps"), 0.0)
+
+            if trade.get("taker_order_id") == open_order.order_id:
+                matched_shares = _safe_float(trade.get("size"), 0.0)
+            else:
+                for maker_order in trade.get("maker_orders") or []:
+                    if maker_order.get("order_id") == open_order.order_id:
+                        matched_shares = _safe_float(
+                            maker_order.get("matched_amount"),
+                            _safe_float(trade.get("size"), 0.0),
+                        )
+                        price = _safe_float(maker_order.get("price"), price)
+                        fee_rate_bps = _safe_float(maker_order.get("fee_rate_bps"), fee_rate_bps)
+                        break
+
+            if matched_shares <= 0:
+                continue
+
+            matches += 1
+            fill_cost = matched_shares * price
+            confirmed_shares += matched_shares
+            confirmed_cost += fill_cost
+            confirmed_fees += fill_cost * fee_rate_bps / 10000.0
+
+        return confirmed_shares, confirmed_cost, confirmed_fees, matches
+
+    def reconcile_order(self, open_order: OpenOrder) -> OrderResult:
+        t0 = time.time()
+        order_payload = self._get_order_payload(open_order.order_id)
+        raw_status = self._normalize_status((order_payload or {}).get("status")) or open_order.raw_status
+
+        confirmed_shares, confirmed_cost, confirmed_fees, match_count = self._matching_trade_totals(open_order)
+        confirmed_shares = max(confirmed_shares, open_order.confirmed_fill_shares)
+        confirmed_cost = max(confirmed_cost, open_order.confirmed_fill_size)
+        confirmed_fees = max(confirmed_fees, open_order.confirmed_fees)
+
+        delta_shares = max(confirmed_shares - open_order.confirmed_fill_shares, 0.0)
+        delta_cost = max(confirmed_cost - open_order.confirmed_fill_size, 0.0)
+        delta_fees = max(confirmed_fees - open_order.confirmed_fees, 0.0)
+
+        matched_shares = confirmed_shares
+        original_shares = open_order.requested_shares
+        if order_payload:
+            original_shares = _safe_float(order_payload.get("original_size"), open_order.requested_shares)
+            matched_shares = max(
+                matched_shares,
+                _safe_float(order_payload.get("size_matched"), confirmed_shares),
+            )
+
+        terminal_statuses = {"cancelled", "canceled", "filled", "confirmed", "failed", "rejected", "expired"}
+        terminal = raw_status in terminal_statuses
+        remaining_shares = max(original_shares - matched_shares, 0.0)
+        if terminal and raw_status in {"cancelled", "canceled", "failed", "rejected", "expired"}:
+            remaining_shares = 0.0
+        remaining_size = remaining_shares * open_order.limit_price
+
+        if remaining_shares <= 1e-9 and (confirmed_shares > 0 or terminal):
+            terminal = True
+
+        if delta_shares > 0:
+            status = "filled" if remaining_shares <= 1e-9 else "partial"
+        elif terminal and confirmed_shares <= 1e-9:
+            status = "cancelled" if "cancel" in raw_status else "rejected"
+        elif confirmed_shares > 0 and remaining_shares <= 1e-9:
+            status = "filled"
+        elif confirmed_shares > 0:
+            status = "partial"
+        else:
+            status = "submitted"
+
+        fill_price = open_order.limit_price
+        if delta_shares > 0:
+            fill_price = delta_cost / delta_shares
+
+        latency_ms = (time.time() - t0) * 1000
+        return OrderResult(
+            filled=delta_shares > 0,
+            fill_price=fill_price,
+            fill_size=delta_cost,
+            fees=delta_fees,
+            slippage=fill_price - open_order.limit_price if delta_shares > 0 else 0.0,
+            latency_ms=latency_ms,
+            order_id=open_order.order_id,
+            status=status,
+            fill_shares=delta_shares,
+            remaining_size=remaining_size,
+            remaining_shares=remaining_shares,
+            reserved_size=remaining_size,
+            requested_size=open_order.requested_size,
+            requested_shares=open_order.requested_shares,
+            token_id=open_order.token_id,
+            needs_reconciliation=not terminal,
+            terminal=terminal,
+            raw_status=raw_status,
+            raw_response={
+                "order": order_payload or {},
+                "confirmed_trade_matches": match_count,
+            },
+        )
