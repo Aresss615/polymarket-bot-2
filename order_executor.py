@@ -148,6 +148,21 @@ class LiveExecutor(OrderExecutor):
                 and "killed" in text
             )
 
+        def _error_text(payload) -> str:
+            if isinstance(payload, dict):
+                for key in ("errorMsg", "error", "error_message", "message", "detail"):
+                    value = payload.get(key)
+                    if value:
+                        return str(value)
+            for key in ("error_msg", "error", "message", "detail", "msg"):
+                value = getattr(payload, key, None)
+                if value:
+                    return str(value)
+            status_code = getattr(payload, "status_code", None)
+            if status_code is not None:
+                return f"HTTP {status_code}: {getattr(payload, 'error_msg', payload)}"
+            return str(payload)
+
         token_idx = 0 if signal.side == "YES" else 1
         if token_idx >= len(signal.market.token_ids):
             return OrderResult(
@@ -164,12 +179,27 @@ class LiveExecutor(OrderExecutor):
 
         # Size in shares: USDC amount / price
         # Polymarket minimum order size is 5 shares
+        estimated_shares = size / limit_price
+        if estimated_shares < 0.1:
+            return OrderResult(
+                filled=False,
+                fill_price=entry_price,
+                fill_size=0.0,
+                fees=0.0,
+                slippage=0.0,
+                latency_ms=0.0,
+                order_id="",
+                status="rejected",
+                reason=f"shares too small ({estimated_shares:.3f} < 0.1)",
+            )
+
         MIN_SHARES = 5.0
         shares = max(round(size / limit_price, 2), MIN_SHARES)
         # Recalculate actual USDC cost from adjusted shares
         actual_size = round(shares * limit_price, 2)
 
         t0 = _time.time()
+        signed_order = None
         try:
             order_args = self._OrderArgs(
                 token_id=token_id,
@@ -182,12 +212,12 @@ class LiveExecutor(OrderExecutor):
 
             # FOK rejects if full size cannot fill instantly. Retry with GTC so
             # aggressive orders can still execute instead of being hard-killed.
-            if _is_fok_full_fill_error(resp.get("errorMsg", resp)):
+            if _is_fok_full_fill_error(_error_text(resp)):
                 resp = self._client.post_order(signed_order, self._OrderType.GTC)
 
             latency_ms = (_time.time() - t0) * 1000
 
-            if resp.get("success") or resp.get("orderID"):
+            if isinstance(resp, dict) and (resp.get("success") or resp.get("orderID")):
                 order_id = resp.get("orderID", resp.get("id", "unknown"))
                 fee_rate = polymarket_taker_fee(limit_price)
                 fees = actual_size * fee_rate
@@ -207,38 +237,35 @@ class LiveExecutor(OrderExecutor):
                     filled=False, fill_price=entry_price, fill_size=0.0,
                     fees=0.0, slippage=0.0, latency_ms=latency_ms,
                     order_id="", status="rejected",
-                    reason=str(resp.get("errorMsg", resp)),
+                    reason=_error_text(resp),
                 )
         except Exception as e:
-            # Some clients raise HTTP 400 for FOK full-fill failure. Retry once
-            # with GTC before returning rejection.
-            if hasattr(e, 'status_code') and int(getattr(e, 'status_code', 0)) == 400:
+            # Retry once if the failure text matches the known FOK full-fill
+            # rejection, regardless of whether the client raised or returned it.
+            err_detail = _error_text(e)
+            if signed_order is not None and _is_fok_full_fill_error(err_detail):
                 try:
-                    err_msg = f"HTTP {e.status_code}: {getattr(e, 'error_msg', e)}"
-                    if _is_fok_full_fill_error(err_msg):
-                        resp = self._client.post_order(signed_order, self._OrderType.GTC)
-                        latency_ms = (_time.time() - t0) * 1000
-                        if resp.get("success") or resp.get("orderID"):
-                            order_id = resp.get("orderID", resp.get("id", "unknown"))
-                            fee_rate = polymarket_taker_fee(limit_price)
-                            fees = actual_size * fee_rate
-                            return OrderResult(
-                                filled=True,
-                                fill_price=limit_price,
-                                fill_size=actual_size,
-                                fees=fees,
-                                slippage=limit_price - entry_price,
-                                latency_ms=latency_ms,
-                                order_id=str(order_id),
-                                status="filled",
-                            )
-                except Exception:
-                    pass
+                    resp = self._client.post_order(signed_order, self._OrderType.GTC)
+                    latency_ms = (_time.time() - t0) * 1000
+                    if isinstance(resp, dict) and (resp.get("success") or resp.get("orderID")):
+                        order_id = resp.get("orderID", resp.get("id", "unknown"))
+                        fee_rate = polymarket_taker_fee(limit_price)
+                        fees = actual_size * fee_rate
+                        return OrderResult(
+                            filled=True,
+                            fill_price=limit_price,
+                            fill_size=actual_size,
+                            fees=fees,
+                            slippage=limit_price - entry_price,
+                            latency_ms=latency_ms,
+                            order_id=str(order_id),
+                            status="filled",
+                        )
+                    err_detail = _error_text(resp)
+                except Exception as retry_error:
+                    err_detail = _error_text(retry_error)
 
             latency_ms = (_time.time() - t0) * 1000
-            err_detail = repr(e)
-            if hasattr(e, 'status_code'):
-                err_detail = f"HTTP {e.status_code}: {getattr(e, 'error_msg', e)}"
             return OrderResult(
                 filled=False, fill_price=entry_price, fill_size=0.0,
                 fees=0.0, slippage=0.0, latency_ms=latency_ms,

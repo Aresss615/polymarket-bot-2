@@ -80,7 +80,7 @@ MAX_TAKER_FEE_RATE = 0.018    # 1.8% dynamic taker fee at price 0.50, lower at e
 # --- Risk Management ---
 DAILY_MAX_LOSS = 20          # stop trading if daily realized losses exceed this
 MAX_OPEN_EXPOSURE = 25.0       # max $ at risk across all pending trades
-MAX_CONSECUTIVE_LOSSES = 5     # pause 1 cycle after this many consecutive losses
+MAX_CONSECUTIVE_LOSSES = 10     # pause 1 cycle after this many consecutive losses
 MAX_EXPOSURE_PER_COIN = 10.0   # max $ exposure on any single coin
 SLIPPAGE_BUFFER = 0.02         # extra edge buffer for simulation/live modes
 
@@ -95,7 +95,7 @@ ARBITRAGE_CONFIDENCE_THRESHOLD = 0.85
 NEWS_POLL_INTERVAL = 300  # 5 minutes
 
 # --- Trading Settings ---
-STARTING_BALANCE = _LIVE_BALANCE if TRADING_MODE == "live" else 11.0
+STARTING_BALANCE = _LIVE_BALANCE if TRADING_MODE == "live" else 50.0
 BET_FRACTION = 0.08       # base risk fraction per trade (was 0.15; reduced to prevent outsized losses)
 MIN_BET = 1.0             # never bet less than $1
 MAX_BET = 5         # never bet more than $10 (was $50; $20 losses took 23 wins to recover)

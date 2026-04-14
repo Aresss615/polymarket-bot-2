@@ -6,6 +6,7 @@ ClobClient is mocked to simulate responses.
 from unittest.mock import patch, MagicMock
 
 from config import Market, Signal
+from py_clob_client.exceptions import PolyApiException
 from order_executor import LiveExecutor, polymarket_taker_fee
 
 
@@ -91,6 +92,42 @@ def test_live_executor_fok_retries_with_gtc(MockClient):
 
     assert result.filled is True
     assert result.order_id == "gtc-order-123"
+    assert instance.post_order.call_count == 2
+
+
+@patch("py_clob_client.client.ClobClient", autospec=True)
+def test_live_executor_fok_retries_with_gtc_from_error_key(MockClient):
+    """FOK full-fill rejection in the generic error field should also retry."""
+    executor, instance = _make_executor(MockClient)
+    instance.create_order.return_value = {"signed": True}
+    instance.post_order.side_effect = [
+        {"error": "order couldn't be fully filled. FOK orders are fully filled or killed."},
+        {"success": True, "orderID": "gtc-order-456"},
+    ]
+
+    signal = _make_signal(side="YES")
+    result = executor.place_order(signal, size=1.0, entry_price=0.80)
+
+    assert result.filled is True
+    assert result.order_id == "gtc-order-456"
+    assert instance.post_order.call_count == 2
+
+
+@patch("py_clob_client.client.ClobClient", autospec=True)
+def test_live_executor_fok_retries_with_gtc_from_poly_api_exception(MockClient):
+    """PolyApiException with the FOK full-fill message should also retry."""
+    executor, instance = _make_executor(MockClient)
+    instance.create_order.return_value = {"signed": True}
+    instance.post_order.side_effect = [
+        PolyApiException(error_msg="order couldn't be fully filled. FOK orders are fully filled or killed."),
+        {"success": True, "orderID": "gtc-order-789"},
+    ]
+
+    signal = _make_signal(side="YES")
+    result = executor.place_order(signal, size=1.0, entry_price=0.80)
+
+    assert result.filled is True
+    assert result.order_id == "gtc-order-789"
     assert instance.post_order.call_count == 2
 
 
