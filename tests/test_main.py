@@ -5,6 +5,8 @@ from config import (
     LIVE_DAILY_MAX_LOSS,
     LIVE_MAX_OPEN_EXPOSURE,
     MAX_EXPOSURE_PER_COIN,
+    SIMULATION_DAILY_MAX_LOSS,
+    SIMULATION_MAX_OPEN_EXPOSURE,
 )
 
 dashboard_stub = ModuleType("dashboard")
@@ -28,3 +30,12 @@ def test_build_risk_config_keeps_repo_defaults_for_non_live():
 
     assert paper_config.daily_max_loss != live_config.daily_max_loss
     assert paper_config.max_open_exposure != live_config.max_open_exposure
+
+
+def test_build_risk_config_uses_relaxed_simulation_limits():
+    config = build_risk_config("simulation")
+
+    assert config.daily_max_loss == SIMULATION_DAILY_MAX_LOSS
+    assert config.max_open_exposure == SIMULATION_MAX_OPEN_EXPOSURE
+    assert config.hard_position_cap_pct == 1.0
+    assert config.max_open_exposure_pct > 1.0

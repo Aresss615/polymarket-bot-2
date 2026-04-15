@@ -7,7 +7,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from config import STRATEGY_VERSION, TRADING_MODE
+from config import CODEX_VERSION, STRATEGY_VERSION, TRADING_MODE
 from strategy_eval import compute_patch_stats
 
 # Extract coin ticker from updown slugs like "btc-updown-5m-123"
@@ -46,6 +46,7 @@ def make_dashboard(engine) -> Layout:
     mode_style = {"paper": "dim", "simulation": "yellow", "live": "bold red"}.get(TRADING_MODE, "dim")
     header_text.append(f"{mode_label} ", style=mode_style)
     header_text.append("Polymarket Bot", style="bold white")
+    header_text.append(f"  |  Codex {CODEX_VERSION}", style="cyan")
     header_text.append(f"  |  Balance: ${engine.balance:,.2f}", style="bold white")
     header_text.append(f"  |  v{STRATEGY_VERSION} P&L: {pnl_str}", style=f"bold {pnl_style}")
     header_text.append(f" ({v_wins}W/{v_losses}L {wr_str})", style="white")
@@ -58,7 +59,7 @@ def make_dashboard(engine) -> Layout:
     mode = getattr(engine, "mode_15m", None)
 
     stats_text = Text()
-    stats_text.append(f"Patch v{STRATEGY_VERSION}", style="bold white")
+    stats_text.append(f"Codex {CODEX_VERSION} / Patch v{STRATEGY_VERSION}", style="bold white")
     stats_text.append(f"  Trades: {patch.settled_trades}/{patch.total_trades}")
     if patch.settled_trades > 0:
         stats_text.append(f"  WR: {patch.win_rate:.0%}")

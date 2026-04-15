@@ -21,6 +21,7 @@ from config import (
     UpDownMarket,
 )
 from engine import Engine
+from level_analyzer import UpdownAnalysis
 from order_executor import OrderExecutor
 
 
@@ -88,6 +89,7 @@ def _clean_engine():
         patch("engine.log_trade_jsonl"),
         patch("engine.log_settlement"),
         patch("engine.log_risk_block"),
+        patch("engine.log_signal_event"),
         patch("engine.log_order_event"),
         patch("logger.log_trade"),
     ):
@@ -115,6 +117,11 @@ def _make_signal(market=None, strategy="updown", side="YES", confidence=0.95):
         side=side,
         confidence=confidence,
         reason="test reason",
+        coin="BTC",
+        cluster_id="crypto_beta",
+        signal_epoch_id="epoch-1",
+        expected_fill_price=0.57,
+        expected_cost=0.02,
     )
 
 
@@ -263,6 +270,10 @@ def test_live_submit_without_confirmed_fill_creates_open_order_only():
     assert engine.reserved_open_exposure == pytest.approx(2.90)
     assert engine.available_balance == pytest.approx(STARTING_BALANCE - 2.90)
     assert "btc-updown-5m-123" not in engine.traded_markets
+    assert engine.open_orders[0].cluster_id == "crypto_beta"
+    assert engine.open_orders[0].signal_epoch_id == "epoch-1"
+    assert engine.open_orders[0].expected_fill_price == pytest.approx(0.57)
+    assert engine.open_orders[0].expected_cost == pytest.approx(0.02)
 
 
 def test_live_partial_fill_books_only_matched_size_and_keeps_order_open():
@@ -580,9 +591,11 @@ def test_try_execute_skips_market_with_active_open_order():
     engine = Engine(executor=executor)
     engine.open_orders.append(_make_open_order())
 
-    trade = engine._try_execute(_make_signal())
+    trade, stage, reason = engine._try_execute(_make_signal())
 
     assert trade is None
+    assert stage == "active_order_skip"
+    assert "live" in reason
     assert executor.place_calls == []
 
 
@@ -617,7 +630,6 @@ def test_tick_reconciles_open_orders_before_new_signals():
     with (
         patch("engine.fetch_active_markets", return_value=[market]),
         patch("engine.find_updown_markets", return_value=[]),
-        patch("engine.fetch_google_news", return_value=[]),
     ):
         trades = engine.tick()
 
@@ -655,56 +667,85 @@ def test_settlement_timeout_logs_structured_event():
     mock_save.assert_called_once()
 
 
-def test_tick_starts_news_refresh_in_background_without_inline_fetch():
+def test_tick_does_not_schedule_news_refresh_when_news_trading_disabled():
     engine = Engine(executor=StubExecutor())
     pending_executor = PendingExecutor()
     engine._background_executor = pending_executor
-    engine.last_news_poll = time.time() - NEWS_POLL_INTERVAL - 1
     market = _make_market()
 
     with (
         patch("engine.fetch_active_markets", return_value=[market]),
         patch("engine.find_updown_markets", return_value=[]),
         patch.object(engine, "_start_background_price_warm"),
-        patch("engine.fetch_google_news") as mock_news,
-        patch("engine.analyze_headlines") as mock_analyze,
     ):
         trades = engine.tick()
 
     assert trades == []
-    assert len(pending_executor.submissions) == 1
-    submitted_fn, submitted_args, _, future = pending_executor.submissions[0]
-    assert submitted_fn.__func__ is Engine._run_news_refresh
-    assert submitted_args == ([market],)
-    assert engine._news_future is future
-    assert future.done() is False
-    mock_news.assert_not_called()
-    mock_analyze.assert_not_called()
+    assert pending_executor.submissions == []
 
 
-def test_tick_consumes_completed_news_refresh_and_executes_cached_signals():
+def test_tick_marks_shadow_signal_without_execution():
     engine = Engine(executor=StubExecutor())
     market = _make_market()
-    signal = _make_signal(market=market, strategy="arbitrage")
-    trade = _make_trade(market_slug=market.slug, strategy="arbitrage", order_id="arb-1")
-    future = Future()
-    future.set_result(([{"title": "headline"}], [signal]))
-    engine._news_future = future
-    engine.last_news_poll = time.time()
+    udm = UpDownMarket(
+        market=market,
+        coin="BTC",
+        interval_minutes=5,
+        seconds_to_close=20,
+        up_outcome_index=0,
+    )
+    signal = _make_signal(market=market)
+    signal.strategy_mode = "shadow"
+    analysis = UpdownAnalysis(
+        udm=udm,
+        signal=signal,
+        reason="shadow test",
+        decision_stage="analysis_ready",
+        seconds_to_close=20,
+        implied_up_prob=0.75,
+        model_up_prob=0.85,
+        signal_side="YES",
+        direction="BUY",
+        confidence=0.7,
+        entry_price=0.75,
+        raw_edge=0.10,
+        effective_edge=0.08,
+        estimated_fee=0.01,
+        min_edge=0.06,
+        momentum=0.001,
+        price_state="confirm",
+        strategy_mode="shadow",
+    )
 
     with (
+        patch("engine.TRADING_MODE", "paper"),
         patch("engine.fetch_active_markets", return_value=[market]),
-        patch("engine.find_updown_markets", return_value=[]),
+        patch("engine.find_updown_markets", return_value=[udm]),
+        patch("engine.analyze_updown_market_detail", return_value=analysis),
+        patch.object(engine, "_warm_active_coins"),
         patch.object(engine, "_start_background_price_warm"),
-        patch.object(engine, "_try_execute", return_value=trade) as mock_try_execute,
+        patch.object(engine, "_try_execute", wraps=engine._try_execute) as mock_try_execute,
     ):
         trades = engine.tick()
 
-    assert trades == [trade]
-    assert engine._news_future is None
-    assert engine.articles_found == [{"title": "headline"}]
-    assert engine._pending_arb_signals == []
+    assert trades == []
+    assert engine.monitor_signals[0]["decision_stage"] == "shadow_only"
     mock_try_execute.assert_called_once_with(signal)
+
+
+def test_simulation_executes_shadow_signal():
+    executor = StubExecutor(place_results=[_make_result(order_id="sim-shadow-1")])
+    engine = Engine(executor=executor)
+    signal = _make_signal()
+    signal.strategy_mode = "shadow"
+
+    with patch("engine.TRADING_MODE", "simulation"):
+        trade, stage, reason = engine._try_execute(signal)
+
+    assert trade is not None
+    assert trade.order_id == "sim-shadow-1"
+    assert stage == "traded"
+    assert "filled" in reason
 
 
 def test_bet_size_scales_with_confidence():
@@ -751,3 +792,97 @@ def test_adaptive_interval_normal_when_far():
         )
     ]
     assert engine._adaptive_interval() == TICK_INTERVAL
+
+
+def test_engine_stop_shuts_down_runtime_services():
+    engine = Engine()
+
+    with patch.object(engine, "stop_runtime_services") as mock_stop_runtime:
+        engine.stop()
+
+    mock_stop_runtime.assert_called_once()
+
+
+def test_monitor_snapshot_summarizes_signal_board():
+    engine = Engine()
+    engine.monitor_updated_at = datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc)
+    engine.monitor_signals = [
+        {
+            "market_type": "5m",
+            "direction": "BUY",
+            "signal_side": "YES",
+            "decision_stage": "traded",
+            "confidence": 0.72,
+        },
+        {
+            "market_type": "15m",
+            "direction": "SELL",
+            "signal_side": "NO",
+            "decision_stage": "risk_blocked",
+            "confidence": 0.51,
+        },
+        {
+            "market_type": "5m",
+            "direction": "",
+            "signal_side": "",
+            "decision_stage": "analysis_skip",
+            "confidence": 0.0,
+        },
+    ]
+
+    snapshot = engine.get_monitor_snapshot()
+
+    assert snapshot["signal_summary"]["5m"]["BUY"]["count"] == 1
+    assert snapshot["signal_summary"]["5m"]["BUY"]["actionable"] == 1
+    assert snapshot["signal_summary"]["15m"]["SELL"]["count"] == 1
+    assert snapshot["signal_summary"]["15m"]["SELL"]["actionable"] == 1
+    assert snapshot["monitor_updated_at"] == "2026-04-10T12:00:00+00:00"
+
+
+def test_tick_updates_monitor_state_and_emits_signal_event():
+    engine = Engine(executor=StubExecutor())
+    market = _make_market(end_minutes=1)
+    udm = UpDownMarket(
+        market=market,
+        coin="BTC",
+        interval_minutes=5,
+        seconds_to_close=20,
+        up_outcome_index=0,
+    )
+    signal = _make_signal(market=market)
+    analysis = UpdownAnalysis(
+        udm=udm,
+        signal=signal,
+        reason="BTC implied UP at 82%, edge +7.0%, 20s to close",
+        decision_stage="analysis_ready",
+        seconds_to_close=20,
+        implied_up_prob=0.82,
+        model_up_prob=0.89,
+        signal_side="YES",
+        direction="BUY",
+        confidence=0.67,
+        entry_price=0.82,
+        raw_edge=0.07,
+        effective_edge=0.06,
+        estimated_fee=0.01,
+        min_edge=0.05,
+        momentum=0.002,
+        price_state="confirm",
+    )
+
+    with (
+        patch("engine.fetch_active_markets", return_value=[market]),
+        patch("engine.find_updown_markets", return_value=[udm]),
+        patch("engine.analyze_updown_market_detail", return_value=analysis),
+        patch.object(engine, "_warm_active_coins"),
+        patch.object(engine, "_start_background_price_warm"),
+        patch.object(engine, "_try_execute", return_value=(None, "risk_blocked", "test block")),
+        patch("engine.log_signal_event") as mock_signal_event,
+    ):
+        trades = engine.tick()
+
+    assert trades == []
+    assert engine.monitor_signals[0]["market_slug"] == market.slug
+    assert engine.monitor_signals[0]["decision_stage"] == "risk_blocked"
+    assert "test block" in engine.monitor_signals[0]["reason"]
+    mock_signal_event.assert_called_once()

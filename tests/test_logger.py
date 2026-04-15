@@ -137,6 +137,20 @@ def test_read_trades_legacy_csv_without_end_date(tmp_csv):
     assert trades[0].executor_type == ""
 
 
+def test_read_trades_cp1252_fallback(tmp_csv):
+    raw = (
+        "timestamp,market_slug,question,strategy,side,entry_price,size,confidence,reason,status,payout\n"
+        "2026-04-10T12:00:00+00:00,btc-updown-5m-123,BTC Up or Down?,updown,YES,0.6000,10.00,0.95,"
+        "Trader’s note,pending,0.00\n"
+    )
+    tmp_csv.write_bytes(raw.encode("cp1252"))
+
+    trades = read_trades(tmp_csv)
+
+    assert len(trades) == 1
+    assert "Trader" in trades[0].reason
+
+
 def test_market_type_field_round_trip(tmp_csv):
     """Trade with market_type persists through CSV write/read."""
     from logger import log_trade, read_trades
