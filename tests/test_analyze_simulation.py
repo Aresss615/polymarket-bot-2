@@ -1,101 +1,145 @@
-from analyze_simulation import build_trade_state
+from analyze_simulation import (
+    build_dumb_loss_audit,
+    build_promotion_report,
+    build_trade_state,
+    summarize_actual_move,
+)
 
 
-def test_build_trade_state_applies_settlement_to_latest_confirmed_snapshot():
+def test_promotion_report_blocks_when_samples_and_stress_are_insufficient():
     trades = [
         {
             "type": "trade",
-            "snapshot_event": "fill",
-            "timestamp": "2026-04-10T12:00:00+00:00",
-            "market_slug": "btc-updown-5m-123",
+            "timestamp": "2026-04-15T00:00:00+00:00",
+            "market_slug": "btc-updown-5m-1",
+            "question": "BTC?",
             "strategy": "updown",
+            "strategy_mode": "live",
             "side": "YES",
-            "entry_price": 0.58,
-            "size": 1.16,
-            "confidence": 0.95,
+            "entry_price": 0.60,
+            "size": 10.0,
+            "confidence": 0.9,
             "reason": "test",
-            "status": "pending",
-            "payout": 0.0,
-            "fees": 0.01,
-            "fill_price": 0.58,
-            "order_id": "order-123",
-            "executor_type": "LiveExecutor",
-        },
-        {
-            "type": "trade",
-            "snapshot_event": "fill",
-            "timestamp": "2026-04-10T12:01:00+00:00",
-            "market_slug": "btc-updown-5m-123",
-            "strategy": "updown",
-            "side": "YES",
-            "entry_price": 0.58,
-            "size": 2.90,
-            "confidence": 0.95,
-            "reason": "test",
-            "status": "pending",
-            "payout": 0.0,
-            "fees": 0.03,
-            "fill_price": 0.58,
-            "order_id": "order-123",
-            "executor_type": "LiveExecutor",
-        },
-    ]
-    events = [
-        {
-            "type": "settlement",
-            "timestamp": "2026-04-10T12:06:00+00:00",
-            "order_id": "order-123",
-            "market_slug": "btc-updown-5m-123",
-            "side": "YES",
             "status": "won",
-            "payout": 4.97,
-            "fees": 0.03,
-        }
-    ]
-
-    latest = build_trade_state(trades, events)
-
-    assert len(latest) == 1
-    assert latest[0]["order_id"] == "order-123"
-    assert latest[0]["size"] == 2.90
-    assert latest[0]["status"] == "won"
-    assert latest[0]["payout"] == 4.97
-
-
-def test_build_trade_state_matches_legacy_trade_without_order_id():
-    trades = [
-        {
-            "type": "trade",
-            "snapshot_event": "fill",
-            "timestamp": "2026-04-10T12:00:00+00:00",
-            "market_slug": "eth-updown-5m-456",
-            "strategy": "updown",
-            "side": "NO",
-            "entry_price": 0.44,
-            "size": 3.00,
-            "confidence": 0.90,
-            "reason": "legacy",
-            "status": "pending",
-            "payout": 0.0,
-            "fees": 0.0,
-            "fill_price": 0.44,
-            "executor_type": "PaperExecutor",
+            "payout": 15.0,
+            "market_type": "5m",
+            "fees": 0.1,
+            "fill_price": 0.62,
+            "order_id": "order-1",
+            "executor_type": "SimulationExecutor",
+            "cluster_id": "crypto_beta",
+            "signal_epoch_id": "epoch-1",
+            "expected_fill_price": 0.60,
+            "spread": 0.04,
+            "markout_5s": -0.02,
+            "order": {
+                "fill_price": 0.62,
+                "fill_shares": 16.129,
+                "latency_ms": 180.0,
+                "spread": 0.04,
+            },
         }
     ]
     events = [
         {
-            "type": "settlement",
-            "timestamp": "2026-04-10T12:05:00+00:00",
-            "market_slug": "eth-updown-5m-456",
-            "side": "NO",
-            "status": "lost",
-            "payout": 0.0,
-            "fees": 0.0,
+            "type": "signal_event",
+            "strategy": "updown",
+            "strategy_mode": "live",
+            "coin": "BTC",
+            "market_type": "5m",
+            "decision_stage": "traded",
         }
     ]
 
     latest = build_trade_state(trades, events)
+    report = build_promotion_report(trades, latest, events)
+
+    assert report["fills_combined"] == 1
+    assert report["fills_by_coin"]["BTC"] == 1
+    assert report["promotion_blocked"] is True
+    assert report["stressed_ev_per_trade"] is not None
+    assert any("need 300 candidate fills" in reason for reason in report["promotion_blockers"])
+
+
+def test_trade_state_uses_latest_snapshot_per_order():
+    trades = [
+        {
+            "type": "trade",
+            "timestamp": "2026-04-15T00:00:00+00:00",
+            "market_slug": "btc-updown-5m-1",
+            "side": "YES",
+            "order_id": "order-1",
+            "size": 1.0,
+            "status": "pending",
+        },
+        {
+            "type": "trade",
+            "timestamp": "2026-04-15T00:00:05+00:00",
+            "market_slug": "btc-updown-5m-1",
+            "side": "YES",
+            "order_id": "order-1",
+            "size": 2.0,
+            "status": "pending",
+        },
+    ]
+    latest = build_trade_state(trades, [])
 
     assert len(latest) == 1
-    assert latest[0]["market_slug"] == "eth-updown-5m-456"
-    assert latest[0]["status"] == "lost"
+    assert latest[0]["size"] == 2.0
+
+
+def test_actual_move_summary_and_dumb_loss_audit_track_contrarian_cases():
+    latest_trades = [
+        {
+            "type": "trade",
+            "timestamp": "2026-04-15T00:00:00+00:00",
+            "market_slug": "btc-updown-5m-1",
+            "strategy": "updown",
+            "strategy_mode": "live",
+            "market_type": "5m",
+            "status": "lost",
+            "side": "NO",
+            "size": 5.0,
+            "payout": 0.0,
+            "actual_move_regime": "strong",
+            "actual_move_side": "YES",
+            "strategy_route": "trend_follow_candidate",
+        },
+        {
+            "type": "trade",
+            "timestamp": "2026-04-15T00:05:00+00:00",
+            "market_slug": "sol-updown-5m-2",
+            "strategy": "updown",
+            "strategy_mode": "live",
+            "market_type": "5m",
+            "status": "won",
+            "side": "YES",
+            "size": 5.0,
+            "payout": 8.0,
+            "actual_move_regime": "strong",
+            "actual_move_side": "YES",
+            "strategy_route": "trend_follow_candidate",
+        },
+    ]
+    events = [
+        {
+            "type": "signal_event",
+            "actual_move_regime": "strong",
+            "actual_move_side": "YES",
+            "legacy_signal_side": "NO",
+            "contrarian_block_reason": "blocked",
+            "strategy_route": "high_prob_shadow",
+            "entry_price": 0.81,
+        }
+    ]
+
+    summary = summarize_actual_move(latest_trades, events)
+    audit = build_dumb_loss_audit(latest_trades, events)
+
+    assert summary["forbidden_blocked_contrarian_cases"] == 1
+    assert summary["strong_up_legacy_no"] == 1
+    assert summary["by_regime"]["strong"]["trades"] == 2
+    assert summary["high_prob_shadow_bands"]["0.78-0.82"] == 1
+    assert audit["trades_against_actual_move"] == 1
+    assert audit["strong_move_disagreements"] == 1
+    assert audit["legacy_contrarian_strong_move_examples"] == 1

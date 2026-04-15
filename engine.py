@@ -4,64 +4,115 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 
 from config import (
-    BET_FRACTION,
+    ENABLE_REALTIME_DATA_PLANE,
     MAX_BET,
     MAX_BETS_PER_CYCLE,
+    MAX_REFERENCE_AGE_SECONDS,
     MIN_BET,
-    NEWS_POLL_INTERVAL,
+    Market,
     OpenOrder,
+    REALTIME_DISCOVERY_REFRESH_SECONDS,
     RiskConfig,
     STARTING_BALANCE,
+    STRATEGY_MODE_DISABLED,
+    STRATEGY_MODE_SHADOW,
     STRATEGY_VERSION,
     SUPPORTED_COINS,
+    SIMULATION_MAX_BETS_PER_CYCLE,
     TICK_INTERVAL,
+    TRADING_MODE,
     Signal,
     Trade,
 )
 from strategy_eval import evaluate_15m_mode
 from market_fetcher import fetch_active_markets, fetch_resolved_market, find_updown_markets
-from news_fetcher import fetch_google_news
-from level_analyzer import analyze_updown_market
-from arbitrage_analyzer import analyze_headlines
+from level_analyzer import UpdownAnalysis, analyze_updown_market_detail
 from logger import read_open_orders, read_trades, save_open_orders, save_trades
 from price_feed import get_prices_batch
 from order_executor import OrderExecutor, PaperExecutor
 from risk_manager import RiskManager
-from trade_logger import log_order_event, log_risk_block, log_settlement, log_trade_jsonl
+from trade_logger import log_order_event, log_risk_block, log_settlement, log_signal_event, log_trade_jsonl
+from runtime_data import RUNTIME_DATA_PLANE
+
+MONITOR_SIGNAL_LIMIT = 40
+MONITOR_ACTIONABLE_STAGES = {
+    "traded",
+    "order_live",
+    "risk_blocked",
+    "cycle_limit_skip",
+    "already_traded_skip",
+    "active_order_skip",
+    "balance_skip",
+    "order_rejected",
+    "tightened_skip",
+    "shadow_only",
+}
+SIGNAL_STAGE_RANK = {
+    "traded": 0,
+    "order_live": 1,
+    "risk_blocked": 2,
+    "shadow_only": 3,
+    "cycle_limit_skip": 3,
+    "tightened_skip": 4,
+    "already_traded_skip": 5,
+    "active_order_skip": 6,
+    "balance_skip": 7,
+    "order_rejected": 8,
+    "analysis_skip": 9,
+    "analysis_ready": 10,
+}
 
 
 class Engine:
     def __init__(self, executor: OrderExecutor | None = None, risk_manager: RiskManager | None = None):
         self.executor = executor or PaperExecutor()
         self.risk_manager = risk_manager or RiskManager(RiskConfig())
+        self.runtime_data_plane = RUNTIME_DATA_PLANE
+        self._runtime_started = False
         self.trades: list[Trade] = []
         self.open_orders: list[OpenOrder] = []
         self.traded_markets: set[str] = set()
-        self.last_news_poll: float = time.time()
         self.running = False
         self.status = "Initializing"
         self.activity_log: deque[str] = deque(maxlen=30)
         self.markets = []
         self.updown_markets_found: list = []
         self.articles_found: list = []
-        self._pending_arb_signals: list[Signal] = []
-        self._news_future: Future | None = None
         self._cache_warm_future: Future | None = None
-        self._background_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="engine-bg")
+        self._background_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="engine-bg")
         self.tick_count = 0
         self.wins = 0
         self.losses = 0
         self.mode_15m = evaluate_15m_mode([])  # default until first tick
+        self.monitor_signals: list[dict] = []
+        self.monitor_updated_at: datetime | None = None
+        self._last_market_refresh_at: float | None = None
+        self._order_token_ids: dict[str, str] = {}
         self._load_history()
         self.risk_manager.bootstrap_from_history(self.trades, account_equity=self.account_equity)
         if self.open_orders:
             self._reconcile_open_orders()
+
+    def start_runtime_services(self) -> None:
+        if ENABLE_REALTIME_DATA_PLANE and not self._runtime_started:
+            self.runtime_data_plane.start()
+            self._runtime_started = True
+
+    def stop_runtime_services(self) -> None:
+        if self._runtime_started:
+            self.runtime_data_plane.stop()
+            self._runtime_started = False
 
     def _load_history(self):
         """Restore confirmed positions and any persisted open live orders."""
         self.balance = STARTING_BALANCE
         self.trades = read_trades()
         self.open_orders = read_open_orders()
+        self._order_token_ids = {
+            order.order_id: order.token_id
+            for order in self.open_orders
+            if order.order_id and order.token_id
+        }
 
         for trade in self.trades:
             self.traded_markets.add(trade.market_slug)
@@ -84,6 +135,123 @@ class Engine:
     def _log(self, msg: str):
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
         self.activity_log.append(f"[{ts}] {msg}")
+
+    def _set_monitor_signals(self, analyses: list[UpdownAnalysis]) -> None:
+        records = [analysis.to_record() for analysis in analyses]
+        records.sort(
+            key=lambda row: (
+                SIGNAL_STAGE_RANK.get(row["decision_stage"], 99),
+                -row.get("confidence", 0.0),
+                row.get("seconds_to_close", 9999),
+                row.get("coin", ""),
+            )
+        )
+        self.monitor_signals = records[:MONITOR_SIGNAL_LIMIT]
+        self.monitor_updated_at = datetime.now(timezone.utc)
+
+    def _emit_signal_events(self, analyses: list[UpdownAnalysis]) -> None:
+        for analysis in analyses:
+            payload = {
+                **analysis.to_record(),
+                "tick_count": self.tick_count,
+                "trading_mode": TRADING_MODE,
+                "strategy_version": STRATEGY_VERSION,
+            }
+            log_signal_event(payload)
+
+    def _monitor_summary(self) -> dict:
+        summary = {
+            "5m": {"BUY": {"count": 0, "actionable": 0, "best_confidence": 0.0}, "SELL": {"count": 0, "actionable": 0, "best_confidence": 0.0}},
+            "15m": {"BUY": {"count": 0, "actionable": 0, "best_confidence": 0.0}, "SELL": {"count": 0, "actionable": 0, "best_confidence": 0.0}},
+        }
+        for row in self.monitor_signals:
+            market_type = row.get("market_type")
+            direction = row.get("direction")
+            if market_type not in summary or direction not in summary[market_type]:
+                continue
+            if not row.get("signal_side"):
+                continue
+            cell = summary[market_type][direction]
+            cell["count"] += 1
+            if row.get("decision_stage") in MONITOR_ACTIONABLE_STAGES:
+                cell["actionable"] += 1
+            cell["best_confidence"] = max(cell["best_confidence"], row.get("confidence", 0.0))
+        return summary
+
+    def get_monitor_snapshot(self) -> dict:
+        recent_trades = []
+        for trade in reversed(self.trades[-12:]):
+            if trade.status == "won":
+                pnl = trade.payout - trade.size
+            elif trade.status == "lost":
+                pnl = -trade.size
+            else:
+                pnl = None
+            recent_trades.append(
+                {
+                    "timestamp": trade.timestamp.isoformat(),
+                    "market_slug": trade.market_slug,
+                    "question": trade.question,
+                    "strategy": trade.strategy,
+                    "side": trade.side,
+                    "entry_price": round(trade.entry_price, 4),
+                    "size": round(trade.size, 4),
+                    "confidence": round(trade.confidence, 4),
+                    "status": trade.status,
+                    "payout": round(trade.payout, 4),
+                    "pnl": round(pnl, 4) if pnl is not None else None,
+                    "market_type": trade.market_type,
+                    "reason": trade.reason,
+                }
+            )
+
+        open_orders = []
+        for order in self.open_orders[-10:]:
+            open_orders.append(
+                {
+                    "order_id": order.order_id,
+                    "market_slug": order.market_slug,
+                    "question": order.question,
+                    "side": order.side,
+                    "status": order.status,
+                    "raw_status": order.raw_status,
+                    "market_type": order.market_type,
+                    "reserved_size": round(order.reserved_size, 4),
+                    "requested_size": round(order.requested_size, 4),
+                    "updated_at": order.updated_at.isoformat(),
+                }
+            )
+
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "monitor_updated_at": self.monitor_updated_at.isoformat() if self.monitor_updated_at else None,
+            "trading_mode": TRADING_MODE,
+            "status": self.status,
+            "tick_count": self.tick_count,
+            "balance": round(self.balance, 4),
+            "available_balance": round(self.available_balance, 4),
+            "reserved_open_exposure": round(self.reserved_open_exposure, 4),
+            "account_equity": round(self.account_equity, 4),
+            "wins": self.wins,
+            "losses": self.losses,
+            "settled_count": self.settled_count,
+            "win_rate": round(self.win_rate, 4),
+            "total_pnl": round(self.total_pnl, 4),
+            "pending_trades": len(self.pending_trades),
+            "open_orders_count": len(self.open_orders),
+            "mode_15m": {
+                "enabled": self.mode_15m.enabled,
+                "tightened": self.mode_15m.tightened,
+                "confidence_boost": round(self.mode_15m.confidence_boost, 4),
+                "edge_boost": round(self.mode_15m.edge_boost, 4),
+                "reason": self.mode_15m.reason,
+            },
+            "signal_summary": self._monitor_summary(),
+            "signal_board": list(self.monitor_signals),
+            "recent_trades": recent_trades,
+            "open_orders": open_orders,
+            "recent_activity": list(self.activity_log)[-12:],
+        }
 
     @property
     def settled_count(self) -> int:
@@ -119,14 +287,62 @@ class Engine:
     def active_order_markets(self) -> set[str]:
         return {order.market_slug for order in self.open_orders}
 
+    def _refresh_markets(self, *, force: bool = False) -> None:
+        now = time.time()
+        refresh_due = (
+            force
+            or not self.markets
+            or self._last_market_refresh_at is None
+            or (now - self._last_market_refresh_at) >= REALTIME_DISCOVERY_REFRESH_SECONDS
+        )
+        if not refresh_due:
+            return
+
+        t0 = time.time()
+        self.markets = fetch_active_markets()
+        self._last_market_refresh_at = now
+        fetch_ms = (time.time() - t0) * 1000
+        self._log(f"Fetched {len(self.markets)} markets ({fetch_ms:.0f}ms)")
+
+    def _update_runtime_subscriptions(self) -> None:
+        if not ENABLE_REALTIME_DATA_PLANE:
+            return
+        market_tokens = {
+            token_id
+            for market in self.markets
+            for token_id in getattr(market, "token_ids", [])
+            if token_id
+        }
+        active_coins = {
+            getattr(udm, "coin", "")
+            for udm in self.updown_markets_found
+            if getattr(udm, "coin", "")
+        }
+        self.runtime_data_plane.set_market_tokens(market_tokens)
+        self.runtime_data_plane.set_reference_symbols(active_coins)
+
     def bet_size(self, confidence: float, entry_price: float) -> float:
-        """Size based on payout asymmetry, not just confidence."""
-        wins_to_recover = entry_price / (1.0 - entry_price)
-        risk_scale = min(1.5, 3.0 / wins_to_recover)
-        conf_scale = 0.6 + confidence * 0.8  # range [0.6, 1.4]
-        fraction = BET_FRACTION * risk_scale * conf_scale
-        raw = self.available_balance * fraction
-        return max(MIN_BET, min(MAX_BET, raw))
+        """Backward-compatible sizing helper used by tests and monitors."""
+        del entry_price
+        synthetic_signal = Signal(
+            market=Market(
+                condition_id="synthetic",
+                question="synthetic",
+                slug="synthetic-updown-5m-0",
+                outcomes=["Up", "Down"],
+                outcome_prices=[0.5, 0.5],
+                token_ids=["synthetic-yes", "synthetic-no"],
+                end_date=None,
+                active=True,
+            ),
+            strategy="updown",
+            side="YES",
+            confidence=confidence,
+            reason="synthetic",
+        )
+        base = self.risk_manager.recommended_position_size(synthetic_signal, self.account_equity)
+        conf_scale = 0.5 + max(0.0, min(confidence, 1.0))
+        return max(MIN_BET, min(MAX_BET, base * conf_scale))
 
     @staticmethod
     def _market_type_from_slug(slug: str) -> str:
@@ -166,6 +382,8 @@ class Engine:
             fill_shares = result.fill_size / result.fill_price
         if result.fill_size <= 0 or fill_shares <= 0:
             return None
+        if order_id and result.token_id:
+            self._order_token_ids[order_id] = result.token_id
 
         trade = self._find_trade_by_order_id(order_id)
         is_new = trade is None
@@ -187,6 +405,54 @@ class Engine:
                 fill_price=result.fill_price,
                 order_id=order_id,
                 executor_type=executor_type,
+                edge_gross=result.edge_gross,
+                edge_net=result.edge_net,
+                reference_symbol=result.reference_symbol,
+                reference_price=result.reference_price,
+                best_bid=result.best_bid,
+                best_ask=result.best_ask,
+                spread=result.spread,
+                decision_latency_ms=result.decision_latency_ms or result.latency_ms,
+                thesis_id=result.thesis_id,
+                cancel_reason=result.cancel_reason,
+                strategy_mode=result.strategy_mode,
+                model_up_probability=result.model_up_probability,
+                selected_side_probability=result.selected_side_probability,
+                interval_open=result.interval_open,
+                interval_high=result.interval_high,
+                interval_low=result.interval_low,
+                interval_close=result.interval_close,
+                interval_return=result.interval_return,
+                late_return_60s=result.late_return_60s,
+                late_return_20s=result.late_return_20s,
+                body_ratio=result.body_ratio,
+                wick_imbalance=result.wick_imbalance,
+                candle_regime=result.candle_regime,
+                trend_alignment=result.trend_alignment,
+                market_yes_at_open=result.market_yes_at_open,
+                market_yes_at_decision=result.market_yes_at_decision,
+                market_yes_at_close=result.market_yes_at_close,
+                contrarian_block_reason=result.contrarian_block_reason,
+                wallet_signal_source=result.wallet_signal_source,
+                wallet_lead_score=result.wallet_lead_score,
+                wallet_cluster=result.wallet_cluster,
+                window_start_ts=result.window_start_ts,
+                window_open_price=result.window_open_price,
+                window_open_source=result.window_open_source,
+                window_open_price_trusted=result.window_open_price_trusted,
+                actual_window_return=result.actual_window_return,
+                actual_move_regime=result.actual_move_regime,
+                actual_move_side=result.actual_move_side,
+                strategy_route=result.strategy_route,
+                cluster_id=result.cluster_id,
+                signal_epoch_id=result.signal_epoch_id,
+                book_age_ms=result.book_age_ms,
+                tick_size=result.tick_size,
+                expected_fill_price=result.expected_fill_price,
+                expected_cost=result.expected_cost,
+                markout_1s=result.markout_1s,
+                markout_5s=result.markout_5s,
+                markout_30s=result.markout_30s,
             )
             self.trades.append(trade)
             self.traded_markets.add(market_slug)
@@ -200,6 +466,54 @@ class Engine:
             trade.fill_price = avg_price
             trade.fees += result.fees
             trade.executor_type = trade.executor_type or executor_type
+            trade.edge_gross = result.edge_gross or trade.edge_gross
+            trade.edge_net = result.edge_net or trade.edge_net
+            trade.reference_symbol = result.reference_symbol or trade.reference_symbol
+            trade.reference_price = result.reference_price or trade.reference_price
+            trade.best_bid = result.best_bid if result.best_bid is not None else trade.best_bid
+            trade.best_ask = result.best_ask if result.best_ask is not None else trade.best_ask
+            trade.spread = result.spread if result.spread is not None else trade.spread
+            trade.decision_latency_ms = max(trade.decision_latency_ms, result.decision_latency_ms or result.latency_ms)
+            trade.thesis_id = result.thesis_id or trade.thesis_id
+            trade.cancel_reason = result.cancel_reason or trade.cancel_reason
+            trade.strategy_mode = result.strategy_mode or trade.strategy_mode
+            trade.model_up_probability = result.model_up_probability if result.model_up_probability is not None else trade.model_up_probability
+            trade.selected_side_probability = result.selected_side_probability if result.selected_side_probability is not None else trade.selected_side_probability
+            trade.interval_open = result.interval_open if result.interval_open is not None else trade.interval_open
+            trade.interval_high = result.interval_high if result.interval_high is not None else trade.interval_high
+            trade.interval_low = result.interval_low if result.interval_low is not None else trade.interval_low
+            trade.interval_close = result.interval_close if result.interval_close is not None else trade.interval_close
+            trade.interval_return = result.interval_return if result.interval_return is not None else trade.interval_return
+            trade.late_return_60s = result.late_return_60s if result.late_return_60s is not None else trade.late_return_60s
+            trade.late_return_20s = result.late_return_20s if result.late_return_20s is not None else trade.late_return_20s
+            trade.body_ratio = result.body_ratio if result.body_ratio is not None else trade.body_ratio
+            trade.wick_imbalance = result.wick_imbalance if result.wick_imbalance is not None else trade.wick_imbalance
+            trade.candle_regime = result.candle_regime or trade.candle_regime
+            trade.trend_alignment = result.trend_alignment or trade.trend_alignment
+            trade.market_yes_at_open = result.market_yes_at_open if result.market_yes_at_open is not None else trade.market_yes_at_open
+            trade.market_yes_at_decision = result.market_yes_at_decision if result.market_yes_at_decision is not None else trade.market_yes_at_decision
+            trade.market_yes_at_close = result.market_yes_at_close if result.market_yes_at_close is not None else trade.market_yes_at_close
+            trade.contrarian_block_reason = result.contrarian_block_reason or trade.contrarian_block_reason
+            trade.wallet_signal_source = result.wallet_signal_source or trade.wallet_signal_source
+            trade.wallet_lead_score = result.wallet_lead_score if result.wallet_lead_score is not None else trade.wallet_lead_score
+            trade.wallet_cluster = result.wallet_cluster or trade.wallet_cluster
+            trade.window_start_ts = result.window_start_ts if result.window_start_ts is not None else trade.window_start_ts
+            trade.window_open_price = result.window_open_price if result.window_open_price is not None else trade.window_open_price
+            trade.window_open_source = result.window_open_source or trade.window_open_source
+            trade.window_open_price_trusted = result.window_open_price_trusted or trade.window_open_price_trusted
+            trade.actual_window_return = result.actual_window_return if result.actual_window_return is not None else trade.actual_window_return
+            trade.actual_move_regime = result.actual_move_regime or trade.actual_move_regime
+            trade.actual_move_side = result.actual_move_side or trade.actual_move_side
+            trade.strategy_route = result.strategy_route or trade.strategy_route
+            trade.cluster_id = result.cluster_id or trade.cluster_id
+            trade.signal_epoch_id = result.signal_epoch_id or trade.signal_epoch_id
+            trade.book_age_ms = result.book_age_ms if result.book_age_ms is not None else trade.book_age_ms
+            trade.tick_size = result.tick_size if result.tick_size is not None else trade.tick_size
+            trade.expected_fill_price = result.expected_fill_price if result.expected_fill_price is not None else trade.expected_fill_price
+            trade.expected_cost = result.expected_cost if result.expected_cost is not None else trade.expected_cost
+            trade.markout_1s = result.markout_1s if result.markout_1s is not None else trade.markout_1s
+            trade.markout_5s = result.markout_5s if result.markout_5s is not None else trade.markout_5s
+            trade.markout_30s = result.markout_30s if result.markout_30s is not None else trade.markout_30s
 
         self.balance -= result.fill_size
         if is_new:
@@ -213,6 +527,14 @@ class Engine:
 
     def _create_open_order(self, signal: Signal, result) -> OpenOrder:
         now = datetime.now(timezone.utc)
+        selected_idx = 0 if signal.side == "YES" else 1
+        token_id = result.token_id or (
+            signal.market.token_ids[selected_idx]
+            if len(signal.market.token_ids) > selected_idx
+            else ""
+        )
+        if result.order_id and token_id:
+            self._order_token_ids[result.order_id] = token_id
         return OpenOrder(
             order_id=result.order_id,
             created_at=now,
@@ -220,7 +542,7 @@ class Engine:
             market_slug=signal.market.slug,
             question=signal.market.question,
             condition_id=signal.market.condition_id,
-            token_id=result.token_id,
+            token_id=token_id,
             strategy=signal.strategy,
             side=signal.side,
             confidence=signal.confidence,
@@ -235,6 +557,59 @@ class Engine:
             reserved_size=result.remaining_size or result.reserved_size,
             status=result.status,
             raw_status=result.raw_status or result.status,
+            edge_gross=signal.edge_gross,
+            edge_net=signal.edge_net,
+            reference_symbol=signal.reference_symbol,
+            reference_price=signal.reference_price,
+            best_bid=result.best_bid if result.best_bid is not None else signal.best_bid,
+            best_ask=result.best_ask if result.best_ask is not None else signal.best_ask,
+            spread=result.spread if result.spread is not None else signal.spread,
+            decision_latency_ms=signal.decision_latency_ms,
+            thesis_id=signal.thesis_id,
+            cancel_reason=result.cancel_reason,
+            strategy_mode=signal.strategy_mode,
+            coin=signal.coin,
+            model_up_probability=signal.model_up_probability,
+            selected_side_probability=signal.selected_side_probability,
+            interval_open=signal.interval_open,
+            interval_high=signal.interval_high,
+            interval_low=signal.interval_low,
+            interval_close=signal.interval_close,
+            interval_return=signal.interval_return,
+            late_return_60s=signal.late_return_60s,
+            late_return_20s=signal.late_return_20s,
+            body_ratio=signal.body_ratio,
+            wick_imbalance=signal.wick_imbalance,
+            candle_regime=signal.candle_regime,
+            trend_alignment=signal.trend_alignment,
+            market_yes_at_open=signal.market_yes_at_open,
+            market_yes_at_decision=signal.market_yes_at_decision,
+            market_yes_at_close=signal.market_yes_at_close,
+            contrarian_block_reason=signal.contrarian_block_reason,
+            wallet_signal_source=signal.wallet_signal_source,
+            wallet_lead_score=signal.wallet_lead_score,
+            wallet_cluster=signal.wallet_cluster,
+            window_start_ts=signal.window_start_ts,
+            window_open_price=signal.window_open_price,
+            window_open_source=signal.window_open_source,
+            window_open_price_trusted=signal.window_open_price_trusted,
+            actual_window_return=signal.actual_window_return,
+            actual_move_regime=signal.actual_move_regime,
+            actual_move_side=signal.actual_move_side,
+            strategy_route=signal.strategy_route,
+            cluster_id=signal.cluster_id,
+            signal_epoch_id=signal.signal_epoch_id,
+            book_age_ms=result.book_age_ms if result.book_age_ms is not None else signal.book_age_ms,
+            tick_size=result.tick_size if result.tick_size is not None else signal.tick_size,
+            expected_fill_price=(
+                result.expected_fill_price
+                if result.expected_fill_price is not None
+                else signal.expected_fill_price
+            ),
+            expected_cost=result.expected_cost if result.expected_cost is not None else signal.expected_cost,
+            markout_1s=result.markout_1s if result.markout_1s is not None else signal.markout_1s,
+            markout_5s=result.markout_5s if result.markout_5s is not None else signal.markout_5s,
+            markout_30s=result.markout_30s if result.markout_30s is not None else signal.markout_30s,
         )
 
     def execute_paper_trade(self, signal: Signal) -> Trade | None:
@@ -244,8 +619,14 @@ class Engine:
         through self.executor (Paper, Simulation, or Live).
         """
         entry_price = self._entry_price_for_signal(signal)
-        size = self.bet_size(signal.confidence, entry_price)
+        size = self.risk_manager.recommended_position_size(signal, self.account_equity)
         result = self.executor.place_order(signal, size, entry_price)
+        self.risk_manager.record_execution_quality(
+            coin=signal.coin,
+            cluster_id=signal.cluster_id,
+            slippage=result.slippage,
+            expected_cost=signal.expected_cost,
+        )
 
         if result.fill_size > 0:
             trade = self._record_trade_fill(
@@ -323,6 +704,14 @@ class Engine:
             result = self.executor.reconcile_order(open_order)
             if result is None:
                 continue
+            self.risk_manager.record_execution_quality(
+                coin=open_order.coin,
+                cluster_id=open_order.cluster_id,
+                slippage=result.slippage,
+                expected_cost=open_order.expected_cost,
+                feed_stale="stale" in (result.reason or "").lower(),
+                liquidity_collapse="liquidity" in (result.reason or "").lower(),
+            )
 
             previous_status = open_order.status
             previous_raw_status = open_order.raw_status
@@ -352,6 +741,7 @@ class Engine:
             open_order.reserved_size = result.remaining_size
             open_order.status = result.status
             open_order.raw_status = result.raw_status or result.status
+            open_order.cancel_reason = result.cancel_reason or open_order.cancel_reason
             open_order.updated_at = datetime.now(timezone.utc)
 
             material_change = (
@@ -399,18 +789,21 @@ class Engine:
 
         return reconciled_trades
 
-    def _try_execute(self, signal: Signal) -> Trade | None:
+    def _try_execute(self, signal: Signal) -> tuple[Trade | None, str, str]:
+        if signal.strategy_mode == STRATEGY_MODE_DISABLED:
+            return None, "analysis_skip", "strategy disabled"
+        if signal.strategy_mode == STRATEGY_MODE_SHADOW and TRADING_MODE != "simulation":
+            return None, "shadow_only", "shadow-only strategy"
         if signal.market.slug in self.traded_markets:
             self._log(f"  Skip (already traded): {signal.market.slug}")
-            return None
+            return None, "already_traded_skip", "already traded"
         if signal.market.slug in self.active_order_markets:
             self._log(f"  Skip (order already live): {signal.market.slug}")
-            return None
-        if self.available_balance < MIN_BET:
-            self._log(f"  Skip (available ${self.available_balance:.2f} < min ${MIN_BET})")
-            return None
-
-        size = self.bet_size(signal.confidence, self._entry_price_for_signal(signal))
+            return None, "active_order_skip", "order already live"
+        size = self.risk_manager.recommended_position_size(signal, self.account_equity)
+        if self.available_balance < size:
+            self._log(f"  Skip (available ${self.available_balance:.2f} < target ${size:.2f})")
+            return None, "balance_skip", f"available ${self.available_balance:.2f} < target ${size:.2f}"
         risk_check = self.risk_manager.check_trade_allowed(
             signal,
             size,
@@ -421,9 +814,14 @@ class Engine:
         if not risk_check.allowed:
             self._log(f"  Risk blocked: {risk_check.reason}")
             log_risk_block(signal.market.slug, risk_check.reason)
-            return None
+            return None, "risk_blocked", risk_check.reason
 
-        return self.execute_paper_trade(signal)
+        trade = self.execute_paper_trade(signal)
+        if trade:
+            return trade, "traded", f"filled @ ${trade.entry_price:.2f}"
+        if signal.market.slug in self.active_order_markets:
+            return None, "order_live", "submitted and awaiting reconciliation"
+        return None, "order_rejected", "executor rejected or produced no fill"
 
     def settle_trades(self, max_checks: int = 3):
         """Settle pending trades whose markets have been resolved on Polymarket."""
@@ -478,6 +876,8 @@ class Engine:
                 self.losses += 1
                 self._log(f"LOSS: {trade.market_slug} -${trade.size:.2f}")
 
+            trade.market_yes_at_close = 1.0 if winning_side == "YES" else 0.0
+
             self.risk_manager.record_trade_result(trade)
             log_settlement(trade)
             log_trade_jsonl(
@@ -490,69 +890,31 @@ class Engine:
         if settled:
             save_trades(self.trades)
 
-    def check_updown_markets(self) -> list[Signal]:
-        signals = []
+    def check_updown_markets(self) -> list[UpdownAnalysis]:
+        analyses = []
         mode = getattr(self, "mode_15m", None)
         extra_edge = mode.edge_boost if mode and mode.tightened else 0.0
         extra_conf = mode.confidence_boost if mode and mode.tightened else 0.0
         for udm in self.updown_markets_found:
             edge_boost = extra_edge if udm.interval_minutes == 15 else 0.0
             conf_boost = extra_conf if udm.interval_minutes == 15 else 0.0
-            signal, reason = analyze_updown_market(udm, extra_min_edge=edge_boost)
-            if signal:
-                if conf_boost > 0 and signal.confidence < conf_boost:
-                    self._log(
-                        f"  {udm.coin} skip: confidence {signal.confidence:.0%} < tightened min {conf_boost:.0%}"
-                    )
-                    continue
-                signals.append(signal)
-            else:
-                self._log(f"  {reason}")
-        signals.sort(key=lambda s: s.confidence, reverse=True)
-        return signals
+            analysis = analyze_updown_market_detail(udm, extra_min_edge=edge_boost)
+            if analysis.signal and conf_boost > 0 and analysis.confidence < conf_boost:
+                analysis.reason = (
+                    f"{udm.coin} skip: confidence {analysis.confidence:.0%} "
+                    f"< tightened min {conf_boost:.0%}"
+                )
+                analysis.decision_stage = "tightened_skip"
+                analysis.signal = None
+            if analysis.signal is None:
+                self._log(f"  {analysis.reason}")
+            analyses.append(analysis)
+        analyses.sort(key=lambda item: (0 if item.signal else 1, -item.confidence, item.seconds_to_close))
+        return analyses
 
     def check_arbitrage(self) -> list[Signal]:
-        articles = fetch_google_news()
-        self.articles_found = articles or []
-        if not articles:
-            return []
-        return analyze_headlines(articles, self.markets)
-
-    def _run_news_refresh(self, markets_snapshot: list) -> tuple[list, list[Signal]]:
-        articles = fetch_google_news()
-        if not articles:
-            return [], []
-        signals = analyze_headlines(articles, markets_snapshot)
-        return articles, signals
-
-    def _submit_news_refresh(self) -> bool:
-        if self._news_future and not self._news_future.done():
-            return False
-
-        self._news_future = self._background_executor.submit(
-            self._run_news_refresh,
-            list(self.markets),
-        )
-        self.last_news_poll = time.time()
-        return True
-
-    def _consume_news_refresh(self):
-        if not self._news_future or not self._news_future.done():
-            return
-
-        future = self._news_future
-        self._news_future = None
-        try:
-            articles, signals = future.result()
-        except Exception as exc:
-            self._log(f"News refresh error: {exc}")
-            return
-
-        self.articles_found = articles or []
-        self._pending_arb_signals = signals or []
-        self._log(
-            f"News refresh ready: {len(self.articles_found)} articles, {len(self._pending_arb_signals)} arb signals"
-        )
+        """Offline research hook retained for compatibility; never executes live."""
+        return []
 
     def _start_background_price_warm(self, coins: set[str]):
         if not coins:
@@ -573,22 +935,91 @@ class Engine:
 
     def _warm_active_coins(self, coins: set[str]):
         """Warm price cache for active coins using a single batch API call."""
+        if not coins:
+            return
+        if ENABLE_REALTIME_DATA_PLANE:
+            stale_or_missing = False
+            for coin in coins:
+                if self.runtime_data_plane.reference_cache.price(coin) is None:
+                    stale_or_missing = True
+                    break
+                age = self.runtime_data_plane.reference_cache.age_seconds(coin)
+                if age is None or age > MAX_REFERENCE_AGE_SECONDS:
+                    stale_or_missing = True
+                    break
+            if not stale_or_missing:
+                return
         get_prices_batch(coins)
+
+    def _markout_midpoint(self, order_id: str) -> float | None:
+        token_id = self._order_token_ids.get(order_id)
+        if not token_id:
+            return None
+        snapshot = self.runtime_data_plane.market_cache.snapshot(token_id)
+        if not snapshot:
+            return None
+        midpoint = snapshot.get("midpoint")
+        if midpoint is not None:
+            return float(midpoint)
+        best_bid = snapshot.get("best_bid")
+        best_ask = snapshot.get("best_ask")
+        if best_bid is not None and best_ask is not None:
+            return (float(best_bid) + float(best_ask)) / 2.0
+        return None
+
+    def _update_trade_markouts(self) -> None:
+        if not self.trades:
+            return
+
+        now = datetime.now(timezone.utc)
+        changed = False
+        for trade in self.trades:
+            if trade.status != "pending" or not trade.order_id:
+                continue
+            midpoint = self._markout_midpoint(trade.order_id)
+            if midpoint is None:
+                continue
+            baseline = (
+                trade.expected_fill_price
+                if trade.expected_fill_price is not None
+                else trade.fill_price
+                if trade.fill_price is not None
+                else trade.entry_price
+            )
+            if baseline <= 0:
+                continue
+            elapsed = (now - trade.timestamp).total_seconds()
+            markout = midpoint - baseline
+            if trade.markout_1s is None and elapsed >= 1.0:
+                trade.markout_1s = markout
+                changed = True
+            if trade.markout_5s is None and elapsed >= 5.0:
+                trade.markout_5s = markout
+                self.risk_manager.record_execution_quality(
+                    coin=(trade.reference_symbol or "").upper(),
+                    cluster_id=trade.cluster_id,
+                    markout_5s=markout,
+                    expected_cost=trade.expected_cost,
+                )
+                changed = True
+            if trade.markout_30s is None and elapsed >= 30.0:
+                trade.markout_30s = markout
+                changed = True
+
+        if changed:
+            save_trades(self.trades)
 
     def tick(self) -> list[Trade]:
         tick_start = time.time()
         new_trades = []
+        updown_analyses: list[UpdownAnalysis] = []
         self.tick_count += 1
         self.risk_manager.on_cycle_start()
-        self._consume_news_refresh()
         self._consume_background_price_warm()
 
-        t0 = time.time()
         try:
             self.status = "Fetching markets"
-            self.markets = fetch_active_markets()
-            fetch_ms = (time.time() - t0) * 1000
-            self._log(f"Fetched {len(self.markets)} markets ({fetch_ms:.0f}ms)")
+            self._refresh_markets()
         except Exception as e:
             self._log(f"Market fetch error: {e}")
             self.status = "Market fetch error"
@@ -603,10 +1034,9 @@ class Engine:
         try:
             all_updown = find_updown_markets(self.markets)
             mode_15m = evaluate_15m_mode(self.trades)
-            if not mode_15m.enabled:
-                all_updown = [u for u in all_updown if u.interval_minutes != 15]
             self.mode_15m = mode_15m
             self.updown_markets_found = all_updown
+            self._update_runtime_subscriptions()
             udm_5m = [u for u in self.updown_markets_found if u.interval_minutes == 5]
             udm_15m = [u for u in self.updown_markets_found if u.interval_minutes == 15]
             self._log(
@@ -623,53 +1053,45 @@ class Engine:
                         f"  Price warming slow: {warm_ms:.0f}ms for {len(active_coins)} coins"
                     )
 
-            signals = self.check_updown_markets()
-            self._log(f"UpDown signals: {len(signals)}")
+            updown_analyses = self.check_updown_markets()
+            signal_analyses = [analysis for analysis in updown_analyses if analysis.signal]
+            self._log(f"UpDown signals: {len(signal_analyses)}")
             cycle_bets = 0
-            for signal in signals:
-                self._log(f"  Signal: {signal.side} on {signal.market.slug} ({signal.confidence:.0%})")
-                if cycle_bets >= MAX_BETS_PER_CYCLE:
-                    self._log(f"  Skipped (max {MAX_BETS_PER_CYCLE} bets/cycle)")
-                    break
-                trade = self._try_execute(signal)
+            cycle_limit = SIMULATION_MAX_BETS_PER_CYCLE if TRADING_MODE == "simulation" else MAX_BETS_PER_CYCLE
+            for analysis in signal_analyses:
+                signal = analysis.signal
+                if signal is None:
+                    continue
+                self._log(
+                    f"  Signal: {signal.side} on {signal.market.slug} "
+                    f"({signal.confidence:.0%}, mode={signal.strategy_mode})"
+                )
+                if cycle_bets >= cycle_limit:
+                    self._log(f"  Skipped (max {cycle_limit} bets/cycle)")
+                    analysis.decision_stage = "cycle_limit_skip"
+                    analysis.reason = f"{analysis.reason} | max {cycle_limit} bets/cycle reached"
+                    continue
+                trade, decision_stage, decision_reason = self._try_execute(signal)
+                analysis.decision_stage = decision_stage
+                if decision_stage != "traded":
+                    analysis.reason = f"{analysis.reason} | {decision_reason}"
                 if trade:
                     self._log(
                         f"  TRADE: {trade.side} {trade.market_slug} @ ${trade.entry_price:.2f}, ${trade.size:.2f}"
                     )
                     new_trades.append(trade)
-                if trade or signal.market.slug in self.active_order_markets:
+                if decision_stage in {"traded", "order_live"}:
                     cycle_bets += 1
         except Exception as e:
             self._log(f"UpDown check error: {e}")
             self.status = "UpDown check error"
+        finally:
+            self._set_monitor_signals(updown_analyses)
+            self._emit_signal_events(updown_analyses)
 
+        self._update_trade_markouts()
         self.settle_trades()
-
-        if self._pending_arb_signals:
-            self.status = "Checking news arbitrage"
-            signals = list(self._pending_arb_signals)
-            self._pending_arb_signals.clear()
-            self._log(f"Processing {len(signals)} cached arb signal(s)")
-            active_slugs = {market.slug for market in self.markets}
-            for signal in signals:
-                if signal.market.slug not in active_slugs:
-                    self._log(f"  Arb skip: stale market {signal.market.slug}")
-                    continue
-                self._log(f"  Arb signal: {signal.side} on {signal.market.slug}")
-                trade = self._try_execute(signal)
-                if trade:
-                    self._log(f"  TRADE: {trade.side} {trade.market_slug}")
-                    new_trades.append(trade)
-
-        now = time.time()
-        secs_until_news = max(0, NEWS_POLL_INTERVAL - (now - self.last_news_poll))
-        if secs_until_news == 0:
-            if self._submit_news_refresh():
-                self._log("News refresh started in background")
-            else:
-                self._log("News refresh already running")
-        else:
-            self._log(f"Next news poll in {secs_until_news:.0f}s")
+        self._log("LLM/news trading disabled; arbitrage remains research-only")
 
         remaining = set(SUPPORTED_COINS.keys()) - {udm.coin for udm in self.updown_markets_found}
         self._start_background_price_warm(remaining)
@@ -687,6 +1109,7 @@ class Engine:
         return TICK_INTERVAL
 
     def run(self, interval: float = TICK_INTERVAL):
+        self.start_runtime_services()
         self.running = True
         while self.running:
             t0 = time.time()
@@ -698,4 +1121,5 @@ class Engine:
 
     def stop(self):
         self.running = False
+        self.stop_runtime_services()
         self._background_executor.shutdown(wait=False, cancel_futures=True)

@@ -13,18 +13,28 @@ from datetime import datetime, timezone
 import math
 from abc import ABC, abstractmethod
 from typing import Any
+import re
 
 from config import (
+    FEED_HEARTBEAT_STALE_SECONDS,
+    LIVE_MAKER_15M_MAX_AGE_SECONDS,
     LIVE_MAKER_DRIFT_TICKS,
     LIVE_MAKER_IMPROVEMENT_TICKS,
     LIVE_MAKER_MAX_AGE_SECONDS,
     LIVE_MAKER_MAX_SPREAD,
+    LIVE_MAKER_MAX_SPREAD_TICKS,
+    LIVE_MAKER_OBI_AGAINST_THRESHOLD,
     LIVE_MAKER_POST_ONLY,
+    LIVE_MAKER_REFERENCE_REVERSAL,
     MAX_TAKER_FEE_RATE,
     OpenOrder,
     OrderResult,
     Signal,
 )
+from price_feed import get_reference_snapshot
+from runtime_data import RUNTIME_DATA_PLANE
+
+_COIN_RE = re.compile(r"^([a-z]+)-updown-", re.IGNORECASE)
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -34,6 +44,63 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _extract_coin(slug: str) -> str | None:
+    match = _COIN_RE.match(slug or "")
+    return match.group(1).upper() if match else None
+
+
+def _result_metadata_from_signal(signal: Signal) -> dict:
+    return {
+        "edge_gross": signal.edge_gross,
+        "edge_net": signal.edge_net,
+        "reference_symbol": signal.reference_symbol or signal.coin,
+        "reference_price": signal.reference_price,
+        "best_bid": signal.best_bid,
+        "best_ask": signal.best_ask,
+        "spread": signal.spread,
+        "decision_latency_ms": signal.decision_latency_ms,
+        "thesis_id": signal.thesis_id,
+        "strategy_mode": signal.strategy_mode,
+        "model_up_probability": signal.model_up_probability,
+        "selected_side_probability": signal.selected_side_probability,
+        "interval_open": signal.interval_open,
+        "interval_high": signal.interval_high,
+        "interval_low": signal.interval_low,
+        "interval_close": signal.interval_close,
+        "interval_return": signal.interval_return,
+        "late_return_60s": signal.late_return_60s,
+        "late_return_20s": signal.late_return_20s,
+        "body_ratio": signal.body_ratio,
+        "wick_imbalance": signal.wick_imbalance,
+        "candle_regime": signal.candle_regime,
+        "trend_alignment": signal.trend_alignment,
+        "market_yes_at_open": signal.market_yes_at_open,
+        "market_yes_at_decision": signal.market_yes_at_decision,
+        "market_yes_at_close": signal.market_yes_at_close,
+        "contrarian_block_reason": signal.contrarian_block_reason,
+        "wallet_signal_source": signal.wallet_signal_source,
+        "wallet_lead_score": signal.wallet_lead_score,
+        "wallet_cluster": signal.wallet_cluster,
+        "window_start_ts": signal.window_start_ts,
+        "window_open_price": signal.window_open_price,
+        "window_open_source": signal.window_open_source,
+        "window_open_price_trusted": signal.window_open_price_trusted,
+        "actual_window_return": signal.actual_window_return,
+        "actual_move_regime": signal.actual_move_regime,
+        "actual_move_side": signal.actual_move_side,
+        "strategy_route": signal.strategy_route,
+        "cluster_id": signal.cluster_id,
+        "signal_epoch_id": signal.signal_epoch_id,
+        "book_age_ms": signal.book_age_ms,
+        "tick_size": signal.tick_size,
+        "expected_fill_price": signal.expected_fill_price,
+        "expected_cost": signal.expected_cost,
+        "markout_1s": signal.markout_1s,
+        "markout_5s": signal.markout_5s,
+        "markout_30s": signal.markout_30s,
+    }
 
 
 class OrderExecutor(ABC):
@@ -60,6 +127,8 @@ class PaperExecutor(OrderExecutor):
 
     def place_order(self, signal: Signal, size: float, entry_price: float) -> OrderResult:
         shares = size / entry_price if entry_price > 0 else 0.0
+        token_index = 0 if signal.side == "YES" else 1
+        token_id = signal.market.token_ids[token_index] if len(signal.market.token_ids) > token_index else ""
         return OrderResult(
             filled=True,
             fill_price=entry_price,
@@ -72,6 +141,8 @@ class PaperExecutor(OrderExecutor):
             fill_shares=shares,
             requested_size=size,
             requested_shares=shares,
+            token_id=token_id,
+            **_result_metadata_from_signal(signal),
         )
 
 
@@ -100,6 +171,9 @@ class SimulationExecutor(OrderExecutor):
 
     def place_order(self, signal: Signal, size: float, entry_price: float) -> OrderResult:
         requested_shares = size / entry_price if entry_price > 0 else 0.0
+        metadata = _result_metadata_from_signal(signal)
+        token_index = 0 if signal.side == "YES" else 1
+        token_id = signal.market.token_ids[token_index] if len(signal.market.token_ids) > token_index else ""
 
         # 2% rejection
         if self._rng.random() < 0.02:
@@ -115,6 +189,8 @@ class SimulationExecutor(OrderExecutor):
                 reason="simulated rejection (rate limit / stale)",
                 requested_size=size,
                 requested_shares=requested_shares,
+                token_id=token_id,
+                **metadata,
             )
 
         # Fee calculation
@@ -149,6 +225,8 @@ class SimulationExecutor(OrderExecutor):
             fill_shares=fill_shares,
             requested_size=size,
             requested_shares=requested_shares,
+            token_id=token_id,
+            **metadata,
         )
 
 
@@ -218,6 +296,19 @@ class LiveExecutor(OrderExecutor):
         return round(max(tick, min(0.99, floored)), 2)
 
     def _get_book_snapshot(self, token_id: str) -> dict:
+        cached = RUNTIME_DATA_PLANE.market_cache.snapshot(token_id)
+        if cached:
+            return {
+                "best_bid": cached.get("best_bid") or 0.0,
+                "best_ask": cached.get("best_ask") or 0.0,
+                "tick_size": cached.get("tick_size") or 0.01,
+                "midpoint": cached.get("midpoint") or 0.0,
+                "spread": cached.get("spread") or 0.0,
+                "microprice": cached.get("microprice"),
+                "top_obi": cached.get("top_obi"),
+                "top3_obi": cached.get("top3_obi"),
+                "book_age_ms": cached.get("book_age_ms"),
+            }
         try:
             book = self._client.get_order_book(token_id)
         except Exception:
@@ -229,6 +320,9 @@ class LiveExecutor(OrderExecutor):
         best_ask = self._book_price(asks[0]) if asks else 0.0
         tick_size = _safe_float(self._book_attr(book, "tick_size"), 0.01)
         midpoint = 0.0
+        microprice = 0.0
+        top_obi = 0.0
+        top3_obi = 0.0
         if best_bid > 0 and best_ask > 0:
             midpoint = (best_bid + best_ask) / 2.0
         elif best_bid > 0:
@@ -237,12 +331,29 @@ class LiveExecutor(OrderExecutor):
             midpoint = best_ask
         spread = max(best_ask - best_bid, 0.0) if best_bid > 0 and best_ask > 0 else 0.0
 
+        best_bid_size = _safe_float(self._book_attr(bids[0], "size"), 0.0) if bids else 0.0
+        best_ask_size = _safe_float(self._book_attr(asks[0], "size"), 0.0) if asks else 0.0
+        top_total = best_bid_size + best_ask_size
+        if best_bid > 0 and best_ask > 0 and top_total > 0:
+            microprice = ((best_ask * best_bid_size) + (best_bid * best_ask_size)) / top_total
+            top_obi = (best_bid_size - best_ask_size) / top_total
+
+        bid3 = sum(_safe_float(self._book_attr(level, "size"), 0.0) for level in bids[:3])
+        ask3 = sum(_safe_float(self._book_attr(level, "size"), 0.0) for level in asks[:3])
+        total3 = bid3 + ask3
+        if total3 > 0:
+            top3_obi = (bid3 - ask3) / total3
+
         return {
             "best_bid": best_bid,
             "best_ask": best_ask,
             "tick_size": tick_size,
             "midpoint": midpoint,
             "spread": spread,
+            "microprice": microprice or None,
+            "top_obi": top_obi if top_total > 0 else None,
+            "top3_obi": top3_obi if total3 > 0 else None,
+            "book_age_ms": 0.0,
         }
 
     def _maker_limit_price(self, entry_price: float, book: dict) -> float:
@@ -288,6 +399,7 @@ class LiveExecutor(OrderExecutor):
         requested_size: float,
         requested_shares: float,
         token_id: str = "",
+        metadata: dict | None = None,
     ) -> OrderResult:
         return OrderResult(
             filled=False,
@@ -302,6 +414,7 @@ class LiveExecutor(OrderExecutor):
             requested_size=requested_size,
             requested_shares=requested_shares,
             token_id=token_id,
+            **(metadata or {}),
         )
 
     def _normalize_submit_response(
@@ -315,6 +428,7 @@ class LiveExecutor(OrderExecutor):
         token_id: str,
         latency_ms: float,
         raw_context: dict | None = None,
+        metadata: dict | None = None,
     ) -> OrderResult:
         if not isinstance(response, dict) or not (response.get("success") or response.get("orderID")):
             return self._make_rejection(
@@ -324,6 +438,7 @@ class LiveExecutor(OrderExecutor):
                 requested_size=actual_size,
                 requested_shares=shares,
                 token_id=token_id,
+                metadata=metadata,
             )
 
         order_id = str(response.get("orderID", response.get("id", "")))
@@ -354,9 +469,11 @@ class LiveExecutor(OrderExecutor):
             terminal=terminal,
             raw_status=raw_status,
             raw_response=raw_context or response,
+            **(metadata or {}),
         )
 
     def place_order(self, signal: Signal, size: float, entry_price: float) -> OrderResult:
+        metadata = _result_metadata_from_signal(signal)
         token_idx = 0 if signal.side == "YES" else 1
         if token_idx >= len(signal.market.token_ids):
             return self._make_rejection(
@@ -365,6 +482,7 @@ class LiveExecutor(OrderExecutor):
                 reason=f"no token_id for index {token_idx}",
                 requested_size=size,
                 requested_shares=0.0,
+                metadata=metadata,
             )
 
         token_id = signal.market.token_ids[token_idx]
@@ -380,6 +498,7 @@ class LiveExecutor(OrderExecutor):
                 requested_size=size,
                 requested_shares=estimated_shares,
                 token_id=token_id,
+                metadata=metadata,
             )
 
         min_shares = 5.0
@@ -424,6 +543,15 @@ class LiveExecutor(OrderExecutor):
                     "book": book_snapshot,
                     "post_only": LIVE_MAKER_POST_ONLY,
                 },
+                metadata={
+                    **metadata,
+                    "best_bid": book_snapshot.get("best_bid") or metadata.get("best_bid"),
+                    "best_ask": book_snapshot.get("best_ask") or metadata.get("best_ask"),
+                    "spread": book_snapshot.get("spread") if book_snapshot else metadata.get("spread"),
+                    "book_age_ms": book_snapshot.get("book_age_ms") if book_snapshot else metadata.get("book_age_ms"),
+                    "tick_size": book_snapshot.get("tick_size") if book_snapshot else metadata.get("tick_size"),
+                    "expected_fill_price": limit_price,
+                },
             )
         except Exception as exc:
             err_detail = self._error_text(exc)
@@ -435,6 +563,7 @@ class LiveExecutor(OrderExecutor):
                 requested_size=actual_size,
                 requested_shares=shares,
                 token_id=token_id,
+                metadata=metadata,
             )
 
     def cancel_order(self, order_id: str) -> bool:
@@ -448,24 +577,54 @@ class LiveExecutor(OrderExecutor):
 
     def _cancel_quote_reason(self, open_order: OpenOrder) -> str:
         age_seconds = (datetime.now(timezone.utc) - open_order.created_at).total_seconds()
-        if age_seconds >= LIVE_MAKER_MAX_AGE_SECONDS:
-            return f"maker_quote_age>{LIVE_MAKER_MAX_AGE_SECONDS:.1f}s"
+        max_age = (
+            LIVE_MAKER_15M_MAX_AGE_SECONDS
+            if open_order.market_type == "15m"
+            else LIVE_MAKER_MAX_AGE_SECONDS
+        )
+        if age_seconds >= max_age:
+            return f"maker_quote_age>{max_age:.1f}s"
 
         book = self._get_book_snapshot(open_order.token_id)
         if not book:
-            return ""
+            return "feed_health_stale"
 
         spread = book.get("spread", 0.0)
         tick_size = max(book.get("tick_size") or 0.01, 0.01)
         midpoint = book.get("midpoint", 0.0)
         best_bid = book.get("best_bid", 0.0)
+        microprice = book.get("microprice")
+        top_obi = book.get("top_obi")
+        top3_obi = book.get("top3_obi")
+        spread_ticks = int(round(spread / tick_size)) if tick_size > 0 else 0
 
-        if spread >= LIVE_MAKER_MAX_SPREAD:
+        if spread >= LIVE_MAKER_MAX_SPREAD or spread_ticks >= LIVE_MAKER_MAX_SPREAD_TICKS:
             return f"spread_widened>{LIVE_MAKER_MAX_SPREAD:.2f}"
         if midpoint > 0 and midpoint <= open_order.limit_price - LIVE_MAKER_DRIFT_TICKS * tick_size:
             return f"midpoint_drift<{midpoint:.2f}"
         if best_bid > open_order.limit_price + tick_size:
             return f"outbid_by_market>{best_bid:.2f}"
+        if microprice is not None and microprice <= open_order.limit_price - tick_size:
+            return f"microprice_cross<{microprice:.2f}"
+        if top_obi is not None and top_obi <= -LIVE_MAKER_OBI_AGAINST_THRESHOLD:
+            return f"top_obi_against<{top_obi:.2f}"
+        if top3_obi is not None and top3_obi <= -LIVE_MAKER_OBI_AGAINST_THRESHOLD:
+            return f"top3_obi_against<{top3_obi:.2f}"
+
+        coin = open_order.coin or _extract_coin(open_order.market_slug)
+        if coin and open_order.reference_price:
+            reference = get_reference_snapshot(coin)
+            current_price = reference.get("price")
+            age = reference.get("age_seconds")
+            if age is None or age > FEED_HEARTBEAT_STALE_SECONDS:
+                return "feed_health_stale"
+            if current_price:
+                upper = open_order.reference_price * (1.0 + LIVE_MAKER_REFERENCE_REVERSAL)
+                lower = open_order.reference_price * (1.0 - LIVE_MAKER_REFERENCE_REVERSAL)
+                if open_order.side == "YES" and current_price <= lower:
+                    return f"reference_reversal<{current_price:.4f}"
+                if open_order.side == "NO" and current_price >= upper:
+                    return f"reference_reversal>{current_price:.4f}"
         return ""
 
     def _get_order_payload(self, order_id: str) -> dict | None:
@@ -535,6 +694,83 @@ class LiveExecutor(OrderExecutor):
 
     def reconcile_order(self, open_order: OpenOrder) -> OrderResult:
         t0 = time.time()
+        event_snapshot = RUNTIME_DATA_PLANE.order_store.snapshot(open_order.order_id)
+        if event_snapshot is not None:
+            delta_shares = max(event_snapshot.fill_shares - open_order.confirmed_fill_shares, 0.0)
+            fill_price = open_order.limit_price
+            if delta_shares > 0 and event_snapshot.fill_size > 0:
+                fill_price = event_snapshot.fill_size / delta_shares
+            return OrderResult(
+                filled=delta_shares > 0,
+                fill_price=fill_price,
+                fill_size=max(event_snapshot.fill_size - open_order.confirmed_fill_size, 0.0),
+                fees=max(event_snapshot.fees - open_order.confirmed_fees, 0.0),
+                slippage=(fill_price - open_order.limit_price) if delta_shares > 0 else 0.0,
+                latency_ms=(time.time() - t0) * 1000,
+                order_id=open_order.order_id,
+                status=event_snapshot.status or open_order.status,
+                reason="",
+                fill_shares=delta_shares,
+                remaining_size=event_snapshot.remaining_size if event_snapshot.remaining_size is not None else open_order.reserved_size,
+                remaining_shares=event_snapshot.remaining_shares if event_snapshot.remaining_shares is not None else open_order.requested_shares - event_snapshot.fill_shares,
+                reserved_size=event_snapshot.remaining_size if event_snapshot.remaining_size is not None else open_order.reserved_size,
+                requested_size=open_order.requested_size,
+                requested_shares=open_order.requested_shares,
+                token_id=open_order.token_id,
+                needs_reconciliation=not event_snapshot.terminal,
+                terminal=event_snapshot.terminal,
+                raw_status=event_snapshot.raw_status or event_snapshot.status,
+                edge_gross=open_order.edge_gross,
+                edge_net=open_order.edge_net,
+                reference_symbol=open_order.reference_symbol,
+                reference_price=open_order.reference_price,
+                best_bid=open_order.best_bid,
+                best_ask=open_order.best_ask,
+                spread=open_order.spread,
+                decision_latency_ms=open_order.decision_latency_ms,
+                thesis_id=open_order.thesis_id,
+                cancel_reason=open_order.cancel_reason,
+                strategy_mode=open_order.strategy_mode,
+                model_up_probability=open_order.model_up_probability,
+                selected_side_probability=open_order.selected_side_probability,
+                interval_open=open_order.interval_open,
+                interval_high=open_order.interval_high,
+                interval_low=open_order.interval_low,
+                interval_close=open_order.interval_close,
+                interval_return=open_order.interval_return,
+                late_return_60s=open_order.late_return_60s,
+                late_return_20s=open_order.late_return_20s,
+                body_ratio=open_order.body_ratio,
+                wick_imbalance=open_order.wick_imbalance,
+                candle_regime=open_order.candle_regime,
+                trend_alignment=open_order.trend_alignment,
+                market_yes_at_open=open_order.market_yes_at_open,
+                market_yes_at_decision=open_order.market_yes_at_decision,
+                market_yes_at_close=open_order.market_yes_at_close,
+                contrarian_block_reason=open_order.contrarian_block_reason,
+                wallet_signal_source=open_order.wallet_signal_source,
+                wallet_lead_score=open_order.wallet_lead_score,
+                wallet_cluster=open_order.wallet_cluster,
+                window_start_ts=open_order.window_start_ts,
+                window_open_price=open_order.window_open_price,
+                window_open_source=open_order.window_open_source,
+                window_open_price_trusted=open_order.window_open_price_trusted,
+                actual_window_return=open_order.actual_window_return,
+                actual_move_regime=open_order.actual_move_regime,
+                actual_move_side=open_order.actual_move_side,
+                strategy_route=open_order.strategy_route,
+                cluster_id=open_order.cluster_id,
+                signal_epoch_id=open_order.signal_epoch_id,
+                book_age_ms=open_order.book_age_ms,
+                tick_size=open_order.tick_size,
+                expected_fill_price=open_order.expected_fill_price,
+                expected_cost=open_order.expected_cost,
+                markout_1s=open_order.markout_1s,
+                markout_5s=open_order.markout_5s,
+                markout_30s=open_order.markout_30s,
+                raw_response=event_snapshot.raw,
+            )
+
         order_payload = self._get_order_payload(open_order.order_id)
         raw_status = self._normalize_status((order_payload or {}).get("status")) or open_order.raw_status
 
@@ -611,6 +847,54 @@ class LiveExecutor(OrderExecutor):
             needs_reconciliation=not terminal,
             terminal=terminal,
             raw_status=raw_status,
+            edge_gross=open_order.edge_gross,
+            edge_net=open_order.edge_net,
+            reference_symbol=open_order.reference_symbol,
+            reference_price=open_order.reference_price,
+            best_bid=open_order.best_bid,
+            best_ask=open_order.best_ask,
+            spread=open_order.spread,
+            decision_latency_ms=open_order.decision_latency_ms,
+            thesis_id=open_order.thesis_id,
+            cancel_reason=cancel_reason,
+            strategy_mode=open_order.strategy_mode,
+            model_up_probability=open_order.model_up_probability,
+            selected_side_probability=open_order.selected_side_probability,
+            interval_open=open_order.interval_open,
+            interval_high=open_order.interval_high,
+            interval_low=open_order.interval_low,
+            interval_close=open_order.interval_close,
+            interval_return=open_order.interval_return,
+            late_return_60s=open_order.late_return_60s,
+            late_return_20s=open_order.late_return_20s,
+            body_ratio=open_order.body_ratio,
+            wick_imbalance=open_order.wick_imbalance,
+            candle_regime=open_order.candle_regime,
+            trend_alignment=open_order.trend_alignment,
+            market_yes_at_open=open_order.market_yes_at_open,
+            market_yes_at_decision=open_order.market_yes_at_decision,
+            market_yes_at_close=open_order.market_yes_at_close,
+            contrarian_block_reason=open_order.contrarian_block_reason,
+            wallet_signal_source=open_order.wallet_signal_source,
+            wallet_lead_score=open_order.wallet_lead_score,
+            wallet_cluster=open_order.wallet_cluster,
+            window_start_ts=open_order.window_start_ts,
+            window_open_price=open_order.window_open_price,
+            window_open_source=open_order.window_open_source,
+            window_open_price_trusted=open_order.window_open_price_trusted,
+            actual_window_return=open_order.actual_window_return,
+            actual_move_regime=open_order.actual_move_regime,
+            actual_move_side=open_order.actual_move_side,
+            strategy_route=open_order.strategy_route,
+            cluster_id=open_order.cluster_id,
+            signal_epoch_id=open_order.signal_epoch_id,
+            book_age_ms=open_order.book_age_ms,
+            tick_size=open_order.tick_size,
+            expected_fill_price=open_order.expected_fill_price,
+            expected_cost=open_order.expected_cost,
+            markout_1s=open_order.markout_1s,
+            markout_5s=open_order.markout_5s,
+            markout_30s=open_order.markout_30s,
             raw_response={
                 "order": order_payload or {},
                 "confirmed_trade_matches": match_count,
