@@ -76,8 +76,8 @@ Data flow:
 - `config.py`
   - Central config and dataclasses: `Market`, `UpDownMarket`, `Article`, `Signal`, `Trade`, `OrderResult`, `OpenOrder`, `RiskConfig`
   - `TRADING_MODE` controls mode selection
-  - `CODEX_VERSION` is currently **1.2**
-  - `STRATEGY_VERSION` is currently **12**
+  - `CODEX_VERSION` is currently **1.3**
+  - `STRATEGY_VERSION` is currently **13**
 
 - `main.py`
   - Chooses executor from `TRADING_MODE`
@@ -86,11 +86,11 @@ Data flow:
   - Starts the Rich dashboard and web monitor
 
 - `level_analyzer.py`
-  - Core v12 deterministic up/down logic
-  - Uses candle-aware reference features: interval OHLC, interval return, late `60s` and `20s` returns, body ratio, wick imbalance
-  - Classifies setups as `trend_strong`, `trend_mixed`, or `uncertain`
-  - Blocks strong-trend contrarian trades
-  - Produces side-aware reason text and regime-aware confidence/sizing
+  - Core v13 deterministic up/down logic with actual-move-first routing
+  - Uses trusted window-open anchors plus interval OHLC, interval return, late `60s` and `20s` returns, body ratio, wick imbalance
+  - Routes setups into `strong`, `flat`, or `mid` actual-move regimes
+  - Strong moves are follow-or-skip only; flat windows stay shadow-only and mid windows skip
+  - Records `high_prob_shadow` for `0.78-0.90` strong-move setups instead of promoting them to live execution
 
 - `state_cache.py`
   - Stores market-book state and reference price history
@@ -131,8 +131,8 @@ Data flow:
 
 Each trade stores `strategy_version`. Analytics are scoped to `STRATEGY_VERSION` only, preventing leakage from older parameter sets.
 
-Current release: **Codex 1.2**.  
-Current patch version: **v12**.
+Current release: **Codex 1.3**.  
+Current patch version: **v13**.
 
 When strategy parameters change, bump `STRATEGY_VERSION` so evaluation remains patch-pure.
 
@@ -153,12 +153,19 @@ Simulation defaults are intentionally research-friendly:
 - exposure/loss/cooldown caps are effectively near-unbounded
 - shadow-only signals are allowed to execute in simulation for data collection
 
-## Candle-Aware V12 Highlights
+## Actual-Move V13 Highlights
 
-- Strong-trend thresholds:
-  - 5m interval return: `>= 0.25%`
-  - 15m interval return: `>= 0.45%`
-  - plus aligned `60s` and `20s` returns and `body_ratio >= 0.60`
+- Trusted exact window-open price is required for candidate/live routing
+- Strong actual-move thresholds:
+  - 5m actual return: `>= 0.30%`
+  - 15m actual return: `>= 0.50%`
+- Flat actual-move thresholds:
+  - 5m actual return: `<= 0.08%`
+  - 15m actual return: `<= 0.12%`
+- Strong-move confirmation requires aligned `60s` and `20s` returns, `body_ratio >= 0.60`, fresh book age, and tight spread
+- Strong actual move may only follow the move direction or skip; opposite-side candidate trades are blocked by design
+- `0.78-0.90` strong-move entries are tracked as `high_prob_shadow`
+- Missing trusted window-open anchor causes `missing_exact_open` skip
 - Confidence caps:
   - strong-trend setups cap at `0.90`
   - mixed or uncertain setups cap at `0.75`
@@ -195,3 +202,4 @@ From `.env.example` and current config:
 - 2026-04-15: Extended CSV and JSONL trade persistence with regime and candle-alignment metadata
 - 2026-04-15: Relaxed simulation research mode so exposure, daily loss, and shadow-only gates no longer choke high-volume sim runs
 - 2026-04-15: Updated `ticker3` web monitor copy and badges to be mode-neutral and simulation-friendly
+- 2026-04-15: Added v13 actual-move-first routing with trusted window-open anchors, follow-or-skip strong-move logic, and dumb-loss audit reporting
