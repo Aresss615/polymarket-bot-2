@@ -77,7 +77,8 @@ Data flow:
 - `config.py`
 	- Central config + dataclasses: `Market`, `UpDownMarket`, `Article`, `Signal`, `Trade`, `OrderResult`, `RiskConfig`
 	- `TRADING_MODE` controls mode selection
-	- `STRATEGY_VERSION` is currently **9**
+	- `CODEX_VERSION` is currently **1.0**
+	- `STRATEGY_VERSION` is currently **10**
 
 - `main.py`
 	- Chooses executor from `TRADING_MODE`
@@ -135,7 +136,8 @@ Data flow:
 
 Each trade stores `strategy_version`. Analytics are scoped to `STRATEGY_VERSION` only, preventing leakage from older parameter sets.
 
-Current version: **v9**.
+Current release: **Codex 1.0**.
+Current patch version: **v10**.
 
 When strategy parameters change (timing windows, edge thresholds, confidence boosts, etc.), bump `STRATEGY_VERSION` so evaluation remains patch-pure.
 

@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 
 from config import (
+    ARBITRAGE_STRATEGY_MODE,
     Market,
     UpDownMarket,
     Article,
@@ -17,11 +18,15 @@ from config import (
     ARBITRAGE_CONFIDENCE_THRESHOLD,
     MIN_SECONDS_TO_CLOSE,
     MAX_SECONDS_TO_CLOSE,
+    MAX_REFERENCE_AGE_SECONDS,
     BET_FRACTION,
     MIN_BET,
     MAX_BET,
     STARTING_BALANCE,
     NEWS_POLL_INTERVAL,
+    STRATEGY_MODE_DISABLED,
+    STRATEGY_MODE_LIVE,
+    STRATEGY_MODE_SHADOW,
     STRATEGY_VERSION,
 )
 
@@ -84,6 +89,7 @@ def test_signal_dataclass():
     s = Signal(market=m, strategy="updown", side="YES", confidence=0.95, reason="test")
     assert s.strategy == "updown"
     assert s.confidence == 0.95
+    assert s.strategy_mode == "live"
 
 
 def test_trade_dataclass():
@@ -103,6 +109,7 @@ def test_trade_dataclass():
     assert t.status == "pending"
     assert t.payout == 0.0
     assert t.strategy_version == 0
+    assert t.strategy_mode == "live"
 
 
 def test_trade_settlement_fields():
@@ -132,13 +139,20 @@ def test_constants():
     assert GROQ_PRIMARY_MODEL == "llama-3.3-70b-versatile"
     assert GROQ_FALLBACK_MODEL == "llama-3.1-8b-instant"
     assert ARBITRAGE_CONFIDENCE_THRESHOLD == 0.85
-    assert MIN_SECONDS_TO_CLOSE == 5
-    assert MAX_SECONDS_TO_CLOSE == 120
+    assert MIN_SECONDS_TO_CLOSE == 15
+    assert MAX_SECONDS_TO_CLOSE == 480
+    assert MAX_REFERENCE_AGE_SECONDS == 2.0
     assert NEWS_POLL_INTERVAL == 300
-    assert BET_FRACTION == 0.08
+    assert BET_FRACTION == 0.02
     assert MIN_BET == 1.0
-    assert MAX_BET == 10.0
-    assert STARTING_BALANCE == 20.0
+    assert MAX_BET == 5.0
+    assert STARTING_BALANCE > 0
+    assert {STRATEGY_MODE_DISABLED, STRATEGY_MODE_SHADOW, STRATEGY_MODE_LIVE} == {
+        "disabled",
+        "shadow",
+        "live",
+    }
+    assert ARBITRAGE_STRATEGY_MODE == STRATEGY_MODE_DISABLED
     assert "BTC" in SUPPORTED_COINS
     assert SUPPORTED_COINS["BTC"] == "BTC-USDT"
     assert isinstance(STRATEGY_VERSION, int)

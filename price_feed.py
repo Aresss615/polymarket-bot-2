@@ -4,11 +4,25 @@ import warnings
 import requests
 import urllib3
 
-from config import OKX_API_URL, BYBIT_API_URL, SUPPORTED_COINS
+from config import (
+    CHAINLINK_REQUIRED_15M,
+    BYBIT_API_URL,
+    MAX_REFERENCE_AGE_SECONDS_FALLBACK,
+    MAX_REFERENCE_AGE_SECONDS_REALTIME,
+    MAX_REFERENCE_AGE_SECONDS,
+    OKX_API_URL,
+    REFERENCE_LOOKBACK_SECONDS,
+    RTDS_STRICT_MODE,
+    SUPPORTED_COINS,
+    WINDOW_OPEN_TRUST_TOLERANCE_SECONDS,
+)
+from runtime_data import RUNTIME_DATA_PLANE, WEBSOCKET_CLIENT_AVAILABLE
+from state_cache import REFERENCE_CACHE
 
 # Python 3.14 on macOS has broken SSL cert verification for most CEX APIs.
 # On Windows/Linux this works fine, so only disable on macOS.
 import sys as _sys
+
 _session = requests.Session()
 if _sys.platform == "darwin":
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -35,25 +49,23 @@ COINGECKO_IDS = {
     "HYPE": "hyperliquid",
 }
 
-# Reverse lookup: CoinGecko ID -> our coin ticker
 _CG_ID_TO_COIN = {v: k for k, v in COINGECKO_IDS.items()}
 
-# Price history for momentum tracking: coin -> [(timestamp, price), ...]
+# Legacy price history used by tests and the analyzer.
 _price_history: dict[str, list[tuple[float, float]]] = {}
-_HISTORY_WINDOW = 120  # keep 2 minutes of price history
+_HISTORY_WINDOW = 180
 
 # Source failure tracking: skip sources that repeatedly fail
 _source_failures: dict[str, int] = {"okx": 0, "bybit": 0, "coingecko": 0}
 _source_disabled_until: dict[str, float] = {"okx": 0, "bybit": 0, "coingecko": 0}
-_SOURCE_FAIL_THRESHOLD = 3   # failures before disabling
-_SOURCE_RETRY_INTERVAL = 300  # re-try disabled source after 5 min
+_SOURCE_FAIL_THRESHOLD = 3
+_SOURCE_RETRY_INTERVAL = 300
 
 
 def _is_source_available(source: str) -> bool:
     if _source_failures[source] < _SOURCE_FAIL_THRESHOLD:
         return True
     if time.time() >= _source_disabled_until[source]:
-        # Reset and retry
         _source_failures[source] = 0
         return True
     return False
@@ -122,20 +134,47 @@ def get_price_coingecko(coin: str) -> float | None:
         return None
 
 
+def _record_price(coin: str, price: float, *, source: str = "poll", chainlink: bool = False) -> None:
+    now = time.time()
+    if not chainlink:
+        history = _price_history.setdefault(coin, [])
+        history.append((now, price))
+        cutoff = now - _HISTORY_WINDOW
+        _price_history[coin] = [(t, p) for t, p in history if t >= cutoff]
+    REFERENCE_CACHE.update(coin, price, source=source, chainlink=chainlink, timestamp=now)
+
+
+def inject_reference_price(
+    coin: str,
+    price: float,
+    *,
+    source: str = "manual",
+    chainlink: bool = False,
+    timestamp: float | None = None,
+) -> None:
+    """Test/streaming hook for updating the reference cache without polling."""
+    ts = timestamp if timestamp is not None else time.time()
+    if not chainlink:
+        history = _price_history.setdefault(coin.upper(), [])
+        history.append((ts, price))
+        cutoff = ts - _HISTORY_WINDOW
+        _price_history[coin.upper()] = [(t, p) for t, p in history if t >= cutoff]
+    REFERENCE_CACHE.update(coin.upper(), price, source=source, chainlink=chainlink, timestamp=ts)
+
+
 def get_prices_batch(coins: set[str]) -> dict[str, float]:
-    """Fetch prices for multiple coins in a single CoinGecko API call.
-
-    Returns dict of {coin: price} for coins that were successfully fetched.
-    """
-    cg_ids = []
-    for coin in coins:
-        cg_id = COINGECKO_IDS.get(coin)
-        if cg_id:
-            cg_ids.append(cg_id)
-
+    """Fetch prices for multiple coins in a single CoinGecko API call."""
+    normalized_coins = {coin.upper() for coin in coins}
+    cg_ids = [COINGECKO_IDS[coin] for coin in normalized_coins if coin in COINGECKO_IDS]
     if not cg_ids:
-        return {}
+        result = {}
+        for coin in normalized_coins:
+            price = get_price(coin)
+            if price is not None:
+                result[coin] = price
+        return result
 
+    result: dict[str, float] = {}
     try:
         resp = _session.get(
             "https://api.coingecko.com/api/v3/simple/price",
@@ -146,75 +185,178 @@ def get_prices_batch(coins: set[str]) -> dict[str, float]:
         data = resp.json()
         _record_source_success("coingecko")
 
-        result = {}
         for cg_id, price_data in data.items():
             coin = _CG_ID_TO_COIN.get(cg_id)
             if coin and "usd" in price_data:
                 price = float(price_data["usd"])
-                _record_price(coin, price)
+                _record_price(coin, price, source="coingecko_batch")
                 result[coin] = price
-        return result
     except Exception:
         _record_source_failure("coingecko")
-        return {}
+
+    missing = normalized_coins.difference(result)
+    for coin in missing:
+        price = get_price(coin)
+        if price is not None:
+            result[coin] = price
+    return result
 
 
 def get_price(coin: str) -> float | None:
     """Get current price. Tries OKX -> Bybit -> CoinGecko, skipping dead sources."""
+    coin = coin.upper()
     symbol = SUPPORTED_COINS.get(coin)
     if symbol:
         price = get_price_okx(symbol)
         if price is not None:
-            _record_price(coin, price)
+            _record_price(coin, price, source="okx")
             return price
         price = get_price_bybit(symbol)
         if price is not None:
-            _record_price(coin, price)
+            _record_price(coin, price, source="bybit")
             return price
     price = get_price_coingecko(coin)
     if price is not None:
-        _record_price(coin, price)
+        _record_price(coin, price, source="coingecko")
     return price
 
 
-def _record_price(coin: str, price: float) -> None:
-    """Store a price observation for momentum calculation."""
-    now = time.time()
-    if coin not in _price_history:
-        _price_history[coin] = []
-    history = _price_history[coin]
-    history.append((now, price))
-    # Prune old entries
-    cutoff = now - _HISTORY_WINDOW
-    _price_history[coin] = [(t, p) for t, p in history if t >= cutoff]
-
-
 def get_price_age(coin: str) -> float | None:
-    """Return seconds since last price update for a coin, or None if no data."""
-    history = _price_history.get(coin, [])
+    cache_age = REFERENCE_CACHE.age_seconds(coin.upper())
+    if cache_age is not None:
+        return cache_age
+    history = _price_history.get(coin.upper(), [])
     if not history:
         return None
     return time.time() - history[-1][0]
 
 
-def is_price_stale(coin: str, max_age: float = 30.0) -> bool:
-    """Return True if the latest price for a coin is older than max_age seconds."""
+def reference_feed_mode() -> str:
+    if not RTDS_STRICT_MODE:
+        return "poll-fallback"
+    if not WEBSOCKET_CLIENT_AVAILABLE or not RUNTIME_DATA_PLANE.reference_stream_available():
+        return "poll-fallback"
+    if not REFERENCE_CACHE.feed_healthy(MAX_REFERENCE_AGE_SECONDS_REALTIME):
+        return "poll-fallback"
+    return "realtime"
+
+
+def active_reference_max_age_seconds() -> float:
+    if not RTDS_STRICT_MODE:
+        return MAX_REFERENCE_AGE_SECONDS_FALLBACK
+    return (
+        MAX_REFERENCE_AGE_SECONDS_REALTIME
+        if reference_feed_mode() == "realtime"
+        else MAX_REFERENCE_AGE_SECONDS_FALLBACK
+    )
+
+
+def reference_feed_status() -> dict:
+    diagnostics = RUNTIME_DATA_PLANE.diagnostics()
+    return {
+        "mode": reference_feed_mode(),
+        "strict_mode": RTDS_STRICT_MODE,
+        "max_age_seconds": active_reference_max_age_seconds(),
+        "reference_feed_healthy": REFERENCE_CACHE.feed_healthy(MAX_REFERENCE_AGE_SECONDS_REALTIME),
+        "websocket_client_available": WEBSOCKET_CLIENT_AVAILABLE,
+        "runtime": diagnostics,
+    }
+
+
+def is_price_stale(coin: str, max_age: float | None = None) -> bool:
+    limit = active_reference_max_age_seconds() if max_age is None else max_age
     age = get_price_age(coin)
-    return age is None or age > max_age
+    return age is None or age > limit
+
+
+def ensure_reference_recent(coin: str, max_age: float | None = None) -> bool:
+    limit = active_reference_max_age_seconds() if max_age is None else max_age
+    coin = coin.upper()
+    cached_price = REFERENCE_CACHE.price(coin)
+    cached_age = REFERENCE_CACHE.age_seconds(coin)
+    if cached_price is not None and cached_age is not None and cached_age <= limit:
+        return True
+    refreshed_price = get_price(coin)
+    if refreshed_price is None:
+        return False
+    refreshed_age = REFERENCE_CACHE.age_seconds(coin)
+    return refreshed_age is not None and refreshed_age <= limit
+
+
+def get_reference_snapshot(
+    coin: str,
+    *,
+    interval_minutes: int | None = None,
+    window_start_ts: float | None = None,
+    window_tolerance_seconds: float = WINDOW_OPEN_TRUST_TOLERANCE_SECONDS,
+) -> dict:
+    coin = coin.upper()
+    state = REFERENCE_CACHE.get(coin)
+    prefer_chainlink = bool(interval_minutes == 15 and CHAINLINK_REQUIRED_15M)
+    snapshot = {
+        "coin": coin,
+        "price": REFERENCE_CACHE.price(coin),
+        "chainlink_price": state.chainlink_price if state else None,
+        "age_seconds": REFERENCE_CACHE.age_seconds(coin),
+        "chainlink_age_seconds": REFERENCE_CACHE.age_seconds(coin, prefer_chainlink=True),
+        "return_lookback": REFERENCE_CACHE.return_over_window(
+            coin,
+            window_seconds=REFERENCE_LOOKBACK_SECONDS,
+        ),
+        "zscore": REFERENCE_CACHE.rolling_return_zscore(
+            coin,
+            window_seconds=REFERENCE_LOOKBACK_SECONDS,
+        ),
+        "source": state.source if state else "",
+        "active_reference_price": REFERENCE_CACHE.price(coin, prefer_chainlink=prefer_chainlink),
+        "active_reference_age_seconds": REFERENCE_CACHE.age_seconds(coin, prefer_chainlink=prefer_chainlink),
+    }
+    if interval_minutes:
+        snapshot.update(
+            REFERENCE_CACHE.candle_features(
+                coin,
+                window_seconds=float(interval_minutes * 60),
+                prefer_chainlink=prefer_chainlink,
+                fallback_to_spot=True,
+            )
+        )
+    if window_start_ts is not None:
+        anchor = REFERENCE_CACHE.window_anchor(
+            coin,
+            target_timestamp=window_start_ts,
+            tolerance_seconds=window_tolerance_seconds,
+            prefer_chainlink=prefer_chainlink,
+            allow_spot_fallback=True,
+        )
+        snapshot.update(
+            {
+                "window_start_ts": window_start_ts,
+                "window_open_price": anchor.get("price"),
+                "window_open_ts": anchor.get("timestamp"),
+                "window_open_source": anchor.get("source"),
+                "window_open_price_trusted": bool(anchor.get("trusted")),
+                "window_open_anchor_age_seconds": anchor.get("anchor_age_seconds"),
+            }
+        )
+    return snapshot
+
+
+def get_reference_zscore(coin: str, window_seconds: float = REFERENCE_LOOKBACK_SECONDS) -> float | None:
+    return REFERENCE_CACHE.rolling_return_zscore(coin.upper(), window_seconds=window_seconds)
+
+
+def get_reference_return(coin: str, window_seconds: float = REFERENCE_LOOKBACK_SECONDS) -> float | None:
+    return REFERENCE_CACHE.return_over_window(coin.upper(), window_seconds=window_seconds)
 
 
 def get_price_momentum(coin: str) -> float | None:
-    """Get recent price momentum as a percentage change.
-
-    Compares the latest price to the price ~30 seconds ago.
-    Returns positive for upward movement, negative for downward.
-    Returns None if insufficient data or if price data is stale (>30s old).
-    """
-    # Only fetch a fresh price if cache is stale or empty — avoids slow
-    # sequential OKX→Bybit→CoinGecko fallback during the critical path
-    # (batch warming should have already seeded the cache this tick)
-    if is_price_stale(coin, max_age=15.0):
+    """Compatibility wrapper around the new reference-return model."""
+    coin = coin.upper()
+    if is_price_stale(coin, max_age=MAX_REFERENCE_AGE_SECONDS):
         get_price(coin)
+    reference_return = get_reference_return(coin, window_seconds=REFERENCE_LOOKBACK_SECONDS)
+    if reference_return is not None:
+        return reference_return
 
     history = _price_history.get(coin, [])
     if len(history) < 2:
@@ -222,13 +364,7 @@ def get_price_momentum(coin: str) -> float | None:
 
     now = history[-1][0]
     latest_price = history[-1][1]
-
-    # Reject stale data — if the latest price is too old, don't trust momentum
-    if time.time() - now > 30:
-        return None
-
-    # Find the price closest to 30 seconds ago
-    target_time = now - 30
+    target_time = now - REFERENCE_LOOKBACK_SECONDS
     best_entry = None
     best_diff = float("inf")
     for t, p in history:
@@ -236,17 +372,12 @@ def get_price_momentum(coin: str) -> float | None:
         if diff < best_diff:
             best_diff = diff
             best_entry = (t, p)
-
     if best_entry is None or best_entry == history[-1]:
         return None
-
-    # Need at least 10 seconds of history for meaningful momentum
     time_span = now - best_entry[0]
     if time_span < 10:
         return None
-
     old_price = best_entry[1]
     if old_price == 0:
         return None
-
     return (latest_price - old_price) / old_price

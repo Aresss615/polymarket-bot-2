@@ -153,7 +153,7 @@ def test_find_updown_markets_matches_slug():
 
 def test_find_updown_markets_respects_time_window():
     now = datetime.now(timezone.utc)
-    # Too far out (200s > 120s max)
+    # 15m shadow mode now includes the mid-life discovery window (180-480s).
     m = Market(
         condition_id="0x3",
         question="ETH Up or Down?",
@@ -165,11 +165,28 @@ def test_find_updown_markets_respects_time_window():
         active=True,
     )
     results = find_updown_markets([m])
-    assert len(results) == 0
+    assert len(results) == 1
+    assert results[0].interval_minutes == 15
+
+
+def test_find_updown_markets_skips_15m_gap_between_windows():
+    now = datetime.now(timezone.utc)
+    m = Market(
+        condition_id="0xgap",
+        question="ETH Up or Down?",
+        slug="eth-updown-15m-999",
+        outcomes=["Up", "Down"],
+        outcome_prices=[0.5, 0.5],
+        token_ids=["0xa", "0xb"],
+        end_date=now + timedelta(seconds=120),
+        active=True,
+    )
+    results = find_updown_markets([m])
+    assert results == []
 
 
 def test_find_updown_markets_15m_in_window():
-    """15m markets within 60s window should be discovered."""
+    """15m markets within the close window should be discovered."""
     now = datetime.now(timezone.utc)
     m = Market(
         condition_id="0x5",

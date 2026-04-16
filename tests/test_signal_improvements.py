@@ -1,10 +1,27 @@
-"""Tests for v8 signal improvements: BTC NO blacklist, NO premium, fee-aware edge."""
+"""Focused regression tests for the v11 deterministic signal rules."""
 
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
-from datetime import datetime, timezone, timedelta
 
-from config import UpDownMarket, Market
-from level_analyzer import analyze_updown_market
+import pytest
+
+from config import STRATEGY_MODE_SHADOW, Market, UpDownMarket
+from level_analyzer import analyze_updown_market_detail
+
+
+@pytest.fixture(autouse=True)
+def _mock_book_snapshot():
+    with patch(
+        "level_analyzer.MARKET_CACHE.snapshot",
+        return_value={
+            "best_bid": 0.69,
+            "best_ask": 0.70,
+            "spread": 0.01,
+            "book_age_ms": 250.0,
+            "tick_size": 0.01,
+        },
+    ):
+        yield
 
 
 def _make_updown(coin="SOL", up_price=0.80, down_price=0.20, secs=20, interval=5):
@@ -19,80 +36,120 @@ def _make_updown(coin="SOL", up_price=0.80, down_price=0.20, secs=20, interval=5
         active=True,
     )
     return UpDownMarket(
-        market=market, coin=coin, interval_minutes=interval,
-        seconds_to_close=secs, up_outcome_index=0,
+        market=market,
+        coin=coin,
+        interval_minutes=interval,
+        seconds_to_close=secs,
+        up_outcome_index=0,
     )
 
 
-@patch("level_analyzer.is_price_stale", return_value=False)
-class TestBtcNoBlacklist:
-    @patch("level_analyzer.get_price_momentum", return_value=-0.005)
-    def test_btc_no_blocked(self, mock_mom, mock_stale):
-        """BTC NO trades are blocked regardless of edge."""
-        udm = _make_updown(coin="BTC", up_price=0.15, down_price=0.85)
-        signal, reason = analyze_updown_market(udm)
-        assert signal is None
-        assert "BTC NO blacklisted" in reason
-
-    @patch("level_analyzer.get_price_momentum", return_value=0.005)
-    def test_btc_yes_still_allowed(self, mock_mom, mock_stale):
-        """BTC YES trades are not affected by the blacklist."""
-        udm = _make_updown(coin="BTC", up_price=0.87, down_price=0.13)
-        signal, reason = analyze_updown_market(udm)
-        # May or may not generate signal depending on edge, but should NOT be blacklisted
-        if signal is None:
-            assert "BTC NO blacklisted" not in reason
-
-    @patch("level_analyzer.get_price_momentum", return_value=-0.005)
-    def test_other_coin_no_not_blocked(self, mock_mom, mock_stale):
-        """Non-BTC NO trades are not affected by the BTC blacklist."""
-        udm = _make_updown(coin="XRP", up_price=0.13, down_price=0.87)
-        signal, reason = analyze_updown_market(udm)
-        if signal is None:
-            assert "BTC NO blacklisted" not in reason
-
-
-@patch("level_analyzer.is_price_stale", return_value=False)
-class TestNoSideEdgePremium:
-    @patch("level_analyzer.get_price_momentum", return_value=0.005)
-    def test_yes_passes_at_lower_edge(self, mock_mom, mock_stale):
-        """YES side should pass with standard min_edge (no premium)."""
-        # SOL at 0.83 UP → YES side, entry at 0.83, strong signal
-        udm = _make_updown(coin="SOL", up_price=0.83, down_price=0.17)
-        signal, reason = analyze_updown_market(udm)
-        assert signal is not None
-        assert signal.side == "YES"
-
-    @patch("level_analyzer.get_price_momentum", return_value=-0.005)
-    def test_no_requires_more_edge(self, mock_mom, mock_stale):
-        """NO side requires +1% extra edge. Strong NO signals still pass."""
-        # SOL at 0.18 DOWN → NO side, entry at 0.82
-        # With 1% NO premium (reduced from 3%), strong NO signals pass
-        udm = _make_updown(coin="SOL", up_price=0.18, down_price=0.82)
-        signal, reason = analyze_updown_market(udm)
-        assert signal is not None
-        assert signal.side == "NO"
+def _snapshot(
+    *,
+    ret,
+    zscore,
+    age=0.2,
+    price=100.0,
+    interval_open=None,
+    interval_high=None,
+    interval_low=None,
+    interval_close=None,
+    interval_return=None,
+    late_return_60s=None,
+    late_return_20s=None,
+    body_ratio=None,
+    chainlink_price=100.0,
+    chainlink_age=0.2,
+):
+    effective_price = interval_close if interval_close is not None else price
+    derived_interval_return = interval_return if interval_return is not None else ret
+    derived_window_open = interval_open if interval_open is not None else effective_price / (1.0 + derived_interval_return)
+    return {
+        "coin": "SOL",
+        "price": effective_price,
+        "active_reference_price": effective_price,
+        "chainlink_price": chainlink_price,
+        "age_seconds": age,
+        "active_reference_age_seconds": age,
+        "chainlink_age_seconds": chainlink_age,
+        "return_lookback": ret,
+        "zscore": zscore,
+        "interval_open": interval_open,
+        "interval_high": interval_high,
+        "interval_low": interval_low,
+        "interval_close": interval_close,
+        "interval_return": interval_return,
+        "late_return_60s": late_return_60s if late_return_60s is not None else derived_interval_return,
+        "late_return_20s": late_return_20s if late_return_20s is not None else derived_interval_return,
+        "body_ratio": body_ratio if body_ratio is not None else 1.0,
+        "window_open_price": derived_window_open,
+        "window_open_source": "test_anchor",
+        "window_open_price_trusted": True,
+        "source": "test",
+    }
 
 
-@patch("level_analyzer.is_price_stale", return_value=False)
-class TestFeeAwareEdge:
-    @patch("level_analyzer.get_price_momentum", return_value=0.001)
-    def test_near_50_filtered_by_fees(self, mock_mom, mock_stale):
-        """Trades near 0.50 have highest fees (1.8%) and should be filtered more aggressively."""
-        # Price at 0.62 (just above skip band), entry near 0.62
-        # Fee at 0.62: 0.018 * (1 - 2*0.12) = 0.018 * 0.76 = 1.37%
-        # This eats into edge significantly
-        udm = _make_updown(coin="SOL", up_price=0.62, down_price=0.38)
-        signal, reason = analyze_updown_market(udm)
-        # With the fee deduction, this marginal signal should be filtered
-        assert signal is None
-        assert "fee" in reason or "skip" in reason
+@patch(
+    "level_analyzer.get_reference_snapshot",
+    return_value=_snapshot(
+        ret=-0.0040,
+        zscore=1.2,
+        interval_open=100.0,
+        interval_high=100.0,
+        interval_low=99.5,
+        interval_close=99.6,
+        interval_return=-0.0040,
+        late_return_60s=-0.0015,
+        late_return_20s=-0.0008,
+        body_ratio=0.8,
+    ),
+)
+def test_btc_no_strong_toxic_flow_is_blocked(mock_snapshot):
+    analysis = analyze_updown_market_detail(_make_updown(coin="BTC", up_price=0.85, down_price=0.15))
+    assert analysis.signal is None
+    assert "toxic flow" in analysis.reason.lower()
 
-    @patch("level_analyzer.get_price_momentum", return_value=0.003)
-    def test_extreme_price_low_fees_passes(self, mock_mom, mock_stale):
-        """Trades at extreme prices have low fees and strong edge, should pass."""
-        # SOL at 0.85 UP → YES side, very low fee (~0.5%)
-        udm = _make_updown(coin="SOL", up_price=0.85, down_price=0.15)
-        signal, reason = analyze_updown_market(udm)
-        assert signal is not None
-        assert signal.side == "YES"
+
+@patch(
+    "level_analyzer.get_reference_snapshot",
+    return_value=_snapshot(
+        ret=-0.0040,
+        zscore=0.7,
+        interval_open=100.0,
+        interval_high=100.0,
+        interval_low=99.5,
+        interval_close=99.6,
+        interval_return=-0.0040,
+        late_return_60s=-0.0015,
+        late_return_20s=-0.0008,
+        body_ratio=0.8,
+    ),
+)
+def test_btc_no_weak_toxic_flow_is_shadow_and_half_size(mock_snapshot):
+    analysis = analyze_updown_market_detail(_make_updown(coin="BTC", up_price=0.85, down_price=0.15))
+    assert analysis.signal is not None
+    assert analysis.signal.side == "NO"
+    assert analysis.signal.strategy_mode == STRATEGY_MODE_SHADOW
+    assert analysis.signal.size_multiplier == 0.625
+
+
+@patch("level_analyzer.get_reference_snapshot", return_value=_snapshot(ret=0.00005, zscore=0.0))
+def test_price_neutral_setup_requires_higher_threshold(mock_snapshot):
+    analysis = analyze_updown_market_detail(_make_updown(up_price=0.58, down_price=0.42))
+    assert analysis.signal is None
+    assert analysis.strategy_route == "range_or_flat"
+
+
+@patch("level_analyzer.get_reference_snapshot", return_value=_snapshot(ret=0.0060, zscore=1.2))
+def test_15m_candidate_stays_shadow_even_when_passing(mock_snapshot):
+    analysis = analyze_updown_market_detail(_make_updown(interval=15, secs=240, up_price=0.60, down_price=0.40))
+    assert analysis.signal is not None
+    assert analysis.signal.strategy_mode == STRATEGY_MODE_SHADOW
+
+
+@patch("level_analyzer.get_reference_snapshot", return_value=_snapshot(ret=0.0036, zscore=1.0))
+def test_fee_aware_edge_can_still_pass_for_strong_setups(mock_snapshot):
+    analysis = analyze_updown_market_detail(_make_updown(up_price=0.70, down_price=0.30))
+    assert analysis.signal is not None
+    assert analysis.effective_edge is not None
+    assert analysis.effective_edge > analysis.estimated_fee

@@ -15,6 +15,7 @@ from config import (
     MAX_SECONDS_TO_CLOSE_5M,
     MIN_SECONDS_TO_CLOSE_15M,
     MAX_SECONDS_TO_CLOSE_15M,
+    WINDOWS_15M,
     MIN_LIQUIDITY,
 )
 
@@ -122,13 +123,13 @@ def find_updown_markets(markets: list[Market]) -> list[UpDownMarket]:
 
         # Per-interval time window
         if interval == 15:
-            min_secs = MIN_SECONDS_TO_CLOSE_15M
-            max_secs = MAX_SECONDS_TO_CLOSE_15M
+            in_window = any(start <= secs <= end for start, end in WINDOWS_15M)
         else:
-            min_secs = MIN_SECONDS_TO_CLOSE_5M
-            max_secs = MAX_SECONDS_TO_CLOSE_5M
+            in_window = MIN_SECONDS_TO_CLOSE_5M <= secs <= MAX_SECONDS_TO_CLOSE_5M
 
-        if secs < min_secs or secs > max_secs:
+        if interval == 15 and not (MIN_SECONDS_TO_CLOSE_15M <= secs <= MAX_SECONDS_TO_CLOSE_15M):
+            continue
+        if not in_window:
             continue
 
         results.append(

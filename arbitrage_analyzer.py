@@ -88,6 +88,8 @@ def analyze_headlines(
                     side=data.get("side", "YES"),
                     confidence=confidence,
                     reason=data.get("reason", ""),
+                    bucket="news_experimental",
+                    expected_value=-0.05,
                 )
             )
         except (json.JSONDecodeError, ValueError, KeyError):

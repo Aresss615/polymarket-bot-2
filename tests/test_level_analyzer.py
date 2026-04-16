@@ -1,230 +1,418 @@
-import pytest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
-from config import Market, UpDownMarket
-from level_analyzer import analyze_updown_market
+import pytest
+
+from config import STRATEGY_MODE_LIVE, STRATEGY_MODE_SHADOW, Market, UpDownMarket
+from level_analyzer import analyze_updown_market, analyze_updown_market_detail
 
 
 @pytest.fixture(autouse=True)
-def _mock_price_freshness():
-    """Default: price data is fresh in tests."""
-    with patch("level_analyzer.is_price_stale", return_value=False):
+def _mock_book_snapshot():
+    with patch(
+        "level_analyzer.MARKET_CACHE.snapshot",
+        return_value={
+            "best_bid": 0.69,
+            "best_ask": 0.70,
+            "spread": 0.01,
+            "book_age_ms": 250.0,
+            "tick_size": 0.01,
+        },
+    ):
         yield
 
 
-def _make_updown(coin="BTC", up_price=0.75, down_price=0.25, secs=30, up_idx=0):
+def _make_updown(coin="SOL", up_price=0.78, down_price=0.22, secs=20, interval=5, up_idx=0):
     outcomes = ["Up", "Down"] if up_idx == 0 else ["Down", "Up"]
     prices = [up_price, down_price] if up_idx == 0 else [down_price, up_price]
-    end_date = datetime.now(timezone.utc) + timedelta(seconds=secs)
-    m = Market(
+    market = Market(
         condition_id="0x1",
-        question=f"{coin}-USDT Up or Down?",
-        slug=f"{coin.lower()}-updown-5m-123",
+        question=f"{coin} Up or Down?",
+        slug=f"{coin.lower()}-updown-{interval}m-123",
         outcomes=outcomes,
         outcome_prices=prices,
-        token_ids=["0xa", "0xb"],
-        end_date=end_date,
+        token_ids=["0xup", "0xdown"],
+        end_date=datetime.now(timezone.utc) + timedelta(seconds=secs),
         active=True,
     )
-    return UpDownMarket(market=m, coin=coin, interval_minutes=5, seconds_to_close=secs, up_outcome_index=up_idx)
-
-
-@patch("level_analyzer.get_price_momentum", return_value=0.002)
-def test_signal_yes_when_market_favors_up_with_confirmation(mock_mom):
-    """UP at 0.82 with positive momentum -> YES (above 70-80% edge floor zone)."""
-    udm = _make_updown(coin="SOL", up_price=0.82, down_price=0.18)
-    signal, reason = analyze_updown_market(udm)
-    assert signal is not None
-    assert signal.side == "YES"
-    assert signal.strategy == "updown"
-    assert signal.confidence > 0
-
-
-@patch("level_analyzer.get_price_momentum", return_value=-0.002)
-def test_no_side_requires_extra_edge(mock_mom):
-    """NO side requires 1% extra edge (reduced from 3%). Strong NO signals pass.
-
-    UP at 0.18 with negative momentum -> strong DOWN signal -> buy NO.
-    With reduced NO premium (1%), this trade should pass.
-    """
-    udm = _make_updown(coin="SOL", up_price=0.18, down_price=0.82)
-    signal, reason = analyze_updown_market(udm)
-    assert signal is not None
-    assert signal.side == "NO"
-
-
-@patch("level_analyzer.get_price_momentum", return_value=None)
-def test_no_signal_at_50_50(mock_mom):
-    """Market at 50/50 -> in skip band, no signal."""
-    udm = _make_updown(up_price=0.50, down_price=0.50)
-    signal, reason = analyze_updown_market(udm)
-    assert signal is None
-    assert "coin-flip" in reason
-
-
-@patch("level_analyzer.get_price_momentum", return_value=None)
-def test_no_signal_in_skip_band(mock_mom):
-    """Market at 55/45 -> inside 38-62% skip band."""
-    udm = _make_updown(up_price=0.55, down_price=0.45)
-    signal, reason = analyze_updown_market(udm)
-    assert signal is None
-    assert "coin-flip" in reason
-
-
-@patch("level_analyzer.get_price_momentum", return_value=None)
-def test_no_signal_when_near_certain_high(mock_mom):
-    """UP at 0.95 -> skip, no room for edge."""
-    udm = _make_updown(up_price=0.95, down_price=0.05)
-    signal, reason = analyze_updown_market(udm)
-    assert signal is None
-    assert "near-certain" in reason
-
-
-@patch("level_analyzer.get_price_momentum", return_value=None)
-def test_no_signal_when_near_certain_low(mock_mom):
-    """UP at 0.05 -> skip, no room for edge."""
-    udm = _make_updown(up_price=0.05, down_price=0.95)
-    signal, reason = analyze_updown_market(udm)
-    assert signal is None
-    assert "near-certain" in reason
-
-
-@patch("level_analyzer.get_price_momentum", return_value=-0.003)
-def test_no_signal_when_price_contradicts(mock_mom):
-    """UP at 0.75 but price falling -> skip (contradiction)."""
-    udm = _make_updown(coin="SOL", up_price=0.75, down_price=0.25)
-    signal, reason = analyze_updown_market(udm)
-    assert signal is None
-    assert "contradicts" in reason
-
-
-@patch("level_analyzer.get_price_momentum", return_value=-0.002)
-def test_inverted_up_index(mock_mom):
-    """When UP is at index 1, prices are read correctly."""
-    udm = _make_updown(coin="SOL", up_price=0.18, down_price=0.82, up_idx=1)
-    signal, reason = analyze_updown_market(udm)
-    assert signal is not None
-    assert signal.side == "YES"
-
-
-@patch("level_analyzer.get_price_momentum", return_value=0.002)
-def test_signal_includes_reason(mock_mom):
-    udm = _make_updown(coin="SOL", up_price=0.82, down_price=0.18)
-    signal, reason = analyze_updown_market(udm)
-    assert signal is not None
-    assert "SOL" in signal.reason
-    assert "UP" in signal.reason
-    assert "30s" in signal.reason
-
-
-@patch("level_analyzer.get_price_momentum", return_value=None)
-def test_no_signal_insufficient_prices(mock_mom):
-    """Market with only one price -> skip."""
-    m = Market(
-        condition_id="0x2",
-        question="BTC Up or Down?",
-        slug="btc-updown-5m-456",
-        outcomes=["Up"],
-        outcome_prices=[0.60],
-        token_ids=["0xa"],
-        end_date=datetime(2026, 4, 10, 21, 0, tzinfo=timezone.utc),
-        active=True,
+    return UpDownMarket(
+        market=market,
+        coin=coin,
+        interval_minutes=interval,
+        seconds_to_close=secs,
+        up_outcome_index=up_idx,
     )
-    udm = UpDownMarket(market=m, coin="BTC", interval_minutes=5, seconds_to_close=30, up_outcome_index=0)
+
+
+def _snapshot(
+    *,
+    price=100.0,
+    age=0.2,
+    ret=0.0012,
+    zscore=0.4,
+    chainlink_price=None,
+    chainlink_age=None,
+    interval_open=None,
+    interval_high=None,
+    interval_low=None,
+    interval_close=None,
+    interval_return=None,
+    late_return_60s=None,
+    late_return_20s=None,
+    body_ratio=None,
+    wick_imbalance=None,
+    window_open_price=None,
+    window_open_source="test_anchor",
+    window_open_price_trusted=None,
+):
+    effective_price = interval_close if interval_close is not None else price
+    derived_interval_return = interval_return if interval_return is not None else ret
+    derived_window_open = window_open_price
+    if derived_window_open is None:
+        if interval_open is not None:
+            derived_window_open = interval_open
+        elif effective_price is not None and derived_interval_return is not None:
+            derived_window_open = effective_price / (1.0 + derived_interval_return)
+    return {
+        "coin": "SOL",
+        "price": effective_price,
+        "active_reference_price": effective_price,
+        "chainlink_price": chainlink_price,
+        "age_seconds": age,
+        "active_reference_age_seconds": age,
+        "chainlink_age_seconds": chainlink_age,
+        "return_lookback": ret,
+        "zscore": zscore,
+        "interval_open": interval_open,
+        "interval_high": interval_high,
+        "interval_low": interval_low,
+        "interval_close": interval_close,
+        "interval_return": interval_return,
+        "late_return_60s": late_return_60s if late_return_60s is not None else derived_interval_return,
+        "late_return_20s": late_return_20s if late_return_20s is not None else derived_interval_return,
+        "body_ratio": body_ratio if body_ratio is not None else 1.0,
+        "wick_imbalance": wick_imbalance,
+        "window_open_price": derived_window_open,
+        "window_open_source": window_open_source,
+        "window_open_price_trusted": (
+            derived_window_open is not None
+            if window_open_price_trusted is None
+            else window_open_price_trusted
+        ),
+        "source": "test",
+    }
+
+
+@patch("level_analyzer.get_reference_snapshot", return_value=_snapshot(ret=0.0036, zscore=1.0))
+def test_live_signal_emits_positive_net_edge(mock_snapshot):
+    udm = _make_updown(up_price=0.70, down_price=0.30)
+    analysis = analyze_updown_market_detail(udm)
+    assert analysis.signal is not None
+    assert analysis.signal.side == "YES"
+    assert analysis.signal.strategy_mode == STRATEGY_MODE_LIVE
+    assert analysis.effective_edge is not None and analysis.effective_edge > 0
+    assert analysis.reference_age_seconds is not None and analysis.reference_age_seconds < 1
+
+
+@patch("level_analyzer.get_reference_snapshot", return_value=_snapshot(ret=0.00005, zscore=0.0))
+def test_neutral_setup_requires_higher_net_edge(mock_snapshot):
+    udm = _make_updown(up_price=0.58, down_price=0.42)
     signal, reason = analyze_updown_market(udm)
     assert signal is None
+    assert "flat window shadow only" in reason
 
 
-@patch("level_analyzer.get_price_momentum", return_value=None)
-def test_strong_signal_no_momentum_still_trades(mock_mom):
-    """Very strong signal (83%) without price data still trades.
-    strength=0.33, boost=0.02+0.33*0.15=0.070, entry=0.83 (above 0.80 floor)."""
-    udm = _make_updown(coin="SOL", up_price=0.83, down_price=0.17)
-    signal, reason = analyze_updown_market(udm)
-    assert signal is not None
-    assert signal.side == "YES"
-
-
-@patch("level_analyzer.get_price_momentum", return_value=0.001)
-def test_moderate_signal_with_momentum_trades(mock_mom):
-    """Strong signal (83%) with price confirmation -> trade (entry 0.83, enough edge after fees)."""
-    udm = _make_updown(coin="SOL", up_price=0.83, down_price=0.17)
-    signal, reason = analyze_updown_market(udm)
-    assert signal is not None
-    assert signal.side == "YES"
-
-
-@patch("level_analyzer.get_price_momentum", return_value=None)
-def test_moderate_signal_no_momentum_skips(mock_mom):
-    """Moderate signal (68%) without price confirmation -> too weak."""
-    udm = _make_updown(coin="SOL", up_price=0.68, down_price=0.32)
-    signal, reason = analyze_updown_market(udm)
-    # 68% is outside skip band, but strength=0.18 < 0.20, no momentum
-    assert signal is None
-    assert "weak signal" in reason
-
-
-@patch("level_analyzer.get_price_momentum", return_value=0.002)
-def test_btc_requires_higher_edge(mock_mom):
-    """BTC at 0.75 with momentum -> edge ~5.8% < BTC min 8% -> skip."""
-    udm = _make_updown(coin="BTC", up_price=0.75, down_price=0.25)
-    signal, reason = analyze_updown_market(udm)
-    assert signal is None
-    assert "edge" in reason
-
-
-@patch("level_analyzer.get_price_momentum", return_value=-0.005)
-def test_btc_no_blacklisted(mock_mom):
-    """BTC NO trades are blocked entirely (historical ~48% WR)."""
-    udm = _make_updown(coin="BTC", up_price=0.15, down_price=0.85)
-    signal, reason = analyze_updown_market(udm)
-    assert signal is None
-    assert "blacklisted" in reason.lower()
-
-
-@patch("level_analyzer.get_price_momentum", return_value=0.002)
-def test_btc_rejected_high_min_edge(mock_mom):
-    """BTC requires 10% edge (59% historical WR) — boost formula can't reach it."""
-    udm = _make_updown(coin="BTC", up_price=0.86, down_price=0.14)
-    signal, reason = analyze_updown_market(udm)
-    assert signal is None
-
-
-@patch("level_analyzer.get_price_momentum", return_value=0.002)
-def test_70_80_zone_requires_higher_edge(mock_mom):
-    """Entry price 0.75 requires 7% edge (price-dependent floor), not just 5%."""
-    # SOL at 0.75 with momentum: strength=0.25, boost=0.0675, edge=6.75% < 7%
-    udm = _make_updown(coin="SOL", up_price=0.75, down_price=0.25)
-    signal, reason = analyze_updown_market(udm)
-    assert signal is None  # rejected by 70-80% edge floor
-    assert "edge" in reason
-
-
-@patch("level_analyzer.is_price_stale", return_value=True)
-@patch("level_analyzer.get_price_momentum", return_value=0.002)
-def test_skip_when_price_data_stale(mock_mom, mock_stale):
-    """If price data is stale (>30s old), skip the trade."""
-    udm = _make_updown(coin="SOL", up_price=0.82, down_price=0.18)
+@patch("level_analyzer.get_reference_snapshot", return_value=_snapshot(age=9.5))
+def test_stale_reference_skips(mock_snapshot):
+    udm = _make_updown()
     signal, reason = analyze_updown_market(udm)
     assert signal is None
     assert "stale" in reason.lower()
 
 
-@patch("level_analyzer.get_price_momentum", return_value=0.002)
-def test_15m_uses_higher_min_seconds(mock_mom):
-    """15m markets use MIN_SECONDS_TO_TRADE_15M (10s), not 5s."""
-    # Create a 15m market with only 8 seconds remaining
-    udm = _make_updown(coin="SOL", up_price=0.82, down_price=0.18, secs=8)
-    from config import UpDownMarket
-    udm_15m = UpDownMarket(
-        market=udm.market,
-        coin="SOL",
-        interval_minutes=15,
-        seconds_to_close=8,
-        up_outcome_index=0,
+@patch("level_analyzer.ensure_reference_recent", return_value=True)
+@patch(
+    "level_analyzer.get_reference_snapshot",
+    side_effect=[_snapshot(age=9.5), _snapshot(ret=0.0036, zscore=1.0)],
+)
+def test_stale_reference_refreshes_before_skip(mock_snapshot, mock_refresh):
+    udm = _make_updown()
+    analysis = analyze_updown_market_detail(udm)
+    assert analysis.signal is not None
+    assert analysis.price_state != "stale"
+    assert mock_snapshot.call_count == 2
+    assert mock_refresh.called
+
+
+@patch("level_analyzer.get_reference_snapshot", return_value=_snapshot())
+def test_invalid_prices_skip(mock_snapshot):
+    market = Market(
+        condition_id="0x2",
+        question="SOL Up or Down?",
+        slug="sol-updown-5m-456",
+        outcomes=["Up"],
+        outcome_prices=[0.8],
+        token_ids=["0xup"],
+        end_date=datetime.now(timezone.utc) + timedelta(seconds=20),
+        active=True,
     )
-    udm_15m.market.slug = "sol-updown-15m-123"
-    signal, reason = analyze_updown_market(udm_15m)
+    udm = UpDownMarket(market=market, coin="SOL", interval_minutes=5, seconds_to_close=20, up_outcome_index=0)
+    signal, reason = analyze_updown_market(udm)
     assert signal is None
-    assert "left" in reason  # "8s left < 10s min"
+    assert "<2 outcome prices" in reason
+
+
+@patch("level_analyzer.get_reference_snapshot", return_value=_snapshot(chainlink_price=None, chainlink_age=None))
+def test_15m_requires_chainlink(mock_snapshot):
+    udm = _make_updown(interval=15, secs=240)
+    signal, reason = analyze_updown_market(udm)
+    assert signal is None
+    assert "Chainlink" in reason
+
+
+@patch(
+    "level_analyzer.get_reference_snapshot",
+    return_value=_snapshot(chainlink_price=100.0, chainlink_age=0.3, ret=0.0060, zscore=1.2),
+)
+def test_15m_signal_is_shadow_only_by_default(mock_snapshot):
+    udm = _make_updown(interval=15, secs=240, up_price=0.60, down_price=0.40)
+    analysis = analyze_updown_market_detail(udm)
+    assert analysis.signal is not None
+    assert analysis.signal.strategy_mode == STRATEGY_MODE_SHADOW
+    assert analysis.strategy_mode == STRATEGY_MODE_SHADOW
+
+
+@patch(
+    "level_analyzer.get_reference_snapshot",
+    return_value=_snapshot(
+        ret=-0.0040,
+        zscore=1.3,
+        interval_open=100.0,
+        interval_high=100.0,
+        interval_low=99.5,
+        interval_close=99.6,
+        interval_return=-0.0040,
+        late_return_60s=-0.0015,
+        late_return_20s=-0.0008,
+        body_ratio=0.80,
+    ),
+)
+def test_btc_toxic_flow_blocks_no_signal(mock_snapshot):
+    udm = _make_updown(coin="BTC", up_price=0.85, down_price=0.15)
+    signal, reason = analyze_updown_market(udm)
+    assert signal is None
+    assert "toxic flow" in reason.lower()
+
+
+@patch(
+    "level_analyzer.get_reference_snapshot",
+    return_value=_snapshot(
+        ret=-0.0040,
+        zscore=0.7,
+        interval_open=100.0,
+        interval_high=100.0,
+        interval_low=99.5,
+        interval_close=99.6,
+        interval_return=-0.0040,
+        late_return_60s=-0.0015,
+        late_return_20s=-0.0008,
+        body_ratio=0.80,
+    ),
+)
+def test_btc_no_weak_toxic_flow_reduces_size_and_stays_shadow(mock_snapshot):
+    udm = _make_updown(coin="BTC", up_price=0.85, down_price=0.15)
+    analysis = analyze_updown_market_detail(udm)
+    assert analysis.signal is not None
+    assert analysis.signal.side == "NO"
+    assert analysis.signal.strategy_mode == STRATEGY_MODE_SHADOW
+    assert analysis.signal.size_multiplier == 0.625
+
+
+@patch("level_analyzer.get_reference_snapshot", return_value=_snapshot(ret=0.0038, zscore=0.8))
+def test_inverted_up_index_is_supported(mock_snapshot):
+    udm = _make_updown(up_price=0.18, down_price=0.82, up_idx=1)
+    analysis = analyze_updown_market_detail(udm)
+    assert analysis.signal is not None
+    assert analysis.signal.side == "YES"
+    assert analysis.direction == "SELL"
+
+
+@patch(
+    "level_analyzer.get_reference_snapshot",
+        return_value=_snapshot(
+            ret=0.0040,
+            zscore=0.0,
+            interval_open=100.0,
+            interval_high=100.4,
+            interval_low=99.9,
+            interval_close=100.4,
+            interval_return=0.0040,
+            late_return_60s=0.0010,
+            late_return_20s=0.0004,
+            body_ratio=0.75,
+            wick_imbalance=0.05,
+        ),
+)
+def test_strong_move_95c_skips_as_too_late_or_overpriced(mock_snapshot):
+    udm = _make_updown(up_price=0.95, down_price=0.05)
+    analysis = analyze_updown_market_detail(udm)
+    assert analysis.signal is None
+    assert analysis.actual_move_regime == "strong"
+    assert analysis.strategy_route == "too_late_or_overpriced"
+    assert "too late or overpriced" in analysis.reason
+
+
+@patch(
+    "level_analyzer.get_reference_snapshot",
+    return_value=_snapshot(
+        ret=0.0030,
+        zscore=0.2,
+        interval_open=100.0,
+        interval_high=100.4,
+        interval_low=99.95,
+        interval_close=100.4,
+        interval_return=0.0040,
+        late_return_60s=0.0012,
+        late_return_20s=0.0005,
+        body_ratio=0.80,
+        wick_imbalance=0.02,
+    ),
+)
+def test_strong_follow_trend_boosts_size_without_excess_confidence(mock_snapshot):
+    udm = _make_updown(up_price=0.70, down_price=0.30)
+    analysis = analyze_updown_market_detail(udm)
+    assert analysis.signal is not None
+    assert analysis.actual_move_regime == "strong"
+    assert analysis.strategy_route == "trend_follow_candidate"
+    assert analysis.signal.size_multiplier == 1.25
+    assert analysis.signal.confidence <= 0.90
+
+
+@patch(
+    "level_analyzer.get_reference_snapshot",
+    return_value=_snapshot(
+        ret=-0.0015,
+        zscore=-0.1,
+        interval_open=100.0,
+        interval_high=100.1,
+        interval_low=99.7,
+        interval_close=99.85,
+        interval_return=-0.0015,
+        late_return_60s=-0.0006,
+        late_return_20s=0.0002,
+        body_ratio=0.30,
+        wick_imbalance=-0.15,
+    ),
+)
+def test_mixed_regime_caps_confidence_and_uses_side_aware_reason(mock_snapshot):
+    udm = _make_updown(up_price=0.75, down_price=0.25)
+    analysis = analyze_updown_market_detail(udm)
+    assert analysis.signal is None
+    assert analysis.actual_move_regime == "mid"
+    assert analysis.strategy_route == "mid_skip"
+    assert "mid regime no trade" in analysis.reason
+
+
+@patch(
+    "level_analyzer.get_reference_snapshot",
+    return_value=_snapshot(
+        ret=-0.0030,
+        zscore=-0.3,
+        interval_open=100.0,
+        interval_high=100.0,
+        interval_low=99.4,
+        interval_close=99.5,
+        interval_return=-0.0050,
+        late_return_60s=-0.0015,
+        late_return_20s=-0.0007,
+        body_ratio=0.75,
+        wick_imbalance=-0.05,
+    ),
+)
+def test_extreme_price_setup_is_shadow_only_not_skipped(mock_snapshot):
+    udm = _make_updown(up_price=0.99, down_price=0.01)
+    analysis = analyze_updown_market_detail(udm)
+    assert analysis.signal is not None
+    assert analysis.signal.side == "NO"
+    assert analysis.signal.strategy_mode == STRATEGY_MODE_SHADOW
+
+
+@patch(
+    "level_analyzer.get_reference_snapshot",
+    return_value=_snapshot(window_open_price=None, window_open_price_trusted=False),
+)
+def test_missing_exact_open_causes_skip(mock_snapshot):
+    udm = _make_updown(up_price=0.70, down_price=0.30)
+    analysis = analyze_updown_market_detail(udm)
+    assert analysis.signal is None
+    assert analysis.strategy_route == "missing_exact_open"
+    assert "trusted exact window open" in analysis.reason
+
+
+@patch(
+    "level_analyzer.get_reference_snapshot",
+    return_value=_snapshot(
+        ret=0.0040,
+        interval_open=100.0,
+        interval_high=100.5,
+        interval_low=99.95,
+        interval_close=100.4,
+        interval_return=0.0040,
+        late_return_60s=0.0012,
+        late_return_20s=0.0006,
+        body_ratio=0.80,
+    ),
+)
+def test_79c_strong_move_goes_to_high_prob_shadow(mock_snapshot):
+    udm = _make_updown(up_price=0.79, down_price=0.21)
+    analysis = analyze_updown_market_detail(udm)
+    assert analysis.signal is not None
+    assert analysis.signal.strategy_mode == STRATEGY_MODE_SHADOW
+    assert analysis.strategy_route == "high_prob_shadow"
+
+
+@patch(
+    "level_analyzer.get_reference_snapshot",
+    return_value=_snapshot(
+        ret=-0.0026,
+        zscore=-0.3,
+        interval_open=100.0,
+        interval_high=100.0,
+        interval_low=99.6,
+        interval_close=99.74,
+        interval_return=-0.0026,
+        late_return_60s=-0.0011,
+        late_return_20s=-0.0005,
+        body_ratio=0.78,
+        wick_imbalance=-0.06,
+    ),
+)
+def test_strong_move_can_use_opposite_token_quote_when_selected_book_is_sparse(mock_snapshot):
+    udm = _make_updown(up_price=0.28, down_price=0.72)
+
+    def _book_snapshot(token_id):
+        if token_id == "0xdown":
+            return {
+                "best_bid": None,
+                "best_ask": None,
+                "spread": None,
+                "book_age_ms": 250.0,
+                "tick_size": 0.01,
+            }
+        return {
+            "best_bid": 0.28,
+            "best_ask": 0.29,
+            "spread": 0.01,
+            "book_age_ms": 250.0,
+            "tick_size": 0.01,
+            "top_obi": 0.25,
+            "top3_obi": 0.22,
+        }
+
+    with patch("level_analyzer.MARKET_CACHE.snapshot", side_effect=_book_snapshot):
+        analysis = analyze_updown_market_detail(udm)
+
+    assert analysis.signal is not None
+    assert analysis.signal.side == "NO"
+    assert analysis.best_bid == pytest.approx(0.71)
+    assert analysis.best_ask == pytest.approx(0.72)
