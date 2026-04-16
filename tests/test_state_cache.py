@@ -66,6 +66,18 @@ def test_market_cache_tick_size_change_updates_existing_state():
     assert snapshot["tick_size"] == pytest.approx(0.005)
 
 
+def test_market_cache_partial_quote_update_preserves_existing_other_side():
+    cache = MarketStateCache()
+    cache.update_best_bid_ask("token-3", best_bid=0.40, best_ask=0.41, tick_size=0.01)
+
+    cache.update_best_bid_ask("token-3", best_bid=None, best_ask=0.42)
+    snapshot = cache.snapshot("token-3")
+
+    assert snapshot["best_bid"] == pytest.approx(0.40)
+    assert snapshot["best_ask"] == pytest.approx(0.42)
+    assert snapshot["spread"] == pytest.approx(0.02)
+
+
 def test_reference_cache_window_anchor_marks_trusted_within_tolerance():
     cache = ReferenceStateCache()
     base = datetime(2026, 4, 15, 0, 0, tzinfo=timezone.utc)

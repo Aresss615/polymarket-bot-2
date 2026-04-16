@@ -1,13 +1,16 @@
+import sys
+import threading
 import time
-from collections import deque
+from collections import Counter, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 
+from copy_trading import CopyTradingService
 from config import (
+    APP_CONFIG,
     ENABLE_REALTIME_DATA_PLANE,
     MAX_BET,
     MAX_BETS_PER_CYCLE,
-    MAX_REFERENCE_AGE_SECONDS,
     MIN_BET,
     Market,
     OpenOrder,
@@ -28,7 +31,14 @@ from strategy_eval import evaluate_15m_mode
 from market_fetcher import fetch_active_markets, fetch_resolved_market, find_updown_markets
 from level_analyzer import UpdownAnalysis, analyze_updown_market_detail
 from logger import read_open_orders, read_trades, save_open_orders, save_trades
-from price_feed import get_prices_batch
+from price_feed import (
+    active_reference_max_age_seconds,
+    ensure_reference_recent,
+    get_prices_batch,
+    get_reference_snapshot,
+    reference_feed_mode,
+    reference_feed_status,
+)
 from order_executor import OrderExecutor, PaperExecutor
 from risk_manager import RiskManager
 from trade_logger import log_order_event, log_risk_block, log_settlement, log_signal_event, log_trade_jsonl
@@ -69,9 +79,12 @@ class Engine:
         self.risk_manager = risk_manager or RiskManager(RiskConfig())
         self.runtime_data_plane = RUNTIME_DATA_PLANE
         self._runtime_started = False
+        self._startup_logged = False
+        self._execution_lock = threading.RLock()
         self.trades: list[Trade] = []
         self.open_orders: list[OpenOrder] = []
         self.traded_markets: set[str] = set()
+        self.executed_signal_keys: set[str] = set()
         self.running = False
         self.status = "Initializing"
         self.activity_log: deque[str] = deque(maxlen=30)
@@ -88,17 +101,48 @@ class Engine:
         self.monitor_updated_at: datetime | None = None
         self._last_market_refresh_at: float | None = None
         self._order_token_ids: dict[str, str] = {}
+        self.copy_trading_service: CopyTradingService | None = None
+        if APP_CONFIG.copy_trading.enabled and APP_CONFIG.copy_trading.target_wallet:
+            self.copy_trading_service = CopyTradingService(APP_CONFIG.copy_trading.target_wallet)
         self._load_history()
         self.risk_manager.bootstrap_from_history(self.trades, account_equity=self.account_equity)
         if self.open_orders:
             self._reconcile_open_orders()
 
     def start_runtime_services(self) -> None:
+        if not self._startup_logged:
+            self._log(f"Python executable: {sys.executable}")
+            diagnostics = self.runtime_data_plane.diagnostics()
+            self._log(
+                "websocket-client available: "
+                f"{diagnostics['websocket_client_available']}"
+            )
+            self._startup_logged = True
         if ENABLE_REALTIME_DATA_PLANE and not self._runtime_started:
             self.runtime_data_plane.start()
             self._runtime_started = True
+            diagnostics = self.runtime_data_plane.diagnostics()
+            workers = diagnostics["workers"]
+            self._log(
+                "Runtime workers started: "
+                f"market={workers['market']} rtds={workers['rtds']} user={workers['user']}"
+            )
+        self._log(
+            f"Reference feed mode: {reference_feed_mode()} "
+            f"(max age {active_reference_max_age_seconds():.1f}s)"
+        )
+        if self.copy_trading_service is not None and not self.copy_trading_service.running:
+            self.copy_trading_service.start(
+                self.process_signal,
+                poll_interval_ms=APP_CONFIG.copy_trading.poll_interval_ms,
+            )
+            self._log(
+                f"Copy-trading service started for {APP_CONFIG.copy_trading.target_wallet}"
+            )
 
     def stop_runtime_services(self) -> None:
+        if self.copy_trading_service is not None:
+            self.copy_trading_service.stop()
         if self._runtime_started:
             self.runtime_data_plane.stop()
             self._runtime_started = False
@@ -115,7 +159,7 @@ class Engine:
         }
 
         for trade in self.trades:
-            self.traded_markets.add(trade.market_slug)
+            self._remember_trade_key(trade)
             self.balance -= trade.size
             if trade.status == "won":
                 self.balance += trade.payout
@@ -135,6 +179,18 @@ class Engine:
     def _log(self, msg: str):
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
         self.activity_log.append(f"[{ts}] {msg}")
+
+    def _signal_key(self, signal: Signal) -> str:
+        if signal.strategy == "copy_trade":
+            return signal.signal_epoch_id or f"copy:{signal.market.slug}:{signal.side}:{signal.reason}"
+        return signal.market.slug
+
+    def _remember_trade_key(self, trade: Trade) -> None:
+        if trade.strategy == "copy_trade" and trade.signal_epoch_id:
+            self.executed_signal_keys.add(trade.signal_epoch_id)
+            return
+        self.traded_markets.add(trade.market_slug)
+        self.executed_signal_keys.add(trade.market_slug)
 
     def _set_monitor_signals(self, analyses: list[UpdownAnalysis]) -> None:
         records = [analysis.to_record() for analysis in analyses]
@@ -177,6 +233,39 @@ class Engine:
                 cell["actionable"] += 1
             cell["best_confidence"] = max(cell["best_confidence"], row.get("confidence", 0.0))
         return summary
+
+    def _signal_route_summary(self) -> dict[str, int]:
+        routes = Counter()
+        for row in self.monitor_signals:
+            routes[row.get("strategy_route") or "unclassified"] += 1
+        return dict(routes)
+
+    def _reference_feed_snapshot(self) -> dict:
+        coins = sorted(
+            {
+                *(udm.coin for udm in self.updown_markets_found if getattr(udm, "coin", "")),
+                *APP_CONFIG.strategies.updown.live_candidate_coins,
+            }
+        )
+        max_age = active_reference_max_age_seconds()
+        per_coin = []
+        for coin in coins:
+            snapshot = get_reference_snapshot(coin)
+            age = snapshot.get("active_reference_age_seconds")
+            per_coin.append(
+                {
+                    "coin": coin,
+                    "reference_age_seconds": age,
+                    "max_age_seconds": max_age,
+                    "stale": age is None or age > max_age,
+                    "source": snapshot.get("source"),
+                    "active_reference_price": snapshot.get("active_reference_price"),
+                }
+            )
+        return {
+            **reference_feed_status(),
+            "per_coin": per_coin,
+        }
 
     def get_monitor_snapshot(self) -> dict:
         recent_trades = []
@@ -247,7 +336,14 @@ class Engine:
                 "reason": self.mode_15m.reason,
             },
             "signal_summary": self._monitor_summary(),
+            "signal_routes": self._signal_route_summary(),
             "signal_board": list(self.monitor_signals),
+            "reference_feed": self._reference_feed_snapshot(),
+            "copy_trading": (
+                self.copy_trading_service.snapshot()
+                if self.copy_trading_service is not None
+                else {"enabled": False, "running": False, "target_wallet": "", "recent_events": []}
+            ),
             "recent_trades": recent_trades,
             "open_orders": open_orders,
             "recent_activity": list(self.activity_log)[-12:],
@@ -357,6 +453,11 @@ class Engine:
             else 0.5
         )
 
+    def _position_size_for_signal(self, signal: Signal) -> float:
+        if signal.requested_size_override not in (None, 0.0):
+            return float(signal.requested_size_override)
+        return self.risk_manager.recommended_position_size(signal, self.account_equity)
+
     def _find_trade_by_order_id(self, order_id: str) -> Trade | None:
         if not order_id:
             return None
@@ -455,7 +556,7 @@ class Engine:
                 markout_30s=result.markout_30s,
             )
             self.trades.append(trade)
-            self.traded_markets.add(market_slug)
+            self._remember_trade_key(trade)
         else:
             existing_shares = trade.size / trade.entry_price if trade.entry_price > 0 else 0.0
             total_cost = trade.size + result.fill_size
@@ -619,7 +720,7 @@ class Engine:
         through self.executor (Paper, Simulation, or Live).
         """
         entry_price = self._entry_price_for_signal(signal)
-        size = self.risk_manager.recommended_position_size(signal, self.account_equity)
+        size = self._position_size_for_signal(signal)
         result = self.executor.place_order(signal, size, entry_price)
         self.risk_manager.record_execution_quality(
             coin=signal.coin,
@@ -687,120 +788,146 @@ class Engine:
         order_ids: set[str] | None = None,
         max_orders: int | None = None,
     ) -> list[Trade]:
-        if not self.open_orders:
-            return []
+        with self._execution_lock:
+            if not self.open_orders:
+                return []
 
-        reconciled_trades: list[Trade] = []
-        changed = False
-        count = 0
+            reconciled_trades: list[Trade] = []
+            changed = False
+            count = 0
 
-        for open_order in list(self.open_orders):
-            if order_ids is not None and open_order.order_id not in order_ids:
-                continue
-            if max_orders is not None and count >= max_orders:
-                break
-            count += 1
+            for open_order in list(self.open_orders):
+                if order_ids is not None and open_order.order_id not in order_ids:
+                    continue
+                if max_orders is not None and count >= max_orders:
+                    break
+                count += 1
 
-            result = self.executor.reconcile_order(open_order)
-            if result is None:
-                continue
-            self.risk_manager.record_execution_quality(
-                coin=open_order.coin,
-                cluster_id=open_order.cluster_id,
-                slippage=result.slippage,
-                expected_cost=open_order.expected_cost,
-                feed_stale="stale" in (result.reason or "").lower(),
-                liquidity_collapse="liquidity" in (result.reason or "").lower(),
-            )
-
-            previous_status = open_order.status
-            previous_raw_status = open_order.raw_status
-            previous_reserved = open_order.reserved_size
-
-            trade = None
-            if result.fill_size > 0:
-                trade = self._record_trade_fill(
-                    market_slug=open_order.market_slug,
-                    question=open_order.question,
-                    strategy=open_order.strategy,
-                    side=open_order.side,
-                    confidence=open_order.confidence,
-                    reason=open_order.reason,
-                    end_date=open_order.end_date,
-                    market_type=open_order.market_type,
-                    executor_type=open_order.executor_type,
-                    order_id=open_order.order_id,
-                    result=result,
+                result = self.executor.reconcile_order(open_order)
+                if result is None:
+                    continue
+                self.risk_manager.record_execution_quality(
+                    coin=open_order.coin,
+                    cluster_id=open_order.cluster_id,
+                    slippage=result.slippage,
+                    expected_cost=open_order.expected_cost,
+                    feed_stale="stale" in (result.reason or "").lower(),
+                    liquidity_collapse="liquidity" in (result.reason or "").lower(),
                 )
-                if trade:
-                    reconciled_trades.append(trade)
 
-            open_order.confirmed_fill_size += result.fill_size
-            open_order.confirmed_fill_shares += result.fill_shares
-            open_order.confirmed_fees += result.fees
-            open_order.reserved_size = result.remaining_size
-            open_order.status = result.status
-            open_order.raw_status = result.raw_status or result.status
-            open_order.cancel_reason = result.cancel_reason or open_order.cancel_reason
-            open_order.updated_at = datetime.now(timezone.utc)
+                previous_status = open_order.status
+                previous_raw_status = open_order.raw_status
+                previous_reserved = open_order.reserved_size
 
-            material_change = (
-                result.fill_size > 0
-                or result.terminal
-                or previous_status != open_order.status
-                or previous_raw_status != open_order.raw_status
-                or abs(previous_reserved - open_order.reserved_size) > 1e-9
-            )
-            if material_change:
-                changed = True
-                if result.status == "cancelled":
+                trade = None
+                if result.fill_size > 0:
+                    trade = self._record_trade_fill(
+                        market_slug=open_order.market_slug,
+                        question=open_order.question,
+                        strategy=open_order.strategy,
+                        side=open_order.side,
+                        confidence=open_order.confidence,
+                        reason=open_order.reason,
+                        end_date=open_order.end_date,
+                        market_type=open_order.market_type,
+                        executor_type=open_order.executor_type,
+                        order_id=open_order.order_id,
+                        result=result,
+                    )
+                    if trade:
+                        reconciled_trades.append(trade)
+
+                open_order.confirmed_fill_size += result.fill_size
+                open_order.confirmed_fill_shares += result.fill_shares
+                open_order.confirmed_fees += result.fees
+                open_order.reserved_size = result.remaining_size
+                open_order.status = result.status
+                open_order.raw_status = result.raw_status or result.status
+                open_order.cancel_reason = result.cancel_reason or open_order.cancel_reason
+                open_order.updated_at = datetime.now(timezone.utc)
+
+                material_change = (
+                    result.fill_size > 0
+                    or result.terminal
+                    or previous_status != open_order.status
+                    or previous_raw_status != open_order.raw_status
+                    or abs(previous_reserved - open_order.reserved_size) > 1e-9
+                )
+                if material_change:
+                    changed = True
+                    if result.status == "cancelled":
+                        log_order_event(
+                            "cancel",
+                            open_order.order_id,
+                            {
+                                "market_slug": open_order.market_slug,
+                                "side": open_order.side,
+                                "status": open_order.status,
+                                "reason": result.reason,
+                            },
+                        )
                     log_order_event(
-                        "cancel",
+                        "reconcile",
                         open_order.order_id,
                         {
                             "market_slug": open_order.market_slug,
                             "side": open_order.side,
                             "status": open_order.status,
+                            "raw_status": open_order.raw_status,
+                            "fill_size": result.fill_size,
+                            "fill_shares": result.fill_shares,
+                            "remaining_size": open_order.reserved_size,
+                            "terminal": result.terminal,
                             "reason": result.reason,
                         },
                     )
-                log_order_event(
-                    "reconcile",
-                    open_order.order_id,
-                    {
-                        "market_slug": open_order.market_slug,
-                        "side": open_order.side,
-                        "status": open_order.status,
-                        "raw_status": open_order.raw_status,
-                        "fill_size": result.fill_size,
-                        "fill_shares": result.fill_shares,
-                        "remaining_size": open_order.reserved_size,
-                        "terminal": result.terminal,
-                        "reason": result.reason,
-                    },
+
+                if result.terminal or result.remaining_size <= 1e-9:
+                    self.open_orders.remove(open_order)
+                    changed = True
+
+            if changed:
+                save_open_orders(self.open_orders)
+
+            return reconciled_trades
+
+    def process_signal(self, signal: Signal, *, source: str = "updown") -> tuple[Trade | None, str, str]:
+        with self._execution_lock:
+            if source != "updown":
+                self._log(
+                    f"  External signal ({source}): {signal.side} on {signal.market.slug}"
                 )
-
-            if result.terminal or result.remaining_size <= 1e-9:
-                self.open_orders.remove(open_order)
-                changed = True
-
-        if changed:
-            save_open_orders(self.open_orders)
-
-        return reconciled_trades
+            return self._try_execute(signal)
 
     def _try_execute(self, signal: Signal) -> tuple[Trade | None, str, str]:
+        signal_key = self._signal_key(signal)
         if signal.strategy_mode == STRATEGY_MODE_DISABLED:
             return None, "analysis_skip", "strategy disabled"
         if signal.strategy_mode == STRATEGY_MODE_SHADOW and TRADING_MODE != "simulation":
             return None, "shadow_only", "shadow-only strategy"
-        if signal.market.slug in self.traded_markets:
-            self._log(f"  Skip (already traded): {signal.market.slug}")
+        if signal_key and signal_key in self.executed_signal_keys:
+            self._log(f"  Skip (already traded): {signal_key}")
             return None, "already_traded_skip", "already traded"
         if signal.market.slug in self.active_order_markets:
             self._log(f"  Skip (order already live): {signal.market.slug}")
             return None, "active_order_skip", "order already live"
-        size = self.risk_manager.recommended_position_size(signal, self.account_equity)
+        entry_price = self._entry_price_for_signal(signal)
+        if signal.strategy == "arbitrage" and not APP_CONFIG.strategies.news.enabled:
+            self._log("  Skip (news arbitrage disabled)")
+            return None, "analysis_skip", "news arbitrage disabled"
+        if signal.strategy == "updown":
+            min_entry = APP_CONFIG.strategies.updown.min_entry_price
+            max_entry = APP_CONFIG.strategies.updown.max_entry_price
+            if entry_price < min_entry:
+                self._log(f"  Skip (entry {entry_price:.2f} < min {min_entry:.2f})")
+                return None, "analysis_skip", f"entry {entry_price:.2f} < min {min_entry:.2f}"
+            if entry_price > max_entry:
+                self._log(f"  Skip (entry {entry_price:.2f} > max {max_entry:.2f})")
+                return None, "analysis_skip", f"entry {entry_price:.2f} > max {max_entry:.2f}"
+            if signal.side == "NO" and entry_price < 0.70:
+                self._log(f"  Skip (NO side low entry {entry_price:.2f})")
+                return None, "analysis_skip", f"NO side low entry {entry_price:.2f}"
+        size = self._position_size_for_signal(signal)
         if self.available_balance < size:
             self._log(f"  Skip (available ${self.available_balance:.2f} < target ${size:.2f})")
             return None, "balance_skip", f"available ${self.available_balance:.2f} < target ${size:.2f}"
@@ -921,7 +1048,7 @@ class Engine:
             return
         if self._cache_warm_future and not self._cache_warm_future.done():
             return
-        self._cache_warm_future = self._background_executor.submit(get_prices_batch, set(coins))
+        self._cache_warm_future = self._background_executor.submit(self._warm_active_coins, set(coins))
 
     def _consume_background_price_warm(self):
         if not self._cache_warm_future or not self._cache_warm_future.done():
@@ -937,6 +1064,7 @@ class Engine:
         """Warm price cache for active coins using a single batch API call."""
         if not coins:
             return
+        reference_max_age = active_reference_max_age_seconds()
         if ENABLE_REALTIME_DATA_PLANE:
             stale_or_missing = False
             for coin in coins:
@@ -944,12 +1072,14 @@ class Engine:
                     stale_or_missing = True
                     break
                 age = self.runtime_data_plane.reference_cache.age_seconds(coin)
-                if age is None or age > MAX_REFERENCE_AGE_SECONDS:
+                if age is None or age > reference_max_age:
                     stale_or_missing = True
                     break
             if not stale_or_missing:
                 return
         get_prices_batch(coins)
+        for coin in coins:
+            ensure_reference_recent(coin, max_age=reference_max_age)
 
     def _markout_midpoint(self, order_id: str) -> float | None:
         token_id = self._order_token_ids.get(order_id)

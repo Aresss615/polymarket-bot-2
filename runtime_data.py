@@ -16,8 +16,13 @@ from state_cache import MARKET_CACHE, REFERENCE_CACHE
 
 try:  # pragma: no cover - import is exercised indirectly
     import websocket
+    WEBSOCKET_IMPORT_ERROR = ""
 except Exception:  # pragma: no cover - dependency may not be installed in some environments
     websocket = None
+    WEBSOCKET_IMPORT_ERROR = "websocket-client import failed"
+
+
+WEBSOCKET_CLIENT_AVAILABLE = websocket is not None
 
 
 def _utc_now() -> datetime:
@@ -39,6 +44,31 @@ def _as_list(value: Any) -> list[Any]:
     if isinstance(value, tuple):
         return list(value)
     return []
+
+
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _normalize_book_price(value: Any) -> float | None:
+    price = _safe_float(value)
+    if price is None or price <= 0:
+        return None
+    return price
+
+
+def _normalize_reference_symbol(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    if "/" in raw:
+        raw = raw.split("/", 1)[0]
+    elif raw.endswith("usdt"):
+        raw = raw[:-4]
+    return raw.upper()
 
 
 def _parse_timestamp(value: Any) -> float:
@@ -161,6 +191,20 @@ class _WebSocketWorker:
                                 ws.send(json.dumps(item))
                             except Exception:
                                 continue
+                        def _ping_loop():
+                            while not self._stop.is_set() and self._app is ws:
+                                time.sleep(5.0)
+                                if self._stop.is_set() or self._app is not ws:
+                                    break
+                                try:
+                                    ws.send("PING")
+                                except Exception:
+                                    break
+                        threading.Thread(
+                            target=_ping_loop,
+                            daemon=True,
+                            name=f"ping:{self.url}",
+                        ).start()
 
                     self._app = websocket.WebSocketApp(
                         self.url,
@@ -207,6 +251,9 @@ class _WebSocketWorker:
             return [item for item in payload if isinstance(item, dict)]
         return [payload] if isinstance(payload, dict) else []
 
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
 
 class RuntimeDataPlane:
     def __init__(self):
@@ -252,6 +299,36 @@ class RuntimeDataPlane:
         self._user_worker = None
         self._running = False
 
+    def diagnostics(self) -> dict[str, Any]:
+        return {
+            "running": self._running,
+            "websocket_client_available": WEBSOCKET_CLIENT_AVAILABLE,
+            "websocket_import_error": WEBSOCKET_IMPORT_ERROR,
+            "workers": {
+                "market": self._market_worker.is_running() if self._market_worker is not None else False,
+                "rtds": self._rtds_worker.is_running() if self._rtds_worker is not None else False,
+                "user": self._user_worker.is_running() if self._user_worker is not None else False,
+            },
+            "market_feed_healthy": self.market_cache.feed_healthy(3.0),
+            "reference_feed_healthy": self.reference_cache.feed_healthy(3.0),
+        }
+
+    def reference_stream_available(self) -> bool:
+        return bool(
+            WEBSOCKET_CLIENT_AVAILABLE
+            and self._running
+            and self._rtds_worker is not None
+            and self._rtds_worker.is_running()
+        )
+
+    def market_stream_available(self) -> bool:
+        return bool(
+            WEBSOCKET_CLIENT_AVAILABLE
+            and self._running
+            and self._market_worker is not None
+            and self._market_worker.is_running()
+        )
+
     def set_market_tokens(self, token_ids: set[str] | list[str]) -> None:
         self._market_tokens = {str(token_id) for token_id in token_ids if token_id}
         if self._market_worker is not None:
@@ -272,12 +349,13 @@ class RuntimeDataPlane:
             market_slug = str(message.get("market_slug") or message.get("market") or "")
             timestamp = _parse_timestamp(message.get("timestamp") or message.get("ts"))
             tick_size = _safe_float(message.get("tick_size"))
+            payload_obj = message.get("payload") if isinstance(message.get("payload"), dict) else {}
 
             if event_type in {"book", "orderbook", "snapshot"} and token_id:
                 self.market_cache.update_from_book(
                     token_id,
-                    _as_list(message.get("bids")),
-                    _as_list(message.get("asks")),
+                    _as_list(_first_present(message.get("bids"), payload_obj.get("bids"))),
+                    _as_list(_first_present(message.get("asks"), payload_obj.get("asks"))),
                     market_slug=market_slug,
                     source=event_type,
                     timestamp=timestamp,
@@ -285,9 +363,67 @@ class RuntimeDataPlane:
                 )
                 continue
 
+            if event_type == "price_change":
+                price_changes = message.get("price_changes")
+                if not isinstance(price_changes, list):
+                    price_changes = payload_obj.get("price_changes")
+                if isinstance(price_changes, list) and price_changes:
+                    for change in price_changes:
+                        if not isinstance(change, dict):
+                            continue
+                        change_token_id = str(
+                            change.get("asset_id")
+                            or change.get("token_id")
+                            or change.get("tokenId")
+                            or token_id
+                        )
+                        if not change_token_id:
+                            continue
+                        change_market_slug = str(change.get("market_slug") or market_slug)
+                        change_tick_size = _safe_float(
+                            _first_present(change.get("tick_size"), tick_size)
+                        )
+                        best_bid = _normalize_book_price(
+                            _first_present(change.get("best_bid"), change.get("bid"))
+                        )
+                        best_ask = _normalize_book_price(
+                            _first_present(change.get("best_ask"), change.get("ask"))
+                        )
+                        changed_price = _normalize_book_price(change.get("price"))
+                        side = str(change.get("side") or "").lower()
+                        if changed_price is not None:
+                            if side in {"buy", "bid"} and best_bid is None:
+                                best_bid = changed_price
+                            elif side in {"sell", "ask"} and best_ask is None:
+                                best_ask = changed_price
+                        self.market_cache.update_best_bid_ask(
+                            change_token_id,
+                            best_bid=best_bid,
+                            best_ask=best_ask,
+                            market_slug=change_market_slug,
+                            source=event_type,
+                            timestamp=timestamp,
+                            tick_size=change_tick_size,
+                        )
+                    continue
+
             if event_type in {"best_bid_ask", "price_change"} and token_id:
-                best_bid = _safe_float(message.get("best_bid") or message.get("bid"))
-                best_ask = _safe_float(message.get("best_ask") or message.get("ask"))
+                best_bid = _normalize_book_price(
+                    _first_present(
+                        message.get("best_bid"),
+                        message.get("bid"),
+                        payload_obj.get("best_bid"),
+                        payload_obj.get("bid"),
+                    )
+                )
+                best_ask = _normalize_book_price(
+                    _first_present(
+                        message.get("best_ask"),
+                        message.get("ask"),
+                        payload_obj.get("best_ask"),
+                        payload_obj.get("ask"),
+                    )
+                )
                 self.market_cache.update_best_bid_ask(
                     token_id,
                     best_bid=best_bid,
@@ -318,19 +454,54 @@ class RuntimeDataPlane:
                 continue
 
             event_type = str(message.get("event_type") or message.get("type") or "").lower()
-            timestamp = _parse_timestamp(message.get("timestamp") or message.get("price_time") or message.get("ts"))
-
-            symbol = str(message.get("symbol") or message.get("asset") or "").upper()
+            topic = str(message.get("topic") or "").lower()
+            payload_obj = message.get("payload") if isinstance(message.get("payload"), dict) else {}
+            raw_symbol = payload_obj.get("symbol") or message.get("symbol") or message.get("asset") or ""
+            symbol = _normalize_reference_symbol(raw_symbol)
             if not symbol:
                 continue
-            price = _safe_float(message.get("price") or message.get("value"))
+            is_chainlink = "chainlink" in topic or "chainlink" in event_type or "/" in str(raw_symbol)
+            source = "rtds_chainlink" if is_chainlink else "rtds"
+            snapshot_points = payload_obj.get("data")
+            if isinstance(snapshot_points, list):
+                for point in snapshot_points:
+                    if not isinstance(point, dict):
+                        continue
+                    point_price = _safe_float(point.get("value") or point.get("price"))
+                    if point_price is None:
+                        continue
+                    point_ts = _parse_timestamp(
+                        point.get("timestamp")
+                        or payload_obj.get("timestamp")
+                        or message.get("timestamp")
+                        or message.get("price_time")
+                        or message.get("ts")
+                    )
+                    self.reference_cache.update(
+                        symbol,
+                        point_price,
+                        source=source,
+                        chainlink=is_chainlink,
+                        timestamp=point_ts,
+                    )
+                continue
+
+            timestamp = _parse_timestamp(
+                payload_obj.get("timestamp")
+                or message.get("timestamp")
+                or message.get("price_time")
+                or message.get("ts")
+            )
+            price = _safe_float(
+                payload_obj.get("value")
+                or payload_obj.get("price")
+                or message.get("price")
+                or message.get("value")
+            )
             if price is None:
                 continue
 
-            if "chainlink" in event_type:
-                self.reference_cache.update(symbol, price, source="rtds_chainlink", chainlink=True, timestamp=timestamp)
-            else:
-                self.reference_cache.update(symbol, price, source="rtds", chainlink=False, timestamp=timestamp)
+            self.reference_cache.update(symbol, price, source=source, chainlink=is_chainlink, timestamp=timestamp)
 
     def apply_user_message(self, payload: str | dict[str, Any]) -> None:
         for message in self._decode_messages(payload):
@@ -388,16 +559,24 @@ class RuntimeDataPlane:
     def _rtds_subscriptions(self) -> dict[str, Any] | None:
         if not self._reference_symbols:
             return None
+        chainlink_supported = {"BTC", "ETH", "SOL", "XRP"}
+        subscriptions: list[dict[str, Any]] = [
+            {
+                "topic": "crypto_prices",
+                "type": "update",
+            }
+        ]
+        for symbol in sorted(self._reference_symbols.intersection(chainlink_supported)):
+            subscriptions.append(
+                {
+                    "topic": "crypto_prices_chainlink",
+                    "type": "*",
+                    "filters": json.dumps({"symbol": f"{symbol.lower()}/usd"}),
+                }
+            )
         return {
             "action": "subscribe",
-            "subscriptions": [
-                {
-                    "topic": "crypto_prices",
-                    "type": "update",
-                    "filters": f"{symbol.lower()}usdt",
-                }
-                for symbol in sorted(self._reference_symbols)
-            ],
+            "subscriptions": subscriptions,
         }
 
 

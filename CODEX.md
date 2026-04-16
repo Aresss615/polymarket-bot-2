@@ -89,8 +89,8 @@ Data flow:
   - Core v13 deterministic up/down logic with actual-move-first routing
   - Uses trusted window-open anchors plus interval OHLC, interval return, late `60s` and `20s` returns, body ratio, wick imbalance
   - Routes setups into `strong`, `flat`, or `mid` actual-move regimes
-  - Strong moves are follow-or-skip only; flat windows stay shadow-only and mid windows skip
-  - Records `high_prob_shadow` for `0.78-0.90` strong-move setups instead of promoting them to live execution
+  - Strong moves follow confirmed trend or skip; 5m mid windows can emit `mid_follow_candidate` when momentum and book conditions align
+  - Emits `high_prob_shadow` shadow signals for `0.78-0.90` strong and mid-follow setups instead of promoting them to live execution
 
 - `state_cache.py`
   - Stores market-book state and reference price history
@@ -138,7 +138,7 @@ When strategy parameters change, bump `STRATEGY_VERSION` so evaluation remains p
 
 ## Current Timing And Risk Highlights
 
-- 5m trade window: `MIN_SECONDS_TO_TRADE_5M=8`, `MAX_SECONDS_TO_CLOSE_5M=30`
+- 5m trade window: `MIN_SECONDS_TO_TRADE_5M=15`, `MAX_SECONDS_TO_CLOSE_5M=60`
 - 15m trade window: `MIN_SECONDS_TO_TRADE_15M=25`, `MAX_SECONDS_TO_CLOSE_15M=480`
 - Default strategy modes:
   - 5m up/down: `live`
@@ -157,14 +157,14 @@ Simulation defaults are intentionally research-friendly:
 
 - Trusted exact window-open price is required for candidate/live routing
 - Strong actual-move thresholds:
-  - 5m actual return: `>= 0.30%`
+  - 5m actual return: `>= 0.16%`
   - 15m actual return: `>= 0.50%`
 - Flat actual-move thresholds:
   - 5m actual return: `<= 0.08%`
   - 15m actual return: `<= 0.12%`
 - Strong-move confirmation requires aligned `60s` and `20s` returns, `body_ratio >= 0.60`, fresh book age, and tight spread
 - Strong actual move may only follow the move direction or skip; opposite-side candidate trades are blocked by design
-- `0.78-0.90` strong-move entries are tracked as `high_prob_shadow`
+- `0.78-0.90` strong-move entries are emitted as `high_prob_shadow` shadow signals
 - Missing trusted window-open anchor causes `missing_exact_open` skip
 - Confidence caps:
   - strong-trend setups cap at `0.90`
@@ -203,3 +203,13 @@ From `.env.example` and current config:
 - 2026-04-15: Relaxed simulation research mode so exposure, daily loss, and shadow-only gates no longer choke high-volume sim runs
 - 2026-04-15: Updated `ticker3` web monitor copy and badges to be mode-neutral and simulation-friendly
 - 2026-04-15: Added v13 actual-move-first routing with trusted window-open anchors, follow-or-skip strong-move logic, and dumb-loss audit reporting
+- 2026-04-16: Updated market websocket parsing for `price_change.price_changes[]`, preserved partial top-of-book updates, reconstructed sparse quotes from the opposite token book, and turned `high_prob_shadow` into executable shadow signals for simulation
+
+## Suggestions
+
+- Add a side-specific CLOB `/prices` fallback in analysis and execution so sparse websocket books do not block otherwise valid simulation/live decisions.
+- Fetch fee data per market (`feesEnabled`, fee rate) instead of relying only on the hardcoded crypto taker-fee approximation.
+- Split 15m feed policy from 5m feed policy and reduce log noise by separating 15m stale-reference diagnostics from the 5m trading activity view.
+- Store raw market websocket samples during simulation runs so feed regressions can be replayed without guessing from downstream skips.
+- Make strong/flat thresholds volatility-adaptive per coin and session instead of relying on static percentage bands.
+- Blend deterministic price-action signals with wallet/order-flow signals from copy trading rather than treating them as separate lanes forever.

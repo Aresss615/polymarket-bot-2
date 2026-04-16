@@ -7,6 +7,21 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_csv_set(name: str, default_csv: str = "") -> set[str]:
+    raw = os.getenv(name, default_csv)
+    if raw is None:
+        return set()
+    return {item.strip().upper() for item in str(raw).split(",") if item.strip()}
+
+
 # --- Trading Mode ---
 TRADING_MODE = os.getenv("TRADING_MODE", "paper")  # "paper", "simulation", "live"
 _LIVE_BALANCE = float(os.getenv("LIVE_BALANCE", "5.0"))
@@ -18,6 +33,7 @@ MONITOR_PORT = int(os.getenv("MONITOR_PORT", "8765"))
 # --- API Endpoints ---
 GAMMA_API_URL = "https://gamma-api.polymarket.com"
 CLOB_API_URL = "https://clob.polymarket.com"
+DATA_API_URL = "https://data-api.polymarket.com"
 OKX_API_URL = "https://www.okx.com/api/v5"
 BYBIT_API_URL = "https://api.bybit.com/v5"
 GOOGLE_NEWS_RSS_URL = "https://news.google.com/rss/search"
@@ -90,21 +106,32 @@ MIN_LIQUIDITY = 500
 MAX_BETS_PER_CYCLE = 5
 SIMULATION_MAX_BETS_PER_CYCLE = 1_000_000
 
-MAX_REFERENCE_AGE_SECONDS = 2.0
+RTDS_STRICT_MODE = _env_bool("RTDS_STRICT_MODE", True)
+MAX_REFERENCE_AGE_SECONDS_REALTIME = float(os.getenv("MAX_REFERENCE_AGE_SECONDS_REALTIME", "2.0"))
+MAX_REFERENCE_AGE_SECONDS_FALLBACK = float(os.getenv("MAX_REFERENCE_AGE_SECONDS_FALLBACK", "8.0"))
+MAX_REFERENCE_AGE_SECONDS = MAX_REFERENCE_AGE_SECONDS_REALTIME
 REFERENCE_LOOKBACK_SECONDS = 20.0
 REFERENCE_PRICE_NEUTRAL_BAND = 0.0006
 REFERENCE_RETURN_PROBABILITY_SCALE_5M = 0.006
 REFERENCE_RETURN_PROBABILITY_SCALE_15M = 0.009
 WINDOW_OPEN_TRUST_TOLERANCE_SECONDS = 2.0
-ACTUAL_MOVE_STRONG_RETURN_5M = 0.0030
+WINDOW_OPEN_DEGRADED_TOLERANCE_SECONDS = float(
+    os.getenv("WINDOW_OPEN_DEGRADED_TOLERANCE_SECONDS", "8.0")
+)
+ACTUAL_MOVE_STRONG_RETURN_5M = float(os.getenv("ACTUAL_MOVE_STRONG_RETURN_5M", "0.0016"))
 ACTUAL_MOVE_STRONG_RETURN_15M = 0.0050
-ACTUAL_MOVE_FLAT_RETURN_5M = 0.0008
+ACTUAL_MOVE_FLAT_RETURN_5M = float(os.getenv("ACTUAL_MOVE_FLAT_RETURN_5M", "0.0008"))
 ACTUAL_MOVE_FLAT_RETURN_15M = 0.0012
 ACTUAL_MOVE_MAX_BOOK_AGE_MS = 1500.0
 ACTUAL_MOVE_MAX_SPREAD = 0.03
 ACTUAL_MOVE_EDGE_COST_MULTIPLE = 2.5
 ACTUAL_MOVE_CANDIDATE_MAX_PRICE = 0.78
 ACTUAL_MOVE_HIGH_PROB_UPPER = 0.90
+MID_FOLLOW_MIN_RETURN_5M = float(os.getenv("MID_FOLLOW_MIN_RETURN_5M", "0.0012"))
+MID_FOLLOW_MIN_BODY_RATIO = float(os.getenv("MID_FOLLOW_MIN_BODY_RATIO", "0.60"))
+MID_FOLLOW_MAX_SPREAD = float(os.getenv("MID_FOLLOW_MAX_SPREAD", "0.03"))
+MID_FOLLOW_MAX_BOOK_AGE_MS = float(os.getenv("MID_FOLLOW_MAX_BOOK_AGE_MS", "1500.0"))
+MID_FOLLOW_MIN_TOP_OBI = float(os.getenv("MID_FOLLOW_MIN_TOP_OBI", "0.10"))
 MIN_EDGE = 0.06
 MIN_EDGE_NEUTRAL = 0.09
 MIN_EDGE_15M_MID = 0.10
@@ -197,6 +224,8 @@ LIVE_MAKER_REFERENCE_REVERSAL = 0.0008  # 0.08%
 FEED_HEARTBEAT_STALE_SECONDS = 3.0
 REALTIME_DISCOVERY_REFRESH_SECONDS = 60.0
 ENABLE_REALTIME_DATA_PLANE = os.getenv("ENABLE_REALTIME_DATA_PLANE", "1") == "1"
+MIN_ORDER_DEPTH_USD = 25.0
+QUOTE_STALENESS_SECONDS = 5.0
 
 # --- Simulation Research Mode ---
 # Research mode should keep gathering data instead of stopping early and
@@ -249,8 +278,12 @@ SUPPORTED_COINS = {
     "HYPE": "HYPE-USDT",
 }
 
-CANDIDATE_COINS = {"BTC", "SOL"}
-SHADOW_ONLY_COINS = {"ETH", "XRP", "BNB"}
+LIVE_CANDIDATE_COINS = _env_csv_set(
+    "LIVE_CANDIDATE_COINS",
+    "BTC,ETH,SOL,XRP,DOGE,BNB,HYPE",
+)
+CANDIDATE_COINS = set(LIVE_CANDIDATE_COINS)
+SHADOW_ONLY_COINS = _env_csv_set("SHADOW_ONLY_COINS", "")
 
 COIN_CLUSTERS = {
     "BTC": "crypto_beta",
@@ -277,6 +310,7 @@ TRADES_CSV = Path("trades.csv")
 OPEN_ORDERS_CSV = Path("open_orders.csv")
 TRADES_JSONL = Path("trades.jsonl")
 EVENTS_JSONL = Path("events.jsonl")
+LEDGER_JSONL = Path("ledger.jsonl")
 HISTORY_ARCHIVE_DIR = Path("history_archive")
 HISTORY_ARCHIVE_MANIFEST = HISTORY_ARCHIVE_DIR / "manifest.jsonl"
 
@@ -365,10 +399,14 @@ class Signal:
     strategy_route: str = ""
     cluster_id: str = ""
     signal_epoch_id: str = ""
+    requested_size_override: float | None = None
     book_age_ms: float | None = None
     tick_size: float | None = None
     expected_fill_price: float | None = None
     expected_cost: float | None = None
+    bucket: str = "uncategorized"
+    expected_value: float = 0.0
+    expected_edge: float = 0.0
     markout_1s: float | None = None
     markout_5s: float | None = None
     markout_30s: float | None = None
@@ -392,6 +430,10 @@ class Trade:
     strategy_version: int = 0
     fees: float = 0.0
     fill_price: float | None = None
+    trade_id: str = ""
+    session_id: str = ""
+    bucket: str = "uncategorized"
+    expected_value: float = 0.0
     order_id: str = ""
     executor_type: str = ""
     edge_gross: float = 0.0
@@ -620,3 +662,161 @@ class RiskConfig:
     max_thesis_exposure_pct: float = MAX_THESIS_EXPOSURE_PCT
     max_positions_per_cluster: int = MAX_POSITIONS_PER_CLUSTER
     max_cluster_exposure_pct: float = MAX_CLUSTER_EXPOSURE_PCT
+
+
+@dataclass(frozen=True)
+class ExecutionConfig:
+    mode: str = TRADING_MODE
+    starting_balance: float = STARTING_BALANCE
+    bet_fraction: float = BET_FRACTION
+    min_bet: float = MIN_BET
+    max_bet: float = MAX_BET
+    live_min_bet: float = LIVE_MIN_BET
+    live_max_bet: float = LIVE_MAX_BET
+    min_order_depth_usd: float = MIN_ORDER_DEPTH_USD
+    quote_staleness_seconds: float = QUOTE_STALENESS_SECONDS
+
+
+@dataclass(frozen=True)
+class MarketDataConfig:
+    gamma_api_url: str = GAMMA_API_URL
+    clob_api_url: str = CLOB_API_URL
+    data_api_url: str = DATA_API_URL
+    min_liquidity: float = MIN_LIQUIDITY
+    quote_timeout_seconds: float = 5.0
+    metadata_timeout_seconds: float = 10.0
+
+
+@dataclass(frozen=True)
+class UpDownStrategyConfig:
+    enabled: bool = _env_bool("ENABLE_UPDOWN_STRATEGY", True)
+    min_seconds_to_close_5m: int = MIN_SECONDS_TO_CLOSE_5M
+    max_seconds_to_close_5m: int = MAX_SECONDS_TO_CLOSE_5M
+    min_seconds_to_close_15m: int = MIN_SECONDS_TO_CLOSE_15M
+    max_seconds_to_close_15m: int = MAX_SECONDS_TO_CLOSE_15M
+    min_seconds_to_trade_5m: int = MIN_SECONDS_TO_TRADE_5M
+    min_seconds_to_trade_15m: int = MIN_SECONDS_TO_TRADE_15M
+    min_entry_price: float = CANDIDATE_MIN_ENTRY_PRICE
+    max_entry_price: float = CRYPTO_NEAR_CERTAIN_UPPER
+    min_edge: float = MIN_EDGE
+    live_candidate_coins: tuple[str, ...] = tuple(sorted(LIVE_CANDIDATE_COINS))
+
+
+@dataclass(frozen=True)
+class ReferenceFeedConfig:
+    strict_mode: bool = RTDS_STRICT_MODE
+    realtime_max_age_seconds: float = MAX_REFERENCE_AGE_SECONDS_REALTIME
+    fallback_max_age_seconds: float = MAX_REFERENCE_AGE_SECONDS_FALLBACK
+    window_open_trust_tolerance_seconds: float = WINDOW_OPEN_TRUST_TOLERANCE_SECONDS
+    window_open_degraded_tolerance_seconds: float = WINDOW_OPEN_DEGRADED_TOLERANCE_SECONDS
+
+
+@dataclass(frozen=True)
+class NewsStrategyConfig:
+    enabled: bool = _env_bool("ENABLE_NEWS_ARBITRAGE", ARBITRAGE_STRATEGY_MODE != STRATEGY_MODE_DISABLED)
+    poll_interval: int = NEWS_POLL_INTERVAL
+    confidence_threshold: float = ARBITRAGE_CONFIDENCE_THRESHOLD
+
+
+@dataclass(frozen=True)
+class StrategyConfig:
+    updown: UpDownStrategyConfig = field(default_factory=UpDownStrategyConfig)
+    news: NewsStrategyConfig = field(default_factory=NewsStrategyConfig)
+
+
+@dataclass(frozen=True)
+class AnalyticsConfig:
+    trades_csv: Path = TRADES_CSV
+    ledger_jsonl: Path = LEDGER_JSONL
+    enable_session_summaries: bool = True
+
+
+_legacy_copy_multiplier_raw = os.getenv("COPY_SIZE_MULTIPLIER")
+_default_copy_size_percent = (
+    float(_legacy_copy_multiplier_raw) * 100.0
+    if _legacy_copy_multiplier_raw not in (None, "")
+    else 100.0
+)
+
+
+@dataclass(frozen=True)
+class CopyTradingConfig:
+    enabled: bool = _env_bool("ENABLE_COPY_TRADING", False)
+    data_api_url: str = DATA_API_URL
+    target_wallet: str = os.getenv("COPY_TARGET_WALLET", "").strip()
+    poll_interval_ms: int = int(os.getenv("COPY_POLL_INTERVAL_MS", "1000"))
+    trade_limit: int = int(os.getenv("COPY_TRADE_LIMIT", "50"))
+    activity_limit: int = int(os.getenv("COPY_ACTIVITY_LIMIT", "100"))
+    size_percent: float = float(os.getenv("COPY_SIZE_PERCENT", str(_default_copy_size_percent)))
+    size_multiplier: float = float(os.getenv("COPY_SIZE_PERCENT", str(_default_copy_size_percent))) / 100.0
+    min_copy_size: float = float(os.getenv("COPY_MIN_SIZE", "1.0"))
+    max_copy_size: float = float(os.getenv("COPY_MAX_SIZE", "10.0"))
+    min_target_shares: float = float(os.getenv("COPY_MIN_TARGET_SHARES", "0.0"))
+    large_trade_shares: float = float(os.getenv("COPY_LARGE_TRADE_SHARES", "1500.0"))
+    consecutive_trigger: int = int(os.getenv("COPY_CONSECUTIVE_TRIGGER", "2"))
+    min_depth_usd: float = float(os.getenv("COPY_MIN_DEPTH_USD", "200.0"))
+    trip_seconds: int = int(os.getenv("COPY_TRIP_SECONDS", "120"))
+    dry_run: bool = _env_bool("COPY_DRY_RUN", True)
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+    market_data: MarketDataConfig = field(default_factory=MarketDataConfig)
+    reference_feed: ReferenceFeedConfig = field(default_factory=ReferenceFeedConfig)
+    strategies: StrategyConfig = field(default_factory=StrategyConfig)
+    risk: RiskConfig = field(default_factory=RiskConfig)
+    analytics: AnalyticsConfig = field(default_factory=AnalyticsConfig)
+    copy_trading: CopyTradingConfig = field(default_factory=CopyTradingConfig)
+
+
+APP_CONFIG = AppConfig()
+
+
+@dataclass(frozen=True)
+class RunSession:
+    session_id: str
+    started_at: datetime
+    mode: str
+    strategies: dict[str, bool] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class LedgerEvent:
+    event_type: str
+    timestamp: datetime
+    session_id: str = ""
+    trade_id: str = ""
+    payload: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class BookLevel:
+    price: float
+    size: float
+
+
+@dataclass(frozen=True)
+class BookSnapshot:
+    token_id: str
+    best_bid: float
+    best_ask: float
+    bids: list[BookLevel] = field(default_factory=list)
+    asks: list[BookLevel] = field(default_factory=list)
+    tick_size: float = 0.01
+    min_order_size: float = 0.1
+    depth_usd: float = 0.0
+    source: str = ""
+    fetched_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class ExecutionQuote:
+    token_id: str
+    side: str
+    best_bid: float
+    best_ask: float
+    tick_size: float = 0.01
+    midpoint: float = 0.0
+    depth_usd: float = 0.0
+    fetched_at: datetime | None = None

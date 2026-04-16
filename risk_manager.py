@@ -269,7 +269,7 @@ class RiskManager:
         coin = signal.coin or _extract_coin(signal.market.slug)
         cluster_id = signal.cluster_id
 
-        if signal.strategy_mode == STRATEGY_MODE_LIVE:
+        if signal.strategy == "updown" and signal.strategy_mode == STRATEGY_MODE_LIVE:
             if coin in SHADOW_ONLY_COINS or (coin and coin not in CANDIDATE_COINS):
                 return RiskCheck(False, f"{coin} is shadow-only in V13")
             if signal.market_type != "5m":
@@ -353,7 +353,7 @@ class RiskManager:
                     f"{cluster_id} cluster exposure cap (${cluster_exposure + size:.2f} > ${cluster_cap:.2f})",
                 )
 
-        if signal.strategy_mode == STRATEGY_MODE_LIVE:
+        if signal.strategy == "updown" and signal.strategy_mode == STRATEGY_MODE_LIVE:
             if self._active_same_side_window_positions(signal, pending_trades, open_orders) > 0:
                 return RiskCheck(False, f"{coin} no re-entry for same side/window")
             if self._active_epoch_positions(signal.signal_epoch_id, pending_trades, open_orders) > 0:

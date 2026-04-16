@@ -144,11 +144,16 @@ class MarketStateCache:
     ) -> MarketState:
         state = self._states.get(token_id, MarketState(token_id=token_id))
         state.market_slug = market_slug or state.market_slug
-        state.best_bid = best_bid
-        state.best_ask = best_ask
-        if best_bid is not None and best_ask is not None:
-            state.spread = max(best_ask - best_bid, 0.0)
-            state.midpoint = (best_bid + best_ask) / 2.0
+        if best_bid is not None:
+            state.best_bid = best_bid if best_bid > 0 else None
+        if best_ask is not None:
+            state.best_ask = best_ask if best_ask > 0 else None
+        if state.best_bid is not None and state.best_ask is not None:
+            state.spread = max(state.best_ask - state.best_bid, 0.0)
+            state.midpoint = (state.best_bid + state.best_ask) / 2.0
+        else:
+            state.spread = None
+            state.midpoint = state.best_ask or state.best_bid
         state.tick_size = tick_size if tick_size is not None else state.tick_size
         state.updated_at = _to_datetime(timestamp)
         state.source = source

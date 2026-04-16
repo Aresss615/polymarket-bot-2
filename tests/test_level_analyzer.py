@@ -122,12 +122,26 @@ def test_neutral_setup_requires_higher_net_edge(mock_snapshot):
     assert "flat window shadow only" in reason
 
 
-@patch("level_analyzer.get_reference_snapshot", return_value=_snapshot(age=3.5))
+@patch("level_analyzer.get_reference_snapshot", return_value=_snapshot(age=9.5))
 def test_stale_reference_skips(mock_snapshot):
     udm = _make_updown()
     signal, reason = analyze_updown_market(udm)
     assert signal is None
     assert "stale" in reason.lower()
+
+
+@patch("level_analyzer.ensure_reference_recent", return_value=True)
+@patch(
+    "level_analyzer.get_reference_snapshot",
+    side_effect=[_snapshot(age=9.5), _snapshot(ret=0.0036, zscore=1.0)],
+)
+def test_stale_reference_refreshes_before_skip(mock_snapshot, mock_refresh):
+    udm = _make_updown()
+    analysis = analyze_updown_market_detail(udm)
+    assert analysis.signal is not None
+    assert analysis.price_state != "stale"
+    assert mock_snapshot.call_count == 2
+    assert mock_refresh.called
 
 
 @patch("level_analyzer.get_reference_snapshot", return_value=_snapshot())
@@ -352,5 +366,53 @@ def test_missing_exact_open_causes_skip(mock_snapshot):
 def test_79c_strong_move_goes_to_high_prob_shadow(mock_snapshot):
     udm = _make_updown(up_price=0.79, down_price=0.21)
     analysis = analyze_updown_market_detail(udm)
-    assert analysis.signal is None
+    assert analysis.signal is not None
+    assert analysis.signal.strategy_mode == STRATEGY_MODE_SHADOW
     assert analysis.strategy_route == "high_prob_shadow"
+
+
+@patch(
+    "level_analyzer.get_reference_snapshot",
+    return_value=_snapshot(
+        ret=-0.0026,
+        zscore=-0.3,
+        interval_open=100.0,
+        interval_high=100.0,
+        interval_low=99.6,
+        interval_close=99.74,
+        interval_return=-0.0026,
+        late_return_60s=-0.0011,
+        late_return_20s=-0.0005,
+        body_ratio=0.78,
+        wick_imbalance=-0.06,
+    ),
+)
+def test_strong_move_can_use_opposite_token_quote_when_selected_book_is_sparse(mock_snapshot):
+    udm = _make_updown(up_price=0.28, down_price=0.72)
+
+    def _book_snapshot(token_id):
+        if token_id == "0xdown":
+            return {
+                "best_bid": None,
+                "best_ask": None,
+                "spread": None,
+                "book_age_ms": 250.0,
+                "tick_size": 0.01,
+            }
+        return {
+            "best_bid": 0.28,
+            "best_ask": 0.29,
+            "spread": 0.01,
+            "book_age_ms": 250.0,
+            "tick_size": 0.01,
+            "top_obi": 0.25,
+            "top3_obi": 0.22,
+        }
+
+    with patch("level_analyzer.MARKET_CACHE.snapshot", side_effect=_book_snapshot):
+        analysis = analyze_updown_market_detail(udm)
+
+    assert analysis.signal is not None
+    assert analysis.signal.side == "NO"
+    assert analysis.best_bid == pytest.approx(0.71)
+    assert analysis.best_ask == pytest.approx(0.72)

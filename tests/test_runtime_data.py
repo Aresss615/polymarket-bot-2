@@ -1,3 +1,5 @@
+import pytest
+
 from runtime_data import RuntimeDataPlane
 
 
@@ -18,7 +20,7 @@ def test_market_and_rtds_messages_accept_list_payloads():
         }
     ])
     plane.apply_rtds_message(
-        '[{"type":"crypto_prices","symbol":"BTC","price":101234.5,"timestamp":1700000000}]'
+        '[{"topic":"crypto_prices","type":"update","timestamp":1700000000123,"payload":{"symbol":"btcusdt","value":101234.5,"timestamp":1700000000000}}]'
     )
 
     market = plane.market_cache.snapshot("token-1")
@@ -26,6 +28,64 @@ def test_market_and_rtds_messages_accept_list_payloads():
     assert market["best_ask"] == 0.47
     assert market["tick_size"] == 0.01
     assert plane.reference_cache.price("BTC") == 101234.5
+
+
+def test_price_change_array_updates_partial_quotes_without_erasing_known_side():
+    plane = RuntimeDataPlane()
+
+    plane.apply_market_message(
+        {
+            "event_type": "best_bid_ask",
+            "asset_id": "token-1",
+            "market_slug": "btc-updown-5m-1",
+            "best_bid": 0.45,
+            "best_ask": 0.47,
+            "tick_size": 0.01,
+            "timestamp": 1_700_000_000,
+        }
+    )
+    plane.apply_market_message(
+        {
+            "event_type": "price_change",
+            "timestamp": 1_700_000_001,
+            "price_changes": [
+                {
+                    "asset_id": "token-1",
+                    "side": "SELL",
+                    "price": 0.46,
+                    "best_ask": 0.46,
+                }
+            ],
+        }
+    )
+
+    market = plane.market_cache.snapshot("token-1")
+    assert market["best_bid"] == 0.45
+    assert market["best_ask"] == 0.46
+    assert market["spread"] == pytest.approx(0.01)
+
+
+def test_rtds_chainlink_snapshot_populates_history_and_latest_price():
+    plane = RuntimeDataPlane()
+
+    plane.apply_rtds_message(
+        {
+            "topic": "crypto_prices_chainlink",
+            "type": "subscribe",
+            "timestamp": 1_700_000_003_000,
+            "payload": {
+                "symbol": "btc/usd",
+                "data": [
+                    {"timestamp": 1_700_000_000_000, "value": 101000.0},
+                    {"timestamp": 1_700_000_001_000, "value": 101100.0},
+                    {"timestamp": 1_700_000_002_000, "value": 101234.5},
+                ],
+            },
+        }
+    )
+
+    assert plane.reference_cache.price("BTC", prefer_chainlink=True) == 101234.5
+    assert plane.reference_cache.age_seconds("BTC", prefer_chainlink=True) is not None
 
 
 def test_user_order_store_uses_cumulative_fill_state():
@@ -86,7 +146,8 @@ def test_subscription_payloads_follow_active_runtime_universe():
     assert rtds_sub == {
         "action": "subscribe",
         "subscriptions": [
-            {"topic": "crypto_prices", "type": "update", "filters": "btcusdt"},
-            {"topic": "crypto_prices", "type": "update", "filters": "solusdt"},
+            {"topic": "crypto_prices", "type": "update"},
+            {"topic": "crypto_prices_chainlink", "type": "*", "filters": '{"symbol": "btc/usd"}'},
+            {"topic": "crypto_prices_chainlink", "type": "*", "filters": '{"symbol": "sol/usd"}'},
         ],
     }

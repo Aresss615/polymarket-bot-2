@@ -248,11 +248,11 @@ def test_cluster_position_cap_blocks_third_live_candidate():
     assert "cluster position cap" in check.reason
 
 
-def test_shadow_only_coin_is_blocked_from_live_candidate_path():
+def test_non_candidate_coin_is_blocked_from_live_candidate_path():
     rm = RiskManager(RiskConfig())
 
     check = rm.check_trade_allowed(
-        _make_signal(slug="eth-updown-5m-1", coin="ETH"),
+        _make_signal(slug="ada-updown-5m-1", coin="ADA"),
         size=1.0,
         pending_trades=[],
         account_equity=100.0,

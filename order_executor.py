@@ -16,6 +16,7 @@ from typing import Any
 import re
 
 from config import (
+    APP_CONFIG,
     FEED_HEARTBEAT_STALE_SECONDS,
     LIVE_MAKER_15M_MAX_AGE_SECONDS,
     LIVE_MAKER_DRIFT_TICKS,
@@ -233,7 +234,7 @@ class SimulationExecutor(OrderExecutor):
 class LiveExecutor(OrderExecutor):
     """Real CLOB execution via py-clob-client with explicit reconciliation."""
 
-    def __init__(self, private_key: str, chain_id: int = 137, funder: str = None):
+    def __init__(self, private_key: str, chain_id: int = 137, funder: str = None, market_data_client=None):
         from py_clob_client.client import ClobClient
         from py_clob_client.clob_types import OpenOrderParams, OrderArgs, OrderType, TradeParams
 
@@ -249,6 +250,7 @@ class LiveExecutor(OrderExecutor):
         self._OrderType = OrderType
         self._OpenOrderParams = OpenOrderParams
         self._TradeParams = TradeParams
+        self._market_data = market_data_client
 
     @staticmethod
     def _is_fok_full_fill_error(detail: str) -> bool:
@@ -288,6 +290,15 @@ class LiveExecutor(OrderExecutor):
 
     def _book_price(self, level: Any) -> float:
         return _safe_float(self._book_attr(level, "price"), 0.0)
+
+    @staticmethod
+    def _quote_age_seconds(quote: Any) -> float | None:
+        fetched_at = getattr(quote, "fetched_at", None)
+        if fetched_at is None:
+            return None
+        if getattr(fetched_at, "tzinfo", None) is None:
+            fetched_at = fetched_at.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - fetched_at).total_seconds()
 
     @staticmethod
     def _floor_to_tick(price: float, tick_size: float) -> float:
@@ -486,6 +497,33 @@ class LiveExecutor(OrderExecutor):
             )
 
         token_id = signal.market.token_ids[token_idx]
+        if self._market_data is not None:
+            try:
+                quote = self._market_data.get_execution_quote(token_id, side="BUY")
+                quote_age = self._quote_age_seconds(quote) if quote is not None else None
+                if quote_age is not None and quote_age > APP_CONFIG.execution.quote_staleness_seconds:
+                    return self._make_rejection(
+                        entry_price=entry_price,
+                        latency_ms=0.0,
+                        reason=f"stale quote ({quote_age:.2f}s old)",
+                        requested_size=size,
+                        requested_shares=(size / entry_price if entry_price > 0 else 0.0),
+                        token_id=token_id,
+                        metadata=metadata,
+                    )
+                depth_usd = _safe_float(getattr(quote, "depth_usd", 0.0), 0.0) if quote is not None else 0.0
+                if depth_usd and depth_usd < max(APP_CONFIG.execution.min_order_depth_usd, size * 1.2):
+                    return self._make_rejection(
+                        entry_price=entry_price,
+                        latency_ms=0.0,
+                        reason=f"insufficient depth (${depth_usd:.2f})",
+                        requested_size=size,
+                        requested_shares=(size / entry_price if entry_price > 0 else 0.0),
+                        token_id=token_id,
+                        metadata=metadata,
+                    )
+            except Exception:
+                pass
 
         book_snapshot = self._get_book_snapshot(token_id)
         limit_price = self._maker_limit_price(entry_price, book_snapshot) if book_snapshot else round(min(entry_price, 0.99), 2)

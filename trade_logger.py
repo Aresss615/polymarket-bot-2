@@ -5,6 +5,7 @@ stream as event-sourced snapshots: later rows for the same order supersede
 earlier rows, while settlement and risk events remain append-only.
 """
 
+from dataclasses import asdict
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,7 +15,7 @@ from config import CODEX_VERSION, EVENTS_JSONL, OrderResult, TRADES_JSONL, Trade
 
 def _write_jsonl(path: Path, record: dict) -> None:
     with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=True) + "\n")
+        f.write(json.dumps(record, ensure_ascii=True, default=str) + "\n")
 
 
 def log_trade_jsonl(
@@ -45,6 +46,10 @@ def log_trade_jsonl(
         "strategy_version": trade.strategy_version,
         "fees": trade.fees,
         "fill_price": trade.fill_price,
+        "trade_id": trade.trade_id,
+        "session_id": trade.session_id,
+        "bucket": trade.bucket,
+        "expected_value": trade.expected_value,
         "order_id": trade.order_id,
         "executor_type": trade.executor_type or executor_type,
         "edge_gross": trade.edge_gross,
@@ -191,6 +196,10 @@ def log_settlement(trade: Trade) -> None:
             "payout": trade.payout,
             "fees": trade.fees,
             "executor_type": trade.executor_type,
+            "trade_id": trade.trade_id,
+            "session_id": trade.session_id,
+            "bucket": trade.bucket,
+            "expected_value": trade.expected_value,
             "edge_gross": trade.edge_gross,
             "edge_net": trade.edge_net,
             "thesis_id": trade.thesis_id,
@@ -202,13 +211,15 @@ def log_settlement(trade: Trade) -> None:
     )
 
 
-def log_risk_block(signal_slug: str, reason: str) -> None:
+def log_risk_block(signal_slug: str, reason: str, session_id: str = "", trade_id: str = "") -> None:
     """Log a trade blocked by risk manager."""
     log_event(
         "risk_block",
         {
             "market_slug": signal_slug,
             "reason": reason,
+            "session_id": session_id,
+            "trade_id": trade_id,
         },
     )
 
@@ -228,3 +239,14 @@ def log_order_event(event_name: str, order_id: str, data: dict) -> None:
 def log_signal_event(data: dict) -> None:
     """Log one analyzed signal decision for research and live monitoring."""
     log_event("signal_event", data)
+
+
+def log_session_summary(session, summary: dict) -> None:
+    """Log an end-of-session analytics payload."""
+    log_event(
+        "session_summary",
+        {
+            "session": asdict(session),
+            "summary": summary,
+        },
+    )

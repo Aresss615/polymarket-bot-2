@@ -72,6 +72,10 @@ CSV_FIELDS = [
     "markout_1s",
     "markout_5s",
     "markout_30s",
+    "trade_id",
+    "session_id",
+    "bucket",
+    "expected_value",
 ]
 
 OPEN_ORDER_FIELDS = [
@@ -285,6 +289,10 @@ def _trade_to_row(trade: Trade) -> list[str]:
         _float_or_blank(trade.markout_1s),
         _float_or_blank(trade.markout_5s),
         _float_or_blank(trade.markout_30s),
+        trade.trade_id,
+        trade.session_id,
+        trade.bucket,
+        _float_or_blank(trade.expected_value),
     ]
 
 
@@ -489,6 +497,10 @@ def read_trades(path: Path = TRADES_CSV) -> list[Trade]:
                     if row.get("expected_cost") not in (None, "")
                     else None
                 ),
+                trade_id=row.get("trade_id", ""),
+                session_id=row.get("session_id", ""),
+                bucket=row.get("bucket", "uncategorized"),
+                expected_value=_safe_float(row.get("expected_value"), 0.0),
                 markout_1s=(
                     _safe_float(row.get("markout_1s"))
                     if row.get("markout_1s") not in (None, "")

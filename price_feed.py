@@ -7,12 +7,16 @@ import urllib3
 from config import (
     CHAINLINK_REQUIRED_15M,
     BYBIT_API_URL,
+    MAX_REFERENCE_AGE_SECONDS_FALLBACK,
+    MAX_REFERENCE_AGE_SECONDS_REALTIME,
     MAX_REFERENCE_AGE_SECONDS,
     OKX_API_URL,
     REFERENCE_LOOKBACK_SECONDS,
+    RTDS_STRICT_MODE,
     SUPPORTED_COINS,
     WINDOW_OPEN_TRUST_TOLERANCE_SECONDS,
 )
+from runtime_data import RUNTIME_DATA_PLANE, WEBSOCKET_CLIENT_AVAILABLE
 from state_cache import REFERENCE_CACHE
 
 # Python 3.14 on macOS has broken SSL cert verification for most CEX APIs.
@@ -160,10 +164,17 @@ def inject_reference_price(
 
 def get_prices_batch(coins: set[str]) -> dict[str, float]:
     """Fetch prices for multiple coins in a single CoinGecko API call."""
-    cg_ids = [COINGECKO_IDS[coin] for coin in coins if coin in COINGECKO_IDS]
+    normalized_coins = {coin.upper() for coin in coins}
+    cg_ids = [COINGECKO_IDS[coin] for coin in normalized_coins if coin in COINGECKO_IDS]
     if not cg_ids:
-        return {}
+        result = {}
+        for coin in normalized_coins:
+            price = get_price(coin)
+            if price is not None:
+                result[coin] = price
+        return result
 
+    result: dict[str, float] = {}
     try:
         resp = _session.get(
             "https://api.coingecko.com/api/v3/simple/price",
@@ -174,17 +185,21 @@ def get_prices_batch(coins: set[str]) -> dict[str, float]:
         data = resp.json()
         _record_source_success("coingecko")
 
-        result = {}
         for cg_id, price_data in data.items():
             coin = _CG_ID_TO_COIN.get(cg_id)
             if coin and "usd" in price_data:
                 price = float(price_data["usd"])
                 _record_price(coin, price, source="coingecko_batch")
                 result[coin] = price
-        return result
     except Exception:
         _record_source_failure("coingecko")
-        return {}
+
+    missing = normalized_coins.difference(result)
+    for coin in missing:
+        price = get_price(coin)
+        if price is not None:
+            result[coin] = price
+    return result
 
 
 def get_price(coin: str) -> float | None:
@@ -207,15 +222,65 @@ def get_price(coin: str) -> float | None:
 
 
 def get_price_age(coin: str) -> float | None:
+    cache_age = REFERENCE_CACHE.age_seconds(coin.upper())
+    if cache_age is not None:
+        return cache_age
     history = _price_history.get(coin.upper(), [])
     if not history:
         return None
     return time.time() - history[-1][0]
 
 
-def is_price_stale(coin: str, max_age: float = MAX_REFERENCE_AGE_SECONDS) -> bool:
+def reference_feed_mode() -> str:
+    if not RTDS_STRICT_MODE:
+        return "poll-fallback"
+    if not WEBSOCKET_CLIENT_AVAILABLE or not RUNTIME_DATA_PLANE.reference_stream_available():
+        return "poll-fallback"
+    if not REFERENCE_CACHE.feed_healthy(MAX_REFERENCE_AGE_SECONDS_REALTIME):
+        return "poll-fallback"
+    return "realtime"
+
+
+def active_reference_max_age_seconds() -> float:
+    if not RTDS_STRICT_MODE:
+        return MAX_REFERENCE_AGE_SECONDS_FALLBACK
+    return (
+        MAX_REFERENCE_AGE_SECONDS_REALTIME
+        if reference_feed_mode() == "realtime"
+        else MAX_REFERENCE_AGE_SECONDS_FALLBACK
+    )
+
+
+def reference_feed_status() -> dict:
+    diagnostics = RUNTIME_DATA_PLANE.diagnostics()
+    return {
+        "mode": reference_feed_mode(),
+        "strict_mode": RTDS_STRICT_MODE,
+        "max_age_seconds": active_reference_max_age_seconds(),
+        "reference_feed_healthy": REFERENCE_CACHE.feed_healthy(MAX_REFERENCE_AGE_SECONDS_REALTIME),
+        "websocket_client_available": WEBSOCKET_CLIENT_AVAILABLE,
+        "runtime": diagnostics,
+    }
+
+
+def is_price_stale(coin: str, max_age: float | None = None) -> bool:
+    limit = active_reference_max_age_seconds() if max_age is None else max_age
     age = get_price_age(coin)
-    return age is None or age > max_age
+    return age is None or age > limit
+
+
+def ensure_reference_recent(coin: str, max_age: float | None = None) -> bool:
+    limit = active_reference_max_age_seconds() if max_age is None else max_age
+    coin = coin.upper()
+    cached_price = REFERENCE_CACHE.price(coin)
+    cached_age = REFERENCE_CACHE.age_seconds(coin)
+    if cached_price is not None and cached_age is not None and cached_age <= limit:
+        return True
+    refreshed_price = get_price(coin)
+    if refreshed_price is None:
+        return False
+    refreshed_age = REFERENCE_CACHE.age_seconds(coin)
+    return refreshed_age is not None and refreshed_age <= limit
 
 
 def get_reference_snapshot(

@@ -2,13 +2,15 @@ from collections import defaultdict
 from concurrent.futures import Future
 from datetime import datetime, timedelta, timezone
 import time
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import pytest
 
 from config import (
     MAX_BET,
     MIN_BET,
+    MAX_REFERENCE_AGE_SECONDS,
+    MAX_REFERENCE_AGE_SECONDS_FALLBACK,
     NEWS_POLL_INTERVAL,
     STARTING_BALANCE,
     STRATEGY_VERSION,
@@ -837,6 +839,26 @@ def test_monitor_snapshot_summarizes_signal_board():
     assert snapshot["signal_summary"]["15m"]["SELL"]["count"] == 1
     assert snapshot["signal_summary"]["15m"]["SELL"]["actionable"] == 1
     assert snapshot["monitor_updated_at"] == "2026-04-10T12:00:00+00:00"
+
+
+def test_warm_active_coins_falls_back_to_direct_refresh_for_stale_symbols():
+    engine = Engine()
+
+    with (
+        patch("engine.get_prices_batch", return_value={}) as mock_batch,
+        patch("engine.ensure_reference_recent", return_value=True) as mock_ensure,
+    ):
+        engine._warm_active_coins({"BTC", "ETH"})
+
+    mock_batch.assert_called_once()
+    assert mock_batch.call_args.args[0] == {"BTC", "ETH"}
+    mock_ensure.assert_has_calls(
+        [
+            call("BTC", max_age=MAX_REFERENCE_AGE_SECONDS_FALLBACK),
+            call("ETH", max_age=MAX_REFERENCE_AGE_SECONDS_FALLBACK),
+        ],
+        any_order=True,
+    )
 
 
 def test_tick_updates_monitor_state_and_emits_signal_event():
