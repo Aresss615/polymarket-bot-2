@@ -1,14 +1,17 @@
 """Risk management for trade gating."""
 
+import json
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from config import (
     CANDIDATE_COINS,
     CLUSTER_SLIPPAGE_BREACH_LIMIT,
     COIN_MARKOUT_BREACH_LIMIT,
     FEED_HEARTBEAT_STALE_SECONDS,
+    KILL_SWITCH_STATE_PATH,
     LIVE_MAKER_MAX_SPREAD,
     MAX_BET,
     MIN_BET,
@@ -30,6 +33,7 @@ class RiskCheck:
 
 
 _COIN_RE = re.compile(r"^([a-z]+)-updown-", re.IGNORECASE)
+_KILL_SWITCH_PATH_UNSET = object()
 
 
 def _extract_coin(slug: str) -> str | None:
@@ -42,8 +46,9 @@ def _utc_now() -> datetime:
 
 
 class RiskManager:
-    def __init__(self, config: RiskConfig | None = None):
+    def __init__(self, config: RiskConfig | None = None, kill_switch_path: Path | None = _KILL_SWITCH_PATH_UNSET):
         self.config = config or RiskConfig()
+        self._kill_switch_path = KILL_SWITCH_STATE_PATH if kill_switch_path is _KILL_SWITCH_PATH_UNSET else kill_switch_path
         self._daily_losses: float = 0.0
         self._daily_start: datetime = _utc_now()
         self._kill_switch: bool = False
@@ -57,6 +62,30 @@ class RiskManager:
         self._cluster_slippage_breaches: dict[str, int] = {}
         self._coin_reduce_only: set[str] = set()
         self._cluster_reduce_only: set[str] = set()
+        self._load_kill_switch_state()
+
+    def _load_kill_switch_state(self) -> None:
+        if self._kill_switch_path is None:
+            return
+        try:
+            if self._kill_switch_path.exists():
+                data = json.loads(self._kill_switch_path.read_text(encoding="utf-8"))
+                if data.get("active"):
+                    self._kill_switch = True
+                    self._kill_switch_reason = data.get("reason", "restored from state file")
+        except Exception:
+            pass
+
+    def _save_kill_switch_state(self) -> None:
+        if self._kill_switch_path is None:
+            return
+        try:
+            self._kill_switch_path.write_text(
+                json.dumps({"active": self._kill_switch, "reason": self._kill_switch_reason}),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
 
     @staticmethod
     def _trade_timestamp(trade: Trade) -> datetime:
@@ -414,6 +443,7 @@ class RiskManager:
     def activate_kill_switch(self, reason: str):
         self._kill_switch = True
         self._kill_switch_reason = reason
+        self._save_kill_switch_state()
 
     def record_execution_quality(
         self,
@@ -454,6 +484,7 @@ class RiskManager:
     def deactivate_kill_switch(self):
         self._kill_switch = False
         self._kill_switch_reason = ""
+        self._save_kill_switch_state()
 
     @property
     def daily_pnl(self) -> float:

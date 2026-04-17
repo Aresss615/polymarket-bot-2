@@ -1,7 +1,14 @@
 import pytest
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 from config import Market, UpDownMarket, Article
+
+
+@pytest.fixture(autouse=True)
+def _no_kill_switch_disk_io():
+    with patch("risk_manager.KILL_SWITCH_STATE_PATH", None):
+        yield
 
 
 @pytest.fixture

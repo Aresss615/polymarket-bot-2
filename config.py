@@ -426,6 +426,7 @@ OPEN_ORDERS_CSV = Path("open_orders.csv")
 TRADES_JSONL = Path("trades.jsonl")
 EVENTS_JSONL = Path("events.jsonl")
 LEDGER_JSONL = Path("ledger.jsonl")
+KILL_SWITCH_STATE_PATH = Path("kill_switch_state.json")
 HISTORY_ARCHIVE_DIR = Path("history_archive")
 HISTORY_ARCHIVE_MANIFEST = HISTORY_ARCHIVE_DIR / "manifest.jsonl"
 

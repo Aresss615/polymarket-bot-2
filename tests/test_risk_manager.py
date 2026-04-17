@@ -310,3 +310,34 @@ def test_execution_quality_breach_moves_cluster_to_reduce_only():
 
     assert check.allowed is False
     assert "reduce-only" in check.reason
+
+
+def test_kill_switch_persisted_and_restored(tmp_path):
+    state_file = tmp_path / "ks.json"
+    rm = RiskManager(kill_switch_path=state_file)
+    assert not rm.kill_switch_active
+
+    rm.activate_kill_switch("test reason")
+    assert state_file.exists()
+
+    rm2 = RiskManager(kill_switch_path=state_file)
+    assert rm2.kill_switch_active
+    assert "test reason" in rm2._kill_switch_reason
+
+
+def test_kill_switch_cleared_on_deactivate(tmp_path):
+    state_file = tmp_path / "ks.json"
+    rm = RiskManager(kill_switch_path=state_file)
+    rm.activate_kill_switch("test")
+
+    rm.deactivate_kill_switch()
+    assert not rm.kill_switch_active
+
+    rm2 = RiskManager(kill_switch_path=state_file)
+    assert not rm2.kill_switch_active
+
+
+def test_kill_switch_no_persistence_when_path_is_none():
+    rm = RiskManager(kill_switch_path=None)
+    rm.activate_kill_switch("test")
+    assert rm.kill_switch_active
