@@ -11,24 +11,37 @@ import requests
 from copy_trading import CopyTradingService
 from config import (
     APP_CONFIG,
+    ARBITRAGE_STRATEGY_MODE,
+    BTC_NO_STRATEGY_MODE,
+    CODEX_VERSION,
     ENABLE_REALTIME_DATA_PLANE,
     EVENTS_JSONL,
+    LIVE_DAILY_MAX_LOSS,
+    LIVE_MAX_BET,
+    LIVE_MAX_OPEN_EXPOSURE,
+    LIVE_MIN_BET,
+    LIVE_STARTING_BALANCE,
     MAX_BET,
     MAX_BETS_PER_CYCLE,
     MIN_BET,
     Market,
     OpenOrder,
+    POLYMARKET_RELAYER_URL,
+    POLYMARKET_WALLET_TYPE,
     REALTIME_DISCOVERY_REFRESH_SECONDS,
     RiskConfig,
     STARTING_BALANCE,
     STRATEGY_MODE_DISABLED,
     STRATEGY_MODE_SHADOW,
     STRATEGY_VERSION,
+    STRUCTURAL_ARB_STRATEGY_MODE,
     SUPPORTED_COINS,
     SIMULATION_MAX_BETS_PER_CYCLE,
     TICK_INTERVAL,
     TRADING_MODE,
     Signal,
+    UPDOWN_5M_STRATEGY_MODE,
+    UPDOWN_15M_STRATEGY_MODE,
     market_side_price,
     market_side_token_id,
     SECOND_CHANCE_WINDOW_SECONDS,
@@ -50,6 +63,7 @@ from price_feed import (
 from order_executor import OrderExecutor, PaperExecutor
 from risk_manager import RiskManager
 from trade_logger import (
+    log_event,
     log_order_event,
     log_redemption_event,
     log_risk_block,
@@ -177,6 +191,24 @@ class Engine:
                 "websocket-client available: "
                 f"{diagnostics['websocket_client_available']}"
             )
+            log_event("session_start", {
+                "trading_mode": TRADING_MODE,
+                "executor_type": type(self.executor).__name__,
+                "strategy_version": STRATEGY_VERSION,
+                "codex_version": CODEX_VERSION,
+                "updown_5m_mode": UPDOWN_5M_STRATEGY_MODE,
+                "updown_15m_mode": UPDOWN_15M_STRATEGY_MODE,
+                "btc_no_mode": BTC_NO_STRATEGY_MODE,
+                "arbitrage_mode": ARBITRAGE_STRATEGY_MODE,
+                "structural_arb_mode": STRUCTURAL_ARB_STRATEGY_MODE,
+                "live_max_bet": LIVE_MAX_BET,
+                "live_min_bet": LIVE_MIN_BET,
+                "live_daily_max_loss": LIVE_DAILY_MAX_LOSS,
+                "live_max_open_exposure": LIVE_MAX_OPEN_EXPOSURE,
+                "live_starting_balance": LIVE_STARTING_BALANCE,
+                "relayer_url": POLYMARKET_RELAYER_URL,
+                "wallet_type": POLYMARKET_WALLET_TYPE,
+            })
             self._startup_logged = True
         if ENABLE_REALTIME_DATA_PLANE and not self._runtime_started:
             self.runtime_data_plane.start()

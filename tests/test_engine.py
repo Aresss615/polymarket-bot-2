@@ -135,6 +135,7 @@ def _clean_engine():
         patch("engine.save_open_orders"),
         patch("engine.save_trades"),
         patch("engine.evaluate_15m_mode", return_value=default_15m),
+        patch("engine.log_event"),
         patch("engine.log_trade_jsonl"),
         patch("engine.log_settlement"),
         patch("engine.log_redemption_event"),
@@ -1619,3 +1620,26 @@ def test_process_redemptions_skips_non_live_modes(mode):
 
     assert executor.redeem_calls == []
     assert trade.redemption_tx_id == ""
+
+
+def test_start_runtime_services_emits_session_start():
+    engine = Engine()
+    with (
+        patch("engine.ENABLE_REALTIME_DATA_PLANE", False),
+        patch("engine.log_event") as mock_log_event,
+        patch.object(
+            engine.runtime_data_plane,
+            "diagnostics",
+            return_value={"websocket_client_available": False, "workers": {}},
+        ),
+    ):
+        engine.start_runtime_services()
+
+    session_calls = [c for c in mock_log_event.call_args_list if c.args[0] == "session_start"]
+    assert len(session_calls) == 1
+    data = session_calls[0].args[1]
+    assert "trading_mode" in data
+    assert "executor_type" in data
+    assert "strategy_version" in data
+    assert "relayer_url" in data
+    assert "wallet_type" in data
