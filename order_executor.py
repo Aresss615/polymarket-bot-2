@@ -15,6 +15,13 @@ from abc import ABC, abstractmethod
 from typing import Any
 import re
 
+import requests
+from eth_abi import encode as abi_encode
+from eth_account import Account
+from eth_account.messages import encode_defunct
+from eth_utils import keccak, to_canonical_address, to_checksum_address
+from py_clob_client.config import get_contract_config
+
 from config import (
     APP_CONFIG,
     FEED_HEARTBEAT_STALE_SECONDS,
@@ -27,15 +34,49 @@ from config import (
     LIVE_MAKER_OBI_AGAINST_THRESHOLD,
     LIVE_MAKER_POST_ONLY,
     LIVE_MAKER_REFERENCE_REVERSAL,
+    LIVE_MAX_SIZE_EXPANSION,
     MAX_TAKER_FEE_RATE,
     OpenOrder,
     OrderResult,
+    POLYMARKET_RELAYER_API_KEY,
+    POLYMARKET_RELAYER_URL,
+    POLYMARKET_WALLET_TYPE,
+    RedemptionResult,
     Signal,
+    market_side_token_id,
+    polymarket_wallet_relayer_type,
+    polymarket_wallet_signature_type,
+    resolve_polymarket_wallet_type,
 )
 from price_feed import get_reference_snapshot
 from runtime_data import RUNTIME_DATA_PLANE
 
 _COIN_RE = re.compile(r"^([a-z]+)-updown-", re.IGNORECASE)
+_SAFE_INIT_CODE_HASH = "0x2bce2127ff07fb632d16c8347c4ebf501f4841168bed00d9e6ef715ddb6fcecf"
+_PROXY_INIT_CODE_HASH = "0xd21df8dc65880a8606f09fe0ce3df9b8869287ab0b058be05aa9e8af6330a00b"
+_SAFE_FACTORY_ADDRESS = "0xaacFeEa03eb1561C4e67d661e40682Bd20E3541b"
+_PROXY_FACTORY_ADDRESS = "0xaB45c5A4B0c941a2F231C04C3f49182e1A254052"
+_PROXY_RELAY_HUB_ADDRESS = "0xD216153c06E857cD7f72665E0aF1d7D82172F494"
+_ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
+_ZERO_HASH = "0x" + ("00" * 32)
+_SAFE_TX_TYPE_HASH = keccak(
+    text=(
+        "SafeTx(address to,uint256 value,bytes data,uint8 operation,uint256 safeTxGas,"
+        "uint256 baseGas,uint256 gasPrice,address gasToken,address refundReceiver,uint256 nonce)"
+    )
+)
+_EIP712_DOMAIN_TYPE_HASH = keccak(
+    text="EIP712Domain(uint256 chainId,address verifyingContract)"
+)
+_SAFE_OPERATION_CALL = 0
+_PROXY_OPERATION_CALL = 1
+_CTF_REDEEM_SELECTOR = keccak(
+    text="redeemPositions(address,bytes32,bytes32,uint256[])"
+)[:4]
+_PROXY_SELECTOR = keccak(text="proxy((uint8,address,uint256,bytes)[])")[:4]
+_RELAY_SUCCESS_STATES = {"STATE_EXECUTED", "STATE_MINED", "STATE_CONFIRMED"}
+_RELAY_PENDING_STATES = {"STATE_NEW"}
+_RELAY_FAILED_STATES = {"STATE_INVALID", "STATE_FAILED"}
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -50,6 +91,42 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 def _extract_coin(slug: str) -> str | None:
     match = _COIN_RE.match(slug or "")
     return match.group(1).upper() if match else None
+
+
+def _hex_bytes(value: str, expected_len: int | None = None) -> bytes:
+    text = str(value or "").strip()
+    if text.startswith(("0x", "0X")):
+        text = text[2:]
+    if len(text) % 2:
+        text = f"0{text}"
+    data = bytes.fromhex(text) if text else b""
+    if expected_len is not None and len(data) != expected_len:
+        raise ValueError(f"expected {expected_len} bytes, got {len(data)}")
+    return data
+
+
+def _derive_create2_address(factory: str, salt: bytes, init_code_hash: str) -> str:
+    digest = keccak(
+        b"\xff"
+        + to_canonical_address(factory)
+        + salt
+        + _hex_bytes(init_code_hash, 32)
+    )
+    return to_checksum_address(digest[-20:])
+
+
+def _pack_safe_signature(signature_hex: str) -> str:
+    signature = _hex_bytes(signature_hex, 65)
+    r = signature[:32]
+    s = signature[32:64]
+    v = signature[64]
+    if v in {0, 1}:
+        v += 31
+    elif v in {27, 28}:
+        v += 4
+    else:
+        raise ValueError("invalid safe signature v value")
+    return f"0x{(r + s + bytes([v])).hex()}"
 
 
 def _result_metadata_from_signal(signal: Signal) -> dict:
@@ -88,6 +165,7 @@ def _result_metadata_from_signal(signal: Signal) -> dict:
         "window_open_price": signal.window_open_price,
         "window_open_source": signal.window_open_source,
         "window_open_price_trusted": signal.window_open_price_trusted,
+        "window_open_anchor_age_seconds": signal.window_open_anchor_age_seconds,
         "actual_window_return": signal.actual_window_return,
         "actual_move_regime": signal.actual_move_regime,
         "actual_move_side": signal.actual_move_side,
@@ -119,6 +197,29 @@ class OrderExecutor(ABC):
         """Cancel an existing order if the executor supports it."""
         return False
 
+    def supports_redemption(self) -> bool:
+        """Whether the executor can submit live redemption transactions."""
+        return False
+
+    def redeem_condition(self, condition_id: str) -> RedemptionResult:
+        """Submit a winning-condition redemption if supported."""
+        return RedemptionResult(
+            status="noop",
+            success=True,
+            terminal=True,
+            raw_response={"condition_id": condition_id},
+        )
+
+    def get_redemption_status(self, transaction_id: str) -> RedemptionResult:
+        """Check the current redemption status if supported."""
+        return RedemptionResult(
+            status="noop",
+            success=True,
+            transaction_id=transaction_id,
+            terminal=True,
+            raw_response={"transaction_id": transaction_id},
+        )
+
 
 class PaperExecutor(OrderExecutor):
     """Instant fill at quoted price with zero fees.
@@ -128,8 +229,7 @@ class PaperExecutor(OrderExecutor):
 
     def place_order(self, signal: Signal, size: float, entry_price: float) -> OrderResult:
         shares = size / entry_price if entry_price > 0 else 0.0
-        token_index = 0 if signal.side == "YES" else 1
-        token_id = signal.market.token_ids[token_index] if len(signal.market.token_ids) > token_index else ""
+        token_id = market_side_token_id(signal.market, signal.side)
         return OrderResult(
             filled=True,
             fill_price=entry_price,
@@ -173,8 +273,7 @@ class SimulationExecutor(OrderExecutor):
     def place_order(self, signal: Signal, size: float, entry_price: float) -> OrderResult:
         requested_shares = size / entry_price if entry_price > 0 else 0.0
         metadata = _result_metadata_from_signal(signal)
-        token_index = 0 if signal.side == "YES" else 1
-        token_id = signal.market.token_ids[token_index] if len(signal.market.token_ids) > token_index else ""
+        token_id = market_side_token_id(signal.market, signal.side)
 
         # 2% rejection
         if self._rng.random() < 0.02:
@@ -234,16 +333,55 @@ class SimulationExecutor(OrderExecutor):
 class LiveExecutor(OrderExecutor):
     """Real CLOB execution via py-clob-client with explicit reconciliation."""
 
-    def __init__(self, private_key: str, chain_id: int = 137, funder: str = None, market_data_client=None):
+    def __init__(
+        self,
+        private_key: str,
+        chain_id: int = 137,
+        funder: str = None,
+        market_data_client=None,
+        wallet_type: str | None = None,
+        relayer_api_key: str | None = None,
+        relayer_url: str | None = None,
+    ):
         from py_clob_client.client import ClobClient
         from py_clob_client.clob_types import OpenOrderParams, OrderArgs, OrderType, TradeParams
+
+        self._chain_id = chain_id
+        self._signer_account = Account.from_key(private_key)
+        self.signer_address = to_checksum_address(self._signer_account.address)
+        self.wallet_type = resolve_polymarket_wallet_type(
+            wallet_type or POLYMARKET_WALLET_TYPE,
+            funder,
+        )
+        self._contract_config = get_contract_config(chain_id)
+        self._safe_factory = to_checksum_address(_SAFE_FACTORY_ADDRESS)
+        self._collateral_address = to_checksum_address(self._contract_config.collateral)
+        self._conditional_tokens_address = to_checksum_address(
+            self._contract_config.conditional_tokens
+        )
+        self._proxy_factory = to_checksum_address(_PROXY_FACTORY_ADDRESS)
+        self._proxy_relay_hub = to_checksum_address(_PROXY_RELAY_HUB_ADDRESS)
+        derived_wallet = self._derive_wallet_address(self.wallet_type)
+        self.funder = (
+            to_checksum_address(funder)
+            if funder
+            else derived_wallet
+            if self.wallet_type in {"safe", "proxy"}
+            else None
+        )
+        self.redemption_wallet_address = self.funder or self.signer_address
+        self.relayer_api_key = relayer_api_key or POLYMARKET_RELAYER_API_KEY
+        self.relayer_url = (relayer_url or POLYMARKET_RELAYER_URL).rstrip("/")
+        self.relayer_type = polymarket_wallet_relayer_type(self.wallet_type)
+        self.redemption_enabled = bool(self.relayer_api_key and self.relayer_type)
+        self._session = requests.Session()
 
         self._client = ClobClient(
             "https://clob.polymarket.com",
             key=private_key,
             chain_id=chain_id,
-            signature_type=2 if funder else 0,
-            funder=funder,
+            signature_type=polymarket_wallet_signature_type(self.wallet_type),
+            funder=self.funder,
         )
         self._client.set_api_creds(self._client.create_or_derive_api_creds())
         self._OrderArgs = OrderArgs
@@ -251,6 +389,383 @@ class LiveExecutor(OrderExecutor):
         self._OpenOrderParams = OpenOrderParams
         self._TradeParams = TradeParams
         self._market_data = market_data_client
+
+    def _derive_wallet_address(self, wallet_type: str) -> str | None:
+        if wallet_type == "safe":
+            salt = keccak(
+                abi_encode(
+                    ["address"],
+                    [self.signer_address],
+                )
+            )
+            return _derive_create2_address(self._safe_factory, salt, _SAFE_INIT_CODE_HASH)
+        if wallet_type == "proxy":
+            salt = keccak(to_canonical_address(self.signer_address))
+            return _derive_create2_address(self._proxy_factory, salt, _PROXY_INIT_CODE_HASH)
+        return None
+
+    def supports_redemption(self) -> bool:
+        return self.redemption_enabled
+
+    def _relayer_headers(self) -> dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if self.relayer_api_key:
+            headers.update(
+                {
+                    "RELAYER_API_KEY": self.relayer_api_key,
+                    "RELAYER_API_KEY_ADDRESS": self.signer_address,
+                }
+            )
+        return headers
+
+    def _relayer_request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict | None = None,
+        payload: dict | None = None,
+    ) -> Any:
+        response = self._session.request(
+            method,
+            f"{self.relayer_url}{path}",
+            headers=self._relayer_headers(),
+            params=params,
+            json=payload,
+            timeout=15,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def _sign_message_hash(self, hash_hex: str) -> str:
+        signed = self._signer_account.sign_message(encode_defunct(hexstr=hash_hex))
+        signature = signed.signature.hex()
+        return signature if signature.startswith("0x") else f"0x{signature}"
+
+    def _safe_transaction_hash(
+        self,
+        *,
+        safe_address: str,
+        to: str,
+        value: int,
+        data: str,
+        operation: int,
+        nonce: int,
+        safe_tx_gas: int = 0,
+        base_gas: int = 0,
+        gas_price: int = 0,
+        gas_token: str = _ZERO_ADDRESS,
+        refund_receiver: str = _ZERO_ADDRESS,
+    ) -> str:
+        data_hash = keccak(_hex_bytes(data))
+        tx_struct_hash = keccak(
+            abi_encode(
+                [
+                    "bytes32",
+                    "address",
+                    "uint256",
+                    "bytes32",
+                    "uint8",
+                    "uint256",
+                    "uint256",
+                    "uint256",
+                    "address",
+                    "address",
+                    "uint256",
+                ],
+                [
+                    _SAFE_TX_TYPE_HASH,
+                    to_checksum_address(to),
+                    int(value),
+                    data_hash,
+                    int(operation),
+                    int(safe_tx_gas),
+                    int(base_gas),
+                    int(gas_price),
+                    to_checksum_address(gas_token),
+                    to_checksum_address(refund_receiver),
+                    int(nonce),
+                ],
+            )
+        )
+        domain_separator = keccak(
+            abi_encode(
+                ["bytes32", "uint256", "address"],
+                [
+                    _EIP712_DOMAIN_TYPE_HASH,
+                    int(self._chain_id),
+                    to_checksum_address(safe_address),
+                ],
+            )
+        )
+        return f"0x{keccak(b'\x19\x01' + domain_separator + tx_struct_hash).hex()}"
+
+    def _proxy_transaction_hash(
+        self,
+        *,
+        to: str,
+        data: str,
+        tx_fee: int,
+        gas_price: int,
+        gas_limit: int,
+        nonce: int,
+        relay_hub: str,
+        relay_address: str,
+    ) -> str:
+        payload = (
+            b"rlx:"
+            + to_canonical_address(self.signer_address)
+            + to_canonical_address(to)
+            + _hex_bytes(data)
+            + int(tx_fee).to_bytes(32, "big")
+            + int(gas_price).to_bytes(32, "big")
+            + int(gas_limit).to_bytes(32, "big")
+            + int(nonce).to_bytes(32, "big")
+            + to_canonical_address(relay_hub)
+            + to_canonical_address(relay_address)
+        )
+        return f"0x{keccak(payload).hex()}"
+
+    def _encode_ctf_redeem_calldata(self, condition_id: str) -> str:
+        encoded = abi_encode(
+            ["address", "bytes32", "bytes32", "uint256[]"],
+            [
+                self._collateral_address,
+                _hex_bytes(_ZERO_HASH, 32),
+                _hex_bytes(condition_id, 32),
+                [1, 2],
+            ],
+        )
+        return f"0x{(_CTF_REDEEM_SELECTOR + encoded).hex()}"
+
+    def _encode_proxy_transaction_data(self, to: str, data: str) -> str:
+        encoded = abi_encode(
+            ["(uint8,address,uint256,bytes)[]"],
+            [[(_PROXY_OPERATION_CALL, to_checksum_address(to), 0, _hex_bytes(data))]],
+        )
+        return f"0x{(_PROXY_SELECTOR + encoded).hex()}"
+
+    def _parse_relayer_result(self, payload: Any) -> RedemptionResult:
+        if isinstance(payload, list):
+            payload = payload[0] if payload else {}
+        if not isinstance(payload, dict):
+            return RedemptionResult(
+                status="failed",
+                success=False,
+                error=str(payload),
+                retryable=True,
+                raw_response={"payload": payload},
+            )
+
+        state = str(payload.get("state", "")).strip().upper()
+        transaction_id = str(
+            payload.get("transactionID")
+            or payload.get("transactionId")
+            or ""
+        )
+        transaction_hash = str(
+            payload.get("transactionHash")
+            or payload.get("hash")
+            or ""
+        )
+        error = self._error_text(payload) if state in _RELAY_FAILED_STATES else ""
+        if state in _RELAY_SUCCESS_STATES:
+            return RedemptionResult(
+                status="confirmed",
+                success=True,
+                transaction_id=transaction_id,
+                transaction_hash=transaction_hash,
+                terminal=True,
+                raw_state=state,
+                raw_response=payload,
+            )
+        if state in _RELAY_PENDING_STATES:
+            return RedemptionResult(
+                status="pending",
+                success=True,
+                transaction_id=transaction_id,
+                transaction_hash=transaction_hash,
+                terminal=False,
+                raw_state=state,
+                raw_response=payload,
+            )
+        if state in _RELAY_FAILED_STATES:
+            return RedemptionResult(
+                status="failed",
+                success=False,
+                transaction_id=transaction_id,
+                transaction_hash=transaction_hash,
+                error=error,
+                terminal=True,
+                retryable=True,
+                raw_state=state,
+                raw_response=payload,
+            )
+        if transaction_id:
+            return RedemptionResult(
+                status="pending",
+                success=True,
+                transaction_id=transaction_id,
+                transaction_hash=transaction_hash,
+                terminal=False,
+                raw_state=state,
+                raw_response=payload,
+            )
+        return RedemptionResult(
+            status="failed",
+            success=False,
+            error=self._error_text(payload),
+            retryable=True,
+            raw_state=state,
+            raw_response=payload,
+        )
+
+    def redeem_condition(self, condition_id: str) -> RedemptionResult:
+        if self.wallet_type == "eoa":
+            return RedemptionResult(
+                status="disabled",
+                success=False,
+                error="auto-redeem is disabled for eoa wallets in v1",
+                terminal=True,
+                raw_response={"wallet_type": self.wallet_type},
+            )
+        if not self.redemption_enabled:
+            return RedemptionResult(
+                status="disabled",
+                success=False,
+                error="relayer api key not configured for live redemption",
+                terminal=True,
+                raw_response={"wallet_type": self.wallet_type},
+            )
+
+        try:
+            calldata = self._encode_ctf_redeem_calldata(condition_id)
+            if self.wallet_type == "safe":
+                nonce_payload = self._relayer_request(
+                    "GET",
+                    "/nonce",
+                    params={"address": self.signer_address, "type": self.relayer_type},
+                )
+                nonce = int(str((nonce_payload or {}).get("nonce", "0")))
+                safe_address = to_checksum_address(self.redemption_wallet_address)
+                tx_hash = self._safe_transaction_hash(
+                    safe_address=safe_address,
+                    to=self._conditional_tokens_address,
+                    value=0,
+                    data=calldata,
+                    operation=_SAFE_OPERATION_CALL,
+                    nonce=nonce,
+                )
+                request_payload = {
+                    "from": self.signer_address,
+                    "to": self._conditional_tokens_address,
+                    "proxyWallet": safe_address,
+                    "data": calldata,
+                    "nonce": str(nonce),
+                    "signature": _pack_safe_signature(self._sign_message_hash(tx_hash)),
+                    "signatureParams": {
+                        "gasPrice": "0",
+                        "operation": "0",
+                        "safeTxnGas": "0",
+                        "baseGas": "0",
+                        "gasToken": _ZERO_ADDRESS,
+                        "refundReceiver": _ZERO_ADDRESS,
+                    },
+                    "type": "SAFE",
+                    "metadata": f"redeem:{condition_id}",
+                }
+            else:
+                relay_payload = self._relayer_request(
+                    "GET",
+                    "/relay-payload",
+                    params={"address": self.signer_address, "type": self.relayer_type},
+                )
+                relay_address = str((relay_payload or {}).get("address", ""))
+                nonce = int(str((relay_payload or {}).get("nonce", "0")))
+                proxy_data = self._encode_proxy_transaction_data(
+                    self._conditional_tokens_address,
+                    calldata,
+                )
+                tx_hash = self._proxy_transaction_hash(
+                    to=self._proxy_factory,
+                    data=proxy_data,
+                    tx_fee=0,
+                    gas_price=0,
+                    gas_limit=10_000_000,
+                    nonce=nonce,
+                    relay_hub=self._proxy_relay_hub,
+                    relay_address=relay_address,
+                )
+                request_payload = {
+                    "from": self.signer_address,
+                    "to": self._proxy_factory,
+                    "proxyWallet": to_checksum_address(self.redemption_wallet_address),
+                    "data": proxy_data,
+                    "nonce": str(nonce),
+                    "signature": self._sign_message_hash(tx_hash),
+                    "signatureParams": {
+                        "gasPrice": "0",
+                        "gasLimit": "10000000",
+                        "relayerFee": "0",
+                        "relayHub": self._proxy_relay_hub,
+                        "relay": relay_address,
+                    },
+                    "type": "PROXY",
+                    "metadata": f"redeem:{condition_id}",
+                }
+
+            response_payload = self._relayer_request(
+                "POST",
+                "/submit",
+                payload=request_payload,
+            )
+            return self._parse_relayer_result(response_payload)
+        except Exception as exc:
+            return RedemptionResult(
+                status="failed",
+                success=False,
+                error=self._error_text(exc),
+                retryable=True,
+                terminal=True,
+                raw_response={"condition_id": condition_id},
+            )
+
+    def get_redemption_status(self, transaction_id: str) -> RedemptionResult:
+        if not transaction_id:
+            return RedemptionResult(
+                status="failed",
+                success=False,
+                error="missing transaction id",
+                retryable=True,
+                terminal=True,
+            )
+        if not self.redemption_enabled:
+            return RedemptionResult(
+                status="disabled",
+                success=False,
+                transaction_id=transaction_id,
+                error="relayer api key not configured for live redemption",
+                terminal=True,
+            )
+        try:
+            response_payload = self._relayer_request(
+                "GET",
+                "/transaction",
+                params={"id": transaction_id},
+            )
+            result = self._parse_relayer_result(response_payload)
+            if not result.transaction_id:
+                result.transaction_id = transaction_id
+            return result
+        except Exception as exc:
+            return RedemptionResult(
+                status="failed",
+                success=False,
+                transaction_id=transaction_id,
+                error=self._error_text(exc),
+                retryable=True,
+                terminal=True,
+            )
 
     @staticmethod
     def _is_fok_full_fill_error(detail: str) -> bool:
@@ -306,9 +821,30 @@ class LiveExecutor(OrderExecutor):
         floored = math.floor((price + 1e-9) / tick) * tick
         return round(max(tick, min(0.99, floored)), 2)
 
+    @staticmethod
+    def _cached_book_needs_refresh(book: dict) -> bool:
+        if not book:
+            return True
+        best_bid = _safe_float(book.get("best_bid"), 0.0)
+        best_ask = _safe_float(book.get("best_ask"), 0.0)
+        tick_size = max(_safe_float(book.get("tick_size"), 0.01), 0.01)
+        spread = book.get("spread")
+        if spread in (None, "") and best_bid > 0 and best_ask > 0:
+            spread = max(best_ask - best_bid, 0.0)
+        spread = _safe_float(spread, 0.0)
+        book_age_ms = _safe_float(book.get("book_age_ms"), 0.0)
+        max_reasonable_spread = max(LIVE_MAKER_MAX_SPREAD, tick_size * LIVE_MAKER_MAX_SPREAD_TICKS)
+        if best_bid <= 0 and best_ask <= 0:
+            return True
+        if book_age_ms > FEED_HEARTBEAT_STALE_SECONDS * 1000.0:
+            return True
+        if best_bid > 0 and best_ask > 0 and best_ask < best_bid:
+            return True
+        return best_bid > 0 and best_ask > 0 and spread > max_reasonable_spread * 2.0
+
     def _get_book_snapshot(self, token_id: str) -> dict:
         cached = RUNTIME_DATA_PLANE.market_cache.snapshot(token_id)
-        if cached:
+        if cached and not self._cached_book_needs_refresh(cached):
             return {
                 "best_bid": cached.get("best_bid") or 0.0,
                 "best_ask": cached.get("best_ask") or 0.0,
@@ -323,6 +859,18 @@ class LiveExecutor(OrderExecutor):
         try:
             book = self._client.get_order_book(token_id)
         except Exception:
+            if cached:
+                return {
+                    "best_bid": cached.get("best_bid") or 0.0,
+                    "best_ask": cached.get("best_ask") or 0.0,
+                    "tick_size": cached.get("tick_size") or 0.01,
+                    "midpoint": cached.get("midpoint") or 0.0,
+                    "spread": cached.get("spread") or 0.0,
+                    "microprice": cached.get("microprice"),
+                    "top_obi": cached.get("top_obi"),
+                    "top3_obi": cached.get("top3_obi"),
+                    "book_age_ms": cached.get("book_age_ms"),
+                }
             return {}
 
         bids = self._book_attr(book, "bids", []) or []
@@ -485,18 +1033,16 @@ class LiveExecutor(OrderExecutor):
 
     def place_order(self, signal: Signal, size: float, entry_price: float) -> OrderResult:
         metadata = _result_metadata_from_signal(signal)
-        token_idx = 0 if signal.side == "YES" else 1
-        if token_idx >= len(signal.market.token_ids):
+        token_id = market_side_token_id(signal.market, signal.side)
+        if not token_id:
             return self._make_rejection(
                 entry_price=entry_price,
                 latency_ms=0.0,
-                reason=f"no token_id for index {token_idx}",
+                reason=f"no token_id for side {signal.side}",
                 requested_size=size,
                 requested_shares=0.0,
                 metadata=metadata,
             )
-
-        token_id = signal.market.token_ids[token_idx]
         if self._market_data is not None:
             try:
                 quote = self._market_data.get_execution_quote(token_id, side="BUY")
@@ -526,6 +1072,36 @@ class LiveExecutor(OrderExecutor):
                 pass
 
         book_snapshot = self._get_book_snapshot(token_id)
+        if book_snapshot:
+            tick_size = max(book_snapshot.get("tick_size") or 0.01, 0.01)
+            best_bid = _safe_float(book_snapshot.get("best_bid"), 0.0)
+            best_ask = _safe_float(book_snapshot.get("best_ask"), 0.0)
+            book_reference_price = best_ask or best_bid
+            drift_threshold = max(
+                LIVE_MAKER_MAX_SPREAD,
+                tick_size * (LIVE_MAKER_DRIFT_TICKS + LIVE_MAKER_IMPROVEMENT_TICKS + 1),
+            )
+            if book_reference_price > 0 and book_reference_price >= entry_price + drift_threshold:
+                return self._make_rejection(
+                    entry_price=entry_price,
+                    latency_ms=0.0,
+                    reason=(
+                        f"market moved above signal price "
+                        f"({book_reference_price:.2f}>{entry_price:.2f})"
+                    ),
+                    requested_size=size,
+                    requested_shares=(size / entry_price if entry_price > 0 else 0.0),
+                    token_id=token_id,
+                    metadata={
+                        **metadata,
+                        "best_bid": best_bid or metadata.get("best_bid"),
+                        "best_ask": best_ask or metadata.get("best_ask"),
+                        "spread": book_snapshot.get("spread"),
+                        "book_age_ms": book_snapshot.get("book_age_ms"),
+                        "tick_size": tick_size,
+                        "expected_fill_price": book_reference_price,
+                    },
+                )
         limit_price = self._maker_limit_price(entry_price, book_snapshot) if book_snapshot else round(min(entry_price, 0.99), 2)
         estimated_shares = size / limit_price if limit_price > 0 else 0.0
         if estimated_shares < 0.1:
@@ -542,6 +1118,16 @@ class LiveExecutor(OrderExecutor):
         min_shares = 5.0
         shares = max(round(size / limit_price, 2), min_shares)
         actual_size = round(shares * limit_price, 2)
+        if actual_size > size * LIVE_MAX_SIZE_EXPANSION:
+            return self._make_rejection(
+                entry_price=limit_price,
+                latency_ms=0.0,
+                reason=f"size expansion {actual_size:.2f} > limit {size * LIVE_MAX_SIZE_EXPANSION:.2f} (min_shares floor)",
+                requested_size=size,
+                requested_shares=shares,
+                token_id=token_id,
+                metadata=metadata,
+            )
 
         t0 = time.time()
         try:
@@ -793,6 +1379,7 @@ class LiveExecutor(OrderExecutor):
                 window_open_price=open_order.window_open_price,
                 window_open_source=open_order.window_open_source,
                 window_open_price_trusted=open_order.window_open_price_trusted,
+                window_open_anchor_age_seconds=open_order.window_open_anchor_age_seconds,
                 actual_window_return=open_order.actual_window_return,
                 actual_move_regime=open_order.actual_move_regime,
                 actual_move_side=open_order.actual_move_side,
@@ -920,6 +1507,7 @@ class LiveExecutor(OrderExecutor):
             window_open_price=open_order.window_open_price,
             window_open_source=open_order.window_open_source,
             window_open_price_trusted=open_order.window_open_price_trusted,
+            window_open_anchor_age_seconds=open_order.window_open_anchor_age_seconds,
             actual_window_return=open_order.actual_window_return,
             actual_move_regime=open_order.actual_move_regime,
             actual_move_side=open_order.actual_move_side,

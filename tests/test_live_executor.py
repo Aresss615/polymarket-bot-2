@@ -3,18 +3,23 @@
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
+import pytest
+from eth_abi import decode as abi_decode
+
 from config import Market, OpenOrder, Signal
 from order_executor import LiveExecutor
 
 
-def _make_signal(side="YES", token_ids=None):
+def _make_signal(side="YES", token_ids=None, outcomes=None, outcome_prices=None):
     token_ids = token_ids or ["0xYES", "0xNO"]
+    outcomes = outcomes or ["Up", "Down"]
+    outcome_prices = outcome_prices or [0.80, 0.20]
     market = Market(
         condition_id="0x1",
         question="BTC Up or Down?",
         slug="btc-updown-5m-123",
-        outcomes=["Up", "Down"],
-        outcome_prices=[0.80, 0.20],
+        outcomes=outcomes,
+        outcome_prices=outcome_prices,
         token_ids=token_ids,
         end_date=None,
         active=True,
@@ -36,7 +41,14 @@ def _make_executor(mock_client_cls):
         "asks": [{"price": "0.82", "size": "25"}],
         "tick_size": "0.01",
     }
-    return LiveExecutor(private_key="0xdeadbeef"), instance
+    return LiveExecutor(private_key=f"0x{'11' * 32}"), instance
+
+
+def _response(payload):
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = payload
+    return resp
 
 
 def _make_open_order(**overrides):
@@ -84,7 +96,7 @@ def test_live_executor_successful_order_returns_submitted(MockClient):
     instance.create_order.return_value = {"signed": True}
     instance.post_order.return_value = {"success": True, "orderID": "order-123", "status": "LIVE"}
 
-    result = executor.place_order(_make_signal(side="YES"), size=1.0, entry_price=0.80)
+    result = executor.place_order(_make_signal(side="YES"), size=4.0, entry_price=0.80)
 
     assert result.filled is False
     assert result.order_id == "order-123"
@@ -122,7 +134,7 @@ def test_live_executor_retries_post_only_reject_with_lower_price(MockClient):
         {"success": True, "orderID": "maker-order-123", "status": "LIVE"},
     ]
 
-    result = executor.place_order(_make_signal(side="YES"), size=1.0, entry_price=0.80)
+    result = executor.place_order(_make_signal(side="YES"), size=4.0, entry_price=0.80)
 
     assert result.filled is False
     assert result.order_id == "maker-order-123"
@@ -139,7 +151,7 @@ def test_live_executor_rejected_order(MockClient):
     instance.create_order.return_value = {"signed": True}
     instance.post_order.return_value = {"errorMsg": "insufficient balance"}
 
-    result = executor.place_order(_make_signal(side="YES"), size=1.0, entry_price=0.80)
+    result = executor.place_order(_make_signal(side="YES"), size=4.0, entry_price=0.80)
 
     assert result.filled is False
     assert result.needs_reconciliation is False
@@ -151,7 +163,7 @@ def test_live_executor_exception(MockClient):
     executor, instance = _make_executor(MockClient)
     instance.create_order.side_effect = Exception("connection timeout")
 
-    result = executor.place_order(_make_signal(side="YES"), size=1.0, entry_price=0.80)
+    result = executor.place_order(_make_signal(side="YES"), size=4.0, entry_price=0.80)
 
     assert result.filled is False
     assert result.needs_reconciliation is False
@@ -161,6 +173,11 @@ def test_live_executor_exception(MockClient):
 @patch("py_clob_client.client.ClobClient", autospec=True)
 def test_live_executor_no_side_token(MockClient):
     executor, instance = _make_executor(MockClient)
+    instance.get_order_book.return_value = {
+        "bids": [{"price": "0.19", "size": "25"}],
+        "asks": [{"price": "0.21", "size": "25"}],
+        "tick_size": "0.01",
+    }
     instance.create_order.return_value = {"signed": True}
     instance.post_order.return_value = {"success": True, "orderID": "no-order", "status": "LIVE"}
 
@@ -169,6 +186,31 @@ def test_live_executor_no_side_token(MockClient):
     assert result.order_id == "no-order"
     call_args = instance.create_order.call_args[0][0]
     assert call_args.token_id == "0xNO"
+
+
+@patch("py_clob_client.client.ClobClient", autospec=True)
+def test_live_executor_uses_reversed_up_token_without_false_drift_reject(MockClient):
+    executor, instance = _make_executor(MockClient)
+    instance.get_order_book.return_value = {
+        "bids": [{"price": "0.43", "size": "25"}],
+        "asks": [{"price": "0.45", "size": "25"}],
+        "tick_size": "0.01",
+    }
+    instance.create_order.return_value = {"signed": True}
+    instance.post_order.return_value = {"success": True, "orderID": "rev-order", "status": "LIVE"}
+
+    signal = _make_signal(
+        side="YES",
+        token_ids=["0xDOWN", "0xUP"],
+        outcomes=["Down", "Up"],
+        outcome_prices=[0.56, 0.44],
+    )
+    result = executor.place_order(signal, size=4.0, entry_price=0.44)
+
+    assert result.status == "submitted"
+    assert "market moved above signal price" not in result.reason
+    call_args = instance.create_order.call_args[0][0]
+    assert call_args.token_id == "0xUP"
 
 
 @patch("py_clob_client.client.ClobClient", autospec=True)
@@ -202,7 +244,34 @@ def test_live_executor_quote_stays_below_ask(MockClient):
     instance.create_order.return_value = {"signed": True}
     instance.post_order.return_value = {"success": True, "orderID": "cap-order", "status": "LIVE"}
 
-    result = executor.place_order(_make_signal(side="YES"), size=1.0, entry_price=0.98)
+    result = executor.place_order(_make_signal(side="YES"), size=4.0, entry_price=0.98)
+
+    assert result.fill_price == 0.98
+    call_args = instance.create_order.call_args[0][0]
+    assert call_args.price == 0.98
+
+
+@patch("order_executor.RUNTIME_DATA_PLANE.market_cache.snapshot")
+@patch("py_clob_client.client.ClobClient", autospec=True)
+def test_live_executor_refreshes_broken_cached_book_before_quoting(MockClient, mock_snapshot):
+    mock_snapshot.return_value = {
+        "best_bid": 0.01,
+        "best_ask": 0.99,
+        "spread": 0.98,
+        "midpoint": 0.50,
+        "tick_size": 0.01,
+        "book_age_ms": 50.0,
+    }
+    executor, instance = _make_executor(MockClient)
+    instance.get_order_book.return_value = {
+        "bids": [{"price": "0.98", "size": "25"}],
+        "asks": [{"price": "0.99", "size": "25"}],
+        "tick_size": "0.01",
+    }
+    instance.create_order.return_value = {"signed": True}
+    instance.post_order.return_value = {"success": True, "orderID": "refresh-order", "status": "LIVE"}
+
+    result = executor.place_order(_make_signal(side="YES"), size=4.0, entry_price=0.98)
 
     assert result.fill_price == 0.98
     call_args = instance.create_order.call_args[0][0]
@@ -385,3 +454,113 @@ def test_reconcile_order_falls_back_to_get_orders(MockClient):
 
     assert result.status == "filled"
     assert result.terminal is True
+
+
+@patch("py_clob_client.client.ClobClient", autospec=True)
+def test_live_executor_redeem_condition_submits_safe_relayer_payload(MockClient):
+    funder = "0x2222222222222222222222222222222222222222"
+    executor = LiveExecutor(
+        private_key=f"0x{'11' * 32}",
+        funder=funder,
+        wallet_type="safe",
+        relayer_api_key="relayer-key",
+    )
+    executor._session = MagicMock()
+    executor._session.request.side_effect = [
+        _response({"nonce": "7"}),
+        _response(
+            {
+                "transactionID": "redeem-123",
+                "transactionHash": "",
+                "state": "STATE_NEW",
+            }
+        ),
+    ]
+
+    condition_id = "0x" + ("ab" * 32)
+    result = executor.redeem_condition(condition_id)
+
+    assert result.status == "pending"
+    assert result.transaction_id == "redeem-123"
+
+    submit_call = executor._session.request.call_args_list[1]
+    assert submit_call.args[0] == "POST"
+    assert submit_call.args[1].endswith("/submit")
+    assert submit_call.kwargs["headers"]["RELAYER_API_KEY"] == "relayer-key"
+    assert submit_call.kwargs["headers"]["RELAYER_API_KEY_ADDRESS"] == executor.signer_address
+
+    payload = submit_call.kwargs["json"]
+    assert payload["type"] == "SAFE"
+    assert payload["to"] == "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+    assert payload["proxyWallet"].lower() == funder.lower()
+    calldata = payload["data"]
+    assert calldata.startswith("0x01b7037c")
+    collateral, parent_collection, encoded_condition, index_sets = abi_decode(
+        ["address", "bytes32", "bytes32", "uint256[]"],
+        bytes.fromhex(calldata[10:]),
+    )
+    assert collateral.lower() == "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
+    assert parent_collection == b"\x00" * 32
+    assert encoded_condition.hex() == condition_id[2:]
+    assert index_sets == (1, 2)
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_status", "expected_success"),
+    [
+        ("STATE_NEW", "pending", True),
+        ("STATE_CONFIRMED", "confirmed", True),
+        ("STATE_FAILED", "failed", False),
+    ],
+)
+@patch("py_clob_client.client.ClobClient", autospec=True)
+def test_live_executor_get_redemption_status_maps_relayer_states(
+    MockClient,
+    state,
+    expected_status,
+    expected_success,
+):
+    executor = LiveExecutor(
+        private_key=f"0x{'11' * 32}",
+        funder="0x2222222222222222222222222222222222222222",
+        wallet_type="safe",
+        relayer_api_key="relayer-key",
+    )
+    executor._session = MagicMock()
+    executor._session.request.return_value = _response(
+        [
+            {
+                "transactionID": "redeem-123",
+                "transactionHash": "0xabc",
+                "state": state,
+                "errorMsg": "boom" if state == "STATE_FAILED" else "",
+            }
+        ]
+    )
+
+    result = executor.get_redemption_status("redeem-123")
+
+    assert result.status == expected_status
+    assert result.success is expected_success
+    assert result.transaction_id == "redeem-123"
+    assert result.transaction_hash == "0xabc"
+
+
+@patch("py_clob_client.client.ClobClient", autospec=True)
+def test_live_executor_size_expansion_rejected(MockClient):
+    """5-share minimum expanding a $2 order to $4.45 (>2x limit) must be rejected."""
+    executor, instance = _make_executor(MockClient)
+    instance.get_order_book.return_value = {
+        "bids": [{"price": "0.88", "size": "25"}],
+        "asks": [{"price": "0.91", "size": "25"}],
+        "tick_size": "0.01",
+    }
+
+    # size=2.0, entry_price=0.90 → limit_price=0.89, estimated_shares≈2.25
+    # 5-share floor → shares=5.0, actual_size=4.45
+    # 4.45 > 2.0 * 2.0 (LIVE_MAX_SIZE_EXPANSION) → rejected
+    result = executor.place_order(_make_signal(side="YES"), size=2.0, entry_price=0.90)
+
+    assert result.filled is False
+    assert "size expansion" in result.reason
+    assert instance.create_order.call_count == 0
