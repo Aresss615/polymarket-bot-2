@@ -4,11 +4,15 @@ import time
 from collections import Counter, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
+import json
+
+import requests
 
 from copy_trading import CopyTradingService
 from config import (
     APP_CONFIG,
     ENABLE_REALTIME_DATA_PLANE,
+    EVENTS_JSONL,
     MAX_BET,
     MAX_BETS_PER_CYCLE,
     MIN_BET,
@@ -25,7 +29,11 @@ from config import (
     TICK_INTERVAL,
     TRADING_MODE,
     Signal,
+    market_side_price,
+    market_side_token_id,
+    SECOND_CHANCE_WINDOW_SECONDS,
     Trade,
+    UpDownMarket,
 )
 from strategy_eval import evaluate_15m_mode
 from market_fetcher import fetch_active_markets, fetch_resolved_market, find_updown_markets
@@ -41,7 +49,14 @@ from price_feed import (
 )
 from order_executor import OrderExecutor, PaperExecutor
 from risk_manager import RiskManager
-from trade_logger import log_order_event, log_risk_block, log_settlement, log_signal_event, log_trade_jsonl
+from trade_logger import (
+    log_order_event,
+    log_redemption_event,
+    log_risk_block,
+    log_settlement,
+    log_signal_event,
+    log_trade_jsonl,
+)
 from runtime_data import RUNTIME_DATA_PLANE
 
 MONITOR_SIGNAL_LIMIT = 40
@@ -72,6 +87,49 @@ SIGNAL_STAGE_RANK = {
     "analysis_ready": 10,
 }
 
+_EXECUTOR_TYPES_BY_MODE = {
+    "paper": {"", "PaperExecutor"},
+    "simulation": {"SimulationExecutor"},
+    "live": {"LiveExecutor"},
+}
+_REDEMPTION_RETRY_COOLDOWN_SECONDS = 60.0
+_REDEMPTION_FINAL_STATUSES = {"confirmed", "external", "unsupported", "disabled"}
+_SHADOW_SETTLEMENT_SKIP_STAGES = {"traded", "order_live", "already_traded_skip", "active_order_skip"}
+_TERMINAL_SIGNAL_STATUSES = {"won", "lost"}
+_SIGNAL_EVENT_RESERVED_FIELDS = {"type", "timestamp", "codex_version"}
+
+
+def _history_matches_current_mode(executor_type: str) -> bool:
+    allowed = _EXECUTOR_TYPES_BY_MODE.get(TRADING_MODE, {""})
+    return (executor_type or "").strip() in allowed
+
+
+def _shadow_signal_allowed(signal: Signal) -> bool:
+    if signal.strategy_mode != STRATEGY_MODE_SHADOW:
+        return True
+    if TRADING_MODE == "simulation":
+        return True
+    return TRADING_MODE == "live" and (signal.strategy_route or "") == "high_prob_shadow"
+
+
+def _winning_side_from_resolution(resolved: dict) -> str | None:
+    outcomes = list(resolved.get("outcomes") or [])
+    prices = list(resolved.get("outcome_prices") or [])
+    if not outcomes or not prices:
+        return None
+
+    try:
+        winning_idx = prices.index(1.0)
+    except ValueError:
+        return None
+
+    winning_outcome = str(outcomes[winning_idx]).strip().upper()
+    if winning_outcome in ("UP", "YES"):
+        return "YES"
+    if winning_outcome in ("DOWN", "NO"):
+        return "NO"
+    return "YES" if winning_idx == 0 else "NO"
+
 
 class Engine:
     def __init__(self, executor: OrderExecutor | None = None, risk_manager: RiskManager | None = None):
@@ -101,6 +159,9 @@ class Engine:
         self.monitor_updated_at: datetime | None = None
         self._last_market_refresh_at: float | None = None
         self._order_token_ids: dict[str, str] = {}
+        self._retry_watches: dict[str, dict] = {}
+        self._last_execution_reason: str = ""
+        self._redemption_disabled_logged = False
         self.copy_trading_service: CopyTradingService | None = None
         if APP_CONFIG.copy_trading.enabled and APP_CONFIG.copy_trading.target_wallet:
             self.copy_trading_service = CopyTradingService(APP_CONFIG.copy_trading.target_wallet)
@@ -108,6 +169,7 @@ class Engine:
         self.risk_manager.bootstrap_from_history(self.trades, account_equity=self.account_equity)
         if self.open_orders:
             self._reconcile_open_orders()
+        self._process_redemptions(startup=True)
 
     def start_runtime_services(self) -> None:
         if not self._startup_logged:
@@ -150,8 +212,14 @@ class Engine:
     def _load_history(self):
         """Restore confirmed positions and any persisted open live orders."""
         self.balance = STARTING_BALANCE
-        self.trades = read_trades()
-        self.open_orders = read_open_orders()
+        all_trades = read_trades()
+        all_open_orders = read_open_orders()
+        self.trades = [
+            trade for trade in all_trades if _history_matches_current_mode(trade.executor_type)
+        ]
+        self.open_orders = [
+            order for order in all_open_orders if _history_matches_current_mode(order.executor_type)
+        ]
         self._order_token_ids = {
             order.order_id: order.token_id
             for order in self.open_orders
@@ -170,6 +238,12 @@ class Engine:
         if self.trades:
             self._log(
                 f"Loaded {len(self.trades)} trades ({self.wins}W/{self.losses}L), balance ${self.balance:.2f}"
+            )
+        skipped_trades = len(all_trades) - len(self.trades)
+        skipped_orders = len(all_open_orders) - len(self.open_orders)
+        if skipped_trades or skipped_orders:
+            self._log(
+                f"Ignored {skipped_trades} trades and {skipped_orders} open orders from other modes"
             )
         if self.open_orders:
             self._log(
@@ -192,6 +266,307 @@ class Engine:
         self.traded_markets.add(trade.market_slug)
         self.executed_signal_keys.add(trade.market_slug)
 
+    def _clear_retry_watch(self, market_slug: str) -> None:
+        if market_slug:
+            self._retry_watches.pop(market_slug, None)
+
+    def _prune_retry_watches(self, active_markets: list[UpDownMarket] | None = None) -> None:
+        if not self._retry_watches:
+            return
+        now = time.time()
+        active_slugs = {udm.market.slug for udm in (active_markets or [])}
+        for market_slug, watch in list(self._retry_watches.items()):
+            observed_at = float(watch.get("observed_at") or 0.0)
+            if observed_at <= 0 or (now - observed_at) > SECOND_CHANCE_WINDOW_SECONDS:
+                self._retry_watches.pop(market_slug, None)
+                continue
+            if active_slugs and market_slug not in active_slugs:
+                self._retry_watches.pop(market_slug, None)
+                continue
+            if market_slug in self.traded_markets or market_slug in self.active_order_markets:
+                self._retry_watches.pop(market_slug, None)
+
+    def _update_retry_watch(self, analysis: UpdownAnalysis) -> None:
+        market_slug = analysis.udm.market.slug
+        if not market_slug:
+            return
+        if TRADING_MODE != "live":
+            self._clear_retry_watch(market_slug)
+            return
+        if market_slug in self.traded_markets or market_slug in self.active_order_markets:
+            self._clear_retry_watch(market_slug)
+            return
+        if analysis.signal and analysis.strategy_route == "second_chance_retry":
+            self._clear_retry_watch(market_slug)
+            return
+
+        existing = self._retry_watches.get(market_slug)
+        actual_move_side = analysis.actual_move_side or ""
+        if existing and actual_move_side and existing.get("actual_move_side") != actual_move_side:
+            self._clear_retry_watch(market_slug)
+            existing = None
+
+        if (
+            analysis.signal is None
+            and analysis.strategy_route == "too_late_or_overpriced"
+            and actual_move_side in {"YES", "NO"}
+            and analysis.entry_price not in (None, 0.0)
+            and analysis.tick_size not in (None, 0.0)
+        ):
+            self._retry_watches[market_slug] = {
+                "market_slug": market_slug,
+                "actual_move_side": actual_move_side,
+                "entry_price": float(analysis.entry_price),
+                "tick_size": float(analysis.tick_size),
+                "observed_at": time.time(),
+            }
+
+    def _redemption_wallet_address(self) -> str:
+        return str(
+            getattr(self.executor, "redemption_wallet_address", "")
+            or getattr(self.executor, "funder", "")
+            or ""
+        )
+
+    @staticmethod
+    def _condition_redemption_updated_at(trades: list[Trade]) -> datetime | None:
+        timestamps = [trade.redemption_updated_at for trade in trades if trade.redemption_updated_at]
+        return max(timestamps) if timestamps else None
+
+    @staticmethod
+    def _condition_redemption_tx_id(trades: list[Trade]) -> str:
+        for trade in trades:
+            if trade.redemption_tx_id:
+                return trade.redemption_tx_id
+        return ""
+
+    @staticmethod
+    def _update_redemption_state(
+        trades: list[Trade],
+        *,
+        status: str | None = None,
+        tx_id: str | None = None,
+        tx_hash: str | None = None,
+        error: str | None = None,
+        updated_at: datetime | None = None,
+    ) -> bool:
+        changed = False
+        for trade in trades:
+            if status is not None and trade.redemption_status != status:
+                trade.redemption_status = status
+                changed = True
+            if tx_id is not None and trade.redemption_tx_id != tx_id:
+                trade.redemption_tx_id = tx_id
+                changed = True
+            if tx_hash is not None and trade.redemption_tx_hash != tx_hash:
+                trade.redemption_tx_hash = tx_hash
+                changed = True
+            if error is not None and trade.redemption_error != error:
+                trade.redemption_error = error
+                changed = True
+            if updated_at is not None and trade.redemption_updated_at != updated_at:
+                trade.redemption_updated_at = updated_at
+                changed = True
+        return changed
+
+    def _fetch_redeemable_positions(self, condition_id: str) -> list[dict] | None:
+        wallet_address = self._redemption_wallet_address()
+        if not wallet_address:
+            return None
+        response = requests.get(
+            f"{APP_CONFIG.market_data.data_api_url}/positions",
+            params={
+                "user": wallet_address,
+                "market": condition_id,
+                "redeemable": "true",
+                "sizeThreshold": "0",
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return payload if isinstance(payload, list) else []
+
+    def _process_redemptions(self, *, startup: bool = False) -> None:
+        if TRADING_MODE != "live":
+            return
+
+        winning_trades = [
+            trade
+            for trade in self.trades
+            if trade.status == "won"
+            and trade.condition_id
+            and trade.redemption_status not in _REDEMPTION_FINAL_STATUSES
+        ]
+        if not winning_trades:
+            return
+
+        wallet_type = getattr(self.executor, "wallet_type", "")
+        if wallet_type == "eoa":
+            changed = self._update_redemption_state(
+                winning_trades,
+                status="disabled",
+                error="auto-redeem is disabled for eoa wallets in v1",
+                updated_at=datetime.now(timezone.utc),
+            )
+            if changed:
+                save_trades(self.trades)
+                log_redemption_event(
+                    "disabled",
+                    "",
+                    {
+                        "trade_count": len(winning_trades),
+                        "wallet_type": wallet_type,
+                    },
+                )
+            if not self._redemption_disabled_logged:
+                self._log("Auto-redeem disabled in v1 for eoa wallets")
+                self._redemption_disabled_logged = True
+            return
+
+        if not self.executor.supports_redemption():
+            if not self._redemption_disabled_logged:
+                self._log("Auto-redeem unavailable: relayer-backed live redemption is not configured")
+                self._redemption_disabled_logged = True
+            return
+
+        changed = False
+        now = datetime.now(timezone.utc)
+        trades_by_condition: dict[str, list[Trade]] = {}
+        for trade in winning_trades:
+            trades_by_condition.setdefault(trade.condition_id, []).append(trade)
+
+        for condition_id, trades in trades_by_condition.items():
+            active_tx_id = ""
+            if any(
+                trade.redemption_status == "pending" and trade.redemption_tx_id
+                for trade in trades
+            ):
+                active_tx_id = self._condition_redemption_tx_id(trades)
+
+            if active_tx_id:
+                result = self.executor.get_redemption_status(active_tx_id)
+                changed |= self._update_redemption_state(
+                    trades,
+                    status=result.status,
+                    tx_id=result.transaction_id or active_tx_id,
+                    tx_hash=result.transaction_hash,
+                    error=result.error,
+                    updated_at=now,
+                )
+                log_redemption_event(
+                    "poll",
+                    condition_id,
+                    {
+                        "transaction_id": result.transaction_id or active_tx_id,
+                        "transaction_hash": result.transaction_hash,
+                        "status": result.status,
+                        "raw_state": result.raw_state,
+                        "error": result.error,
+                        "startup": startup,
+                    },
+                )
+                if result.status == "pending":
+                    continue
+                if result.status in _REDEMPTION_FINAL_STATUSES or result.status == "confirmed":
+                    continue
+
+            latest_update = self._condition_redemption_updated_at(trades)
+            if latest_update is not None and any(
+                trade.redemption_status == "failed" for trade in trades
+            ):
+                if (now - latest_update).total_seconds() < _REDEMPTION_RETRY_COOLDOWN_SECONDS:
+                    continue
+
+            try:
+                redeemable_positions = self._fetch_redeemable_positions(condition_id)
+            except Exception as exc:
+                changed |= self._update_redemption_state(
+                    trades,
+                    status="failed",
+                    error=str(exc),
+                    updated_at=now,
+                )
+                log_redemption_event(
+                    "positions_error",
+                    condition_id,
+                    {
+                        "error": str(exc),
+                        "startup": startup,
+                    },
+                )
+                continue
+
+            if redeemable_positions is None:
+                continue
+
+            if any(bool(position.get("negativeRisk")) for position in redeemable_positions):
+                changed |= self._update_redemption_state(
+                    trades,
+                    status="unsupported",
+                    error="negative-risk redemption is unsupported in v1",
+                    updated_at=now,
+                )
+                log_redemption_event(
+                    "unsupported",
+                    condition_id,
+                    {
+                        "reason": "negative-risk redemption is unsupported in v1",
+                        "startup": startup,
+                    },
+                )
+                continue
+
+            if not redeemable_positions:
+                changed |= self._update_redemption_state(
+                    trades,
+                    status="external",
+                    error="wallet no longer reports a redeemable position for this condition",
+                    updated_at=now,
+                )
+                log_redemption_event(
+                    "external",
+                    condition_id,
+                    {
+                        "trade_count": len(trades),
+                        "startup": startup,
+                    },
+                )
+                continue
+
+            result = self.executor.redeem_condition(condition_id)
+            changed |= self._update_redemption_state(
+                trades,
+                status=result.status,
+                tx_id=result.transaction_id,
+                tx_hash=result.transaction_hash,
+                error=result.error,
+                updated_at=now,
+            )
+            log_redemption_event(
+                "submit",
+                condition_id,
+                {
+                    "transaction_id": result.transaction_id,
+                    "transaction_hash": result.transaction_hash,
+                    "status": result.status,
+                    "raw_state": result.raw_state,
+                    "error": result.error,
+                    "startup": startup,
+                },
+            )
+            if result.status == "pending":
+                self._log(
+                    f"Redemption submitted for {condition_id} ({result.transaction_id or 'pending'})"
+                )
+            elif result.status == "confirmed":
+                self._log(f"Redemption confirmed for {condition_id}")
+            elif result.status == "failed":
+                self._log(f"Redemption failed for {condition_id}: {result.error or 'unknown error'}")
+
+        if changed:
+            save_trades(self.trades)
+
     def _set_monitor_signals(self, analyses: list[UpdownAnalysis]) -> None:
         records = [analysis.to_record() for analysis in analyses]
         records.sort(
@@ -213,6 +588,94 @@ class Engine:
                 "trading_mode": TRADING_MODE,
                 "strategy_version": STRATEGY_VERSION,
             }
+            log_signal_event(payload)
+
+    def _load_latest_signal_snapshots(self) -> dict[str, dict]:
+        if not EVENTS_JSONL.exists():
+            return {}
+
+        latest_by_id: dict[str, dict] = {}
+        with open(EVENTS_JSONL, encoding="utf-8-sig") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line or not line.startswith("{"):
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if row.get("type") != "signal_event":
+                    continue
+                signal_id = str(row.get("signal_id") or "").strip()
+                if not signal_id:
+                    continue
+                timestamp = str(row.get("timestamp") or "")
+                if not timestamp:
+                    continue
+                existing = latest_by_id.get(signal_id)
+                if existing is None or timestamp >= str(existing.get("timestamp") or ""):
+                    latest_by_id[signal_id] = row
+        return latest_by_id
+
+    def _shadow_signal_end_ts(self, signal_row: dict) -> float | None:
+        window_start_ts = signal_row.get("window_start_ts")
+        if window_start_ts in (None, ""):
+            market_slug = str(signal_row.get("market_slug") or "")
+            try:
+                window_start_ts = float(market_slug.rsplit("-", 1)[1])
+            except (IndexError, TypeError, ValueError):
+                return None
+        interval_minutes = signal_row.get("interval_minutes")
+        if interval_minutes in (None, ""):
+            return None
+        try:
+            return float(window_start_ts) + (float(interval_minutes) * 60.0)
+        except (TypeError, ValueError):
+            return None
+
+    def settle_shadow_signals(self, max_checks: int = 10) -> None:
+        now = datetime.now(timezone.utc).timestamp()
+        api_calls = 0
+
+        latest_signals = self._load_latest_signal_snapshots()
+        for signal_row in sorted(latest_signals.values(), key=lambda row: str(row.get("timestamp") or "")):
+            if api_calls >= max_checks:
+                break
+            if signal_row.get("strategy_mode") != STRATEGY_MODE_SHADOW:
+                continue
+            if signal_row.get("signal_side") not in {"YES", "NO"}:
+                continue
+            if signal_row.get("decision_stage") in _SHADOW_SETTLEMENT_SKIP_STAGES:
+                continue
+            if signal_row.get("signal_status") in _TERMINAL_SIGNAL_STATUSES:
+                continue
+
+            end_ts = self._shadow_signal_end_ts(signal_row)
+            if end_ts is None or now < end_ts + 10.0:
+                continue
+
+            market_slug = str(signal_row.get("market_slug") or "")
+            if not market_slug:
+                continue
+
+            api_calls += 1
+            resolved = fetch_resolved_market(market_slug)
+            if resolved is None:
+                continue
+
+            winning_side = _winning_side_from_resolution(resolved)
+            if winning_side not in {"YES", "NO"}:
+                continue
+
+            payload = {
+                key: value
+                for key, value in signal_row.items()
+                if key not in _SIGNAL_EVENT_RESERVED_FIELDS
+            }
+            payload["snapshot_event"] = "resolution"
+            payload["signal_status"] = "won" if signal_row.get("signal_side") == winning_side else "lost"
+            payload["resolved_side"] = winning_side
+            payload["market_yes_at_close"] = 1.0 if winning_side == "YES" else 0.0
             log_signal_event(payload)
 
     def _monitor_summary(self) -> dict:
@@ -446,12 +909,10 @@ class Engine:
 
     @staticmethod
     def _entry_price_for_signal(signal: Signal) -> float:
-        price_idx = 0 if signal.side == "YES" else 1
-        return (
-            signal.market.outcome_prices[price_idx]
-            if len(signal.market.outcome_prices) > price_idx
-            else 0.5
-        )
+        if signal.entry_price not in (None, 0.0):
+            return float(signal.entry_price)
+        selected_price = market_side_price(signal.market, signal.side)
+        return float(selected_price) if selected_price not in (None, 0.0) else 0.5
 
     def _position_size_for_signal(self, signal: Signal) -> float:
         if signal.requested_size_override not in (None, 0.0):
@@ -468,6 +929,7 @@ class Engine:
         *,
         market_slug: str,
         question: str,
+        condition_id: str,
         strategy: str,
         side: str,
         confidence: float,
@@ -493,6 +955,7 @@ class Engine:
                 timestamp=datetime.now(timezone.utc),
                 market_slug=market_slug,
                 question=question,
+                condition_id=condition_id,
                 strategy=strategy,
                 side=side,
                 entry_price=result.fill_price,
@@ -541,6 +1004,7 @@ class Engine:
                 window_open_price=result.window_open_price,
                 window_open_source=result.window_open_source,
                 window_open_price_trusted=result.window_open_price_trusted,
+                window_open_anchor_age_seconds=result.window_open_anchor_age_seconds,
                 actual_window_return=result.actual_window_return,
                 actual_move_regime=result.actual_move_regime,
                 actual_move_side=result.actual_move_side,
@@ -565,6 +1029,8 @@ class Engine:
             trade.size = total_cost
             trade.entry_price = avg_price
             trade.fill_price = avg_price
+            if condition_id and not trade.condition_id:
+                trade.condition_id = condition_id
             trade.fees += result.fees
             trade.executor_type = trade.executor_type or executor_type
             trade.edge_gross = result.edge_gross or trade.edge_gross
@@ -602,6 +1068,11 @@ class Engine:
             trade.window_open_price = result.window_open_price if result.window_open_price is not None else trade.window_open_price
             trade.window_open_source = result.window_open_source or trade.window_open_source
             trade.window_open_price_trusted = result.window_open_price_trusted or trade.window_open_price_trusted
+            trade.window_open_anchor_age_seconds = (
+                result.window_open_anchor_age_seconds
+                if result.window_open_anchor_age_seconds is not None
+                else trade.window_open_anchor_age_seconds
+            )
             trade.actual_window_return = result.actual_window_return if result.actual_window_return is not None else trade.actual_window_return
             trade.actual_move_regime = result.actual_move_regime or trade.actual_move_regime
             trade.actual_move_side = result.actual_move_side or trade.actual_move_side
@@ -628,12 +1099,7 @@ class Engine:
 
     def _create_open_order(self, signal: Signal, result) -> OpenOrder:
         now = datetime.now(timezone.utc)
-        selected_idx = 0 if signal.side == "YES" else 1
-        token_id = result.token_id or (
-            signal.market.token_ids[selected_idx]
-            if len(signal.market.token_ids) > selected_idx
-            else ""
-        )
+        token_id = result.token_id or market_side_token_id(signal.market, signal.side)
         if result.order_id and token_id:
             self._order_token_ids[result.order_id] = token_id
         return OpenOrder(
@@ -694,6 +1160,7 @@ class Engine:
             window_open_price=signal.window_open_price,
             window_open_source=signal.window_open_source,
             window_open_price_trusted=signal.window_open_price_trusted,
+            window_open_anchor_age_seconds=signal.window_open_anchor_age_seconds,
             actual_window_return=signal.actual_window_return,
             actual_move_regime=signal.actual_move_regime,
             actual_move_side=signal.actual_move_side,
@@ -719,6 +1186,7 @@ class Engine:
         Named execute_paper_trade for backwards compatibility, but routes
         through self.executor (Paper, Simulation, or Live).
         """
+        self._last_execution_reason = ""
         entry_price = self._entry_price_for_signal(signal)
         size = self._position_size_for_signal(signal)
         result = self.executor.place_order(signal, size, entry_price)
@@ -733,6 +1201,7 @@ class Engine:
             trade = self._record_trade_fill(
                 market_slug=signal.market.slug,
                 question=signal.market.question,
+                condition_id=signal.market.condition_id,
                 strategy=signal.strategy,
                 side=signal.side,
                 confidence=signal.confidence,
@@ -764,9 +1233,17 @@ class Engine:
                 },
             )
             reconciled = self._reconcile_open_orders(order_ids={open_order.order_id})
-            return reconciled[-1] if reconciled else trade
+            if reconciled:
+                return reconciled[-1]
+            if trade is None and open_order.status in {"cancelled", "rejected"}:
+                self._last_execution_reason = (
+                    open_order.cancel_reason
+                    or open_order.status
+                )
+            return trade
 
         if not result.filled:
+            self._last_execution_reason = result.reason or result.status
             self._log(f"  Order rejected: {result.reason}")
             log_order_event(
                 "reject",
@@ -824,6 +1301,7 @@ class Engine:
                     trade = self._record_trade_fill(
                         market_slug=open_order.market_slug,
                         question=open_order.question,
+                        condition_id=open_order.condition_id,
                         strategy=open_order.strategy,
                         side=open_order.side,
                         confidence=open_order.confidence,
@@ -903,13 +1381,15 @@ class Engine:
         signal_key = self._signal_key(signal)
         if signal.strategy_mode == STRATEGY_MODE_DISABLED:
             return None, "analysis_skip", "strategy disabled"
-        if signal.strategy_mode == STRATEGY_MODE_SHADOW and TRADING_MODE != "simulation":
+        if not _shadow_signal_allowed(signal):
             return None, "shadow_only", "shadow-only strategy"
         if signal_key and signal_key in self.executed_signal_keys:
             self._log(f"  Skip (already traded): {signal_key}")
+            self._clear_retry_watch(signal.market.slug)
             return None, "already_traded_skip", "already traded"
         if signal.market.slug in self.active_order_markets:
             self._log(f"  Skip (order already live): {signal.market.slug}")
+            self._clear_retry_watch(signal.market.slug)
             return None, "active_order_skip", "order already live"
         entry_price = self._entry_price_for_signal(signal)
         if signal.strategy == "arbitrage" and not APP_CONFIG.strategies.news.enabled:
@@ -924,9 +1404,6 @@ class Engine:
             if entry_price > max_entry:
                 self._log(f"  Skip (entry {entry_price:.2f} > max {max_entry:.2f})")
                 return None, "analysis_skip", f"entry {entry_price:.2f} > max {max_entry:.2f}"
-            if signal.side == "NO" and entry_price < 0.70:
-                self._log(f"  Skip (NO side low entry {entry_price:.2f})")
-                return None, "analysis_skip", f"NO side low entry {entry_price:.2f}"
         size = self._position_size_for_signal(signal)
         if self.available_balance < size:
             self._log(f"  Skip (available ${self.available_balance:.2f} < target ${size:.2f})")
@@ -945,10 +1422,16 @@ class Engine:
 
         trade = self.execute_paper_trade(signal)
         if trade:
+            self._clear_retry_watch(signal.market.slug)
             return trade, "traded", f"filled @ ${trade.entry_price:.2f}"
         if signal.market.slug in self.active_order_markets:
+            self._clear_retry_watch(signal.market.slug)
             return None, "order_live", "submitted and awaiting reconciliation"
-        return None, "order_rejected", "executor rejected or produced no fill"
+        return (
+            None,
+            "order_rejected",
+            self._last_execution_reason or "executor rejected or produced no fill",
+        )
 
     def settle_trades(self, max_checks: int = 3):
         """Settle pending trades whose markets have been resolved on Polymarket."""
@@ -969,31 +1452,22 @@ class Engine:
             resolved = fetch_resolved_market(trade.market_slug)
             if resolved is None:
                 if trade.end_date and (now - trade.end_date).total_seconds() > 600:
-                    trade.status = "lost"
-                    trade.payout = 0.0
-                    self.losses += 1
-                    self.risk_manager.record_trade_result(trade)
-                    self._log(f"LOSS (unresolved after 10m): {trade.market_slug}")
-                    log_settlement(trade)
-                    log_trade_jsonl(trade, executor_type=trade.executor_type or type(self.executor).__name__, snapshot_event="settlement")
-                    settled = True
+                    self._log(f"PENDING (still unresolved after 10m): {trade.market_slug}")
                 continue
 
-            outcomes = resolved["outcomes"]
-            prices = resolved["outcome_prices"]
-            winning_idx = prices.index(1.0)
-            winning_outcome = outcomes[winning_idx].strip().upper()
-
-            if winning_outcome in ("UP", "YES"):
-                winning_side = "YES"
-            elif winning_outcome in ("DOWN", "NO"):
-                winning_side = "NO"
-            else:
-                winning_side = "YES" if winning_idx == 0 else "NO"
+            winning_side = _winning_side_from_resolution(resolved)
+            if winning_side not in {"YES", "NO"}:
+                continue
 
             if trade.side == winning_side:
                 trade.payout = (trade.size / trade.entry_price) - trade.fees
                 trade.status = "won"
+                if TRADING_MODE == "live" and trade.condition_id:
+                    trade.redemption_status = "pending"
+                    trade.redemption_tx_id = ""
+                    trade.redemption_tx_hash = ""
+                    trade.redemption_error = ""
+                    trade.redemption_updated_at = now
                 self.balance += trade.payout
                 self.wins += 1
                 self._log(f"WIN: {trade.market_slug} +${trade.payout - trade.size:.2f}")
@@ -1022,10 +1496,17 @@ class Engine:
         mode = getattr(self, "mode_15m", None)
         extra_edge = mode.edge_boost if mode and mode.tightened else 0.0
         extra_conf = mode.confidence_boost if mode and mode.tightened else 0.0
+        self._prune_retry_watches(self.updown_markets_found)
         for udm in self.updown_markets_found:
             edge_boost = extra_edge if udm.interval_minutes == 15 else 0.0
             conf_boost = extra_conf if udm.interval_minutes == 15 else 0.0
-            analysis = analyze_updown_market_detail(udm, extra_min_edge=edge_boost)
+            retry_context = self._retry_watches.get(udm.market.slug)
+            analysis = analyze_updown_market_detail(
+                udm,
+                extra_min_edge=edge_boost,
+                retry_context=retry_context,
+            )
+            self._update_retry_watch(analysis)
             if analysis.signal and conf_boost > 0 and analysis.confidence < conf_boost:
                 analysis.reason = (
                     f"{udm.coin} skip: confidence {analysis.confidence:.0%} "
@@ -1221,6 +1702,8 @@ class Engine:
 
         self._update_trade_markouts()
         self.settle_trades()
+        self.settle_shadow_signals()
+        self._process_redemptions()
         self._log("LLM/news trading disabled; arbitrage remains research-only")
 
         remaining = set(SUPPORTED_COINS.keys()) - {udm.coin for udm in self.updown_markets_found}

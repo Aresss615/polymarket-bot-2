@@ -1,23 +1,27 @@
 from collections import defaultdict
 from concurrent.futures import Future
 from datetime import datetime, timedelta, timezone
+import json
 import time
-from unittest.mock import call, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+import trade_logger
 from config import (
     MAX_BET,
     MIN_BET,
     MAX_REFERENCE_AGE_SECONDS,
     MAX_REFERENCE_AGE_SECONDS_FALLBACK,
     NEWS_POLL_INTERVAL,
+    RiskConfig,
     STARTING_BALANCE,
     STRATEGY_VERSION,
     TICK_INTERVAL,
     Market,
     OpenOrder,
     OrderResult,
+    RedemptionResult,
     Signal,
     Trade,
     UpDownMarket,
@@ -25,19 +29,42 @@ from config import (
 from engine import Engine
 from level_analyzer import UpdownAnalysis
 from order_executor import OrderExecutor
+from risk_manager import RiskManager
 
 
 class StubExecutor(OrderExecutor):
-    def __init__(self, *, place_results=None, reconcile_results=None):
+    def __init__(
+        self,
+        *,
+        place_results=None,
+        reconcile_results=None,
+        redeem_results=None,
+        redemption_status_results=None,
+        supports_redemption=False,
+        wallet_type="safe",
+        redemption_wallet_address="0xfeed000000000000000000000000000000000000",
+    ):
         self.place_results = list(place_results or [])
         self.reconcile_results = defaultdict(list)
+        self.redeem_results = list(redeem_results or [])
+        self.redemption_status_results = defaultdict(list)
+        self.supports_redemption_flag = supports_redemption
+        self.wallet_type = wallet_type
+        self.redemption_wallet_address = redemption_wallet_address
         self.place_calls = []
+        self.redeem_calls = []
+        self.redemption_status_calls = []
 
         for order_id, results in (reconcile_results or {}).items():
             if isinstance(results, list):
                 self.reconcile_results[order_id].extend(results)
             else:
                 self.reconcile_results[order_id].append(results)
+        for transaction_id, results in (redemption_status_results or {}).items():
+            if isinstance(results, list):
+                self.redemption_status_results[transaction_id].extend(results)
+            else:
+                self.redemption_status_results[transaction_id].append(results)
 
     def place_order(self, signal: Signal, size: float, entry_price: float) -> OrderResult:
         self.place_calls.append(
@@ -54,6 +81,26 @@ class StubExecutor(OrderExecutor):
         if self.reconcile_results[open_order.order_id]:
             return self.reconcile_results[open_order.order_id].pop(0)
         return None
+
+    def supports_redemption(self) -> bool:
+        return self.supports_redemption_flag
+
+    def redeem_condition(self, condition_id: str) -> RedemptionResult:
+        self.redeem_calls.append(condition_id)
+        if self.redeem_results:
+            return self.redeem_results.pop(0)
+        return RedemptionResult(status="pending", success=True, terminal=False)
+
+    def get_redemption_status(self, transaction_id: str) -> RedemptionResult:
+        self.redemption_status_calls.append(transaction_id)
+        if self.redemption_status_results[transaction_id]:
+            return self.redemption_status_results[transaction_id].pop(0)
+        return RedemptionResult(
+            status="pending",
+            success=True,
+            transaction_id=transaction_id,
+            terminal=False,
+        )
 
 
 class PendingExecutor:
@@ -90,6 +137,7 @@ def _clean_engine():
         patch("engine.evaluate_15m_mode", return_value=default_15m),
         patch("engine.log_trade_jsonl"),
         patch("engine.log_settlement"),
+        patch("engine.log_redemption_event"),
         patch("engine.log_risk_block"),
         patch("engine.log_signal_event"),
         patch("engine.log_order_event"),
@@ -124,6 +172,17 @@ def _make_signal(market=None, strategy="updown", side="YES", confidence=0.95):
         signal_epoch_id="epoch-1",
         expected_fill_price=0.57,
         expected_cost=0.02,
+    )
+
+
+def _make_udm(market=None, *, coin="BTC", interval_minutes=5, seconds_to_close=45, up_outcome_index=0):
+    market = market or _make_market()
+    return UpDownMarket(
+        market=market,
+        coin=coin,
+        interval_minutes=interval_minutes,
+        seconds_to_close=seconds_to_close,
+        up_outcome_index=up_outcome_index,
     )
 
 
@@ -207,6 +266,22 @@ def _make_trade(**overrides):
     return Trade(**defaults)
 
 
+def _make_redemption_result(**overrides):
+    defaults = dict(
+        status="pending",
+        success=True,
+        transaction_id="redeem-123",
+        transaction_hash="0xhash",
+        error="",
+        terminal=False,
+        retryable=False,
+        raw_state="STATE_NEW",
+        raw_response={},
+    )
+    defaults.update(overrides)
+    return RedemptionResult(**defaults)
+
+
 def test_engine_initial_state():
     engine = Engine()
     assert engine.balance == STARTING_BALANCE
@@ -217,6 +292,72 @@ def test_engine_initial_state():
     assert engine.running is False
     assert engine.wins == 0
     assert engine.losses == 0
+
+
+def test_live_engine_ignores_simulation_history():
+    live_trade = _make_trade(
+        executor_type="LiveExecutor",
+        size=1.16,
+        status="won",
+        payout=2.0,
+        order_id="live-order",
+    )
+    sim_trade = _make_trade(
+        executor_type="SimulationExecutor",
+        size=5.0,
+        status="won",
+        payout=6.0,
+        order_id="sim-order",
+        market_slug="eth-updown-5m-456",
+    )
+    live_open_order = _make_open_order(
+        executor_type="LiveExecutor",
+        order_id="live-open-order",
+    )
+    sim_open_order = _make_open_order(
+        executor_type="SimulationExecutor",
+        order_id="sim-open-order",
+        market_slug="eth-updown-5m-456",
+    )
+
+    with (
+        patch("engine.TRADING_MODE", "live"),
+        patch("engine.read_trades", return_value=[live_trade, sim_trade]),
+        patch("engine.read_open_orders", return_value=[live_open_order, sim_open_order]),
+    ):
+        engine = Engine(executor=StubExecutor())
+
+    assert [trade.order_id for trade in engine.trades] == ["live-order"]
+    assert [order.order_id for order in engine.open_orders] == ["live-open-order"]
+    assert engine.balance == pytest.approx(STARTING_BALANCE - 1.16 + 2.0)
+
+
+def test_simulation_engine_ignores_live_history():
+    live_trade = _make_trade(
+        executor_type="LiveExecutor",
+        size=1.16,
+        status="won",
+        payout=2.0,
+        order_id="live-order",
+    )
+    sim_trade = _make_trade(
+        executor_type="SimulationExecutor",
+        size=5.0,
+        status="won",
+        payout=6.0,
+        order_id="sim-order",
+        market_slug="eth-updown-5m-456",
+    )
+
+    with (
+        patch("engine.TRADING_MODE", "simulation"),
+        patch("engine.read_trades", return_value=[live_trade, sim_trade]),
+        patch("engine.read_open_orders", return_value=[]),
+    ):
+        engine = Engine(executor=StubExecutor())
+
+    assert [trade.order_id for trade in engine.trades] == ["sim-order"]
+    assert engine.balance == pytest.approx(STARTING_BALANCE - 5.0 + 6.0)
 
 
 def test_execute_trade_immediate_fill_books_confirmed_position_only():
@@ -545,8 +686,9 @@ def test_reconciliation_logs_explicit_cancel_event():
 
 
 def test_restart_reconciliation_does_not_double_book_existing_fill():
-    existing_trade = _make_trade()
+    existing_trade = _make_trade(executor_type="LiveExecutor")
     existing_open_order = _make_open_order(
+        executor_type="LiveExecutor",
         reserved_size=1.74,
         confirmed_fill_size=1.16,
         confirmed_fill_shares=2.0,
@@ -576,6 +718,7 @@ def test_restart_reconciliation_does_not_double_book_existing_fill():
     )
 
     with (
+        patch("engine.TRADING_MODE", "live"),
         patch("engine.read_trades", return_value=[existing_trade]),
         patch("engine.read_open_orders", return_value=[existing_open_order]),
     ):
@@ -599,6 +742,136 @@ def test_try_execute_skips_market_with_active_open_order():
     assert stage == "active_order_skip"
     assert "live" in reason
     assert executor.place_calls == []
+
+
+def test_try_execute_surfaces_executor_rejection_reason():
+    executor = StubExecutor(
+        place_results=[
+            _make_result(
+                filled=False,
+                fill_size=0.0,
+                fill_shares=0.0,
+                order_id="",
+                status="rejected",
+                reason="market moved above signal price (0.99>0.51)",
+                requested_size=2.75,
+                requested_shares=5.0,
+                reserved_size=0.0,
+                remaining_size=0.0,
+                remaining_shares=0.0,
+                needs_reconciliation=False,
+                terminal=True,
+                raw_status="rejected",
+            )
+        ]
+    )
+    engine = Engine(
+        executor=executor,
+        risk_manager=RiskManager(
+            RiskConfig(
+                max_open_exposure=100.0,
+                max_open_exposure_pct=1.0,
+                hard_position_cap_pct=1.0,
+                max_thesis_exposure_pct=1.0,
+                max_cluster_exposure_pct=1.0,
+            )
+        ),
+    )
+
+    trade, stage, reason = engine._try_execute(_make_signal())
+
+    assert trade is None
+    assert stage == "order_rejected"
+    assert "market moved above signal price" in reason
+
+
+def test_try_execute_prefers_signal_entry_price_override():
+    executor = StubExecutor(place_results=[_make_result()])
+    engine = Engine(
+        executor=executor,
+        risk_manager=RiskManager(
+            RiskConfig(
+                max_open_exposure=100.0,
+                max_open_exposure_pct=1.0,
+                hard_position_cap_pct=1.0,
+                max_thesis_exposure_pct=1.0,
+                max_cluster_exposure_pct=1.0,
+            )
+        ),
+    )
+    signal = _make_signal()
+    signal.entry_price = 0.91
+
+    trade, stage, reason = engine._try_execute(signal)
+
+    assert trade is not None
+    assert stage == "traded"
+    assert "filled" in reason
+    assert executor.place_calls[0]["entry_price"] == pytest.approx(0.91)
+
+
+def test_try_execute_surfaces_reconciled_cancel_reason():
+    executor = StubExecutor(
+        place_results=[
+            _make_result(
+                filled=False,
+                fill_size=0.0,
+                fill_shares=0.0,
+                fill_price=0.55,
+                order_id="live-1",
+                status="submitted",
+                requested_size=2.75,
+                requested_shares=5.0,
+                reserved_size=2.75,
+                remaining_size=2.75,
+                remaining_shares=5.0,
+                needs_reconciliation=True,
+                terminal=False,
+                raw_status="live",
+            )
+        ],
+        reconcile_results={
+            "live-1": [
+                _make_result(
+                    filled=False,
+                    fill_size=0.0,
+                    fill_shares=0.0,
+                    fill_price=0.55,
+                    order_id="live-1",
+                    status="cancelled",
+                    reason="outbid_by_market>0.99",
+                    cancel_reason="outbid_by_market>0.99",
+                    requested_size=2.75,
+                    requested_shares=5.0,
+                    reserved_size=0.0,
+                    remaining_size=0.0,
+                    remaining_shares=0.0,
+                    needs_reconciliation=False,
+                    terminal=True,
+                    raw_status="live",
+                )
+            ]
+        },
+    )
+    engine = Engine(
+        executor=executor,
+        risk_manager=RiskManager(
+            RiskConfig(
+                max_open_exposure=100.0,
+                max_open_exposure_pct=1.0,
+                hard_position_cap_pct=1.0,
+                max_thesis_exposure_pct=1.0,
+                max_cluster_exposure_pct=1.0,
+            )
+        ),
+    )
+
+    trade, stage, reason = engine._try_execute(_make_signal())
+
+    assert trade is None
+    assert stage == "order_rejected"
+    assert "outbid_by_market" in reason
+    assert engine.open_orders == []
 
 
 def test_tick_reconciles_open_orders_before_new_signals():
@@ -641,7 +914,7 @@ def test_tick_reconciles_open_orders_before_new_signals():
     assert len(engine.open_orders) == 1
 
 
-def test_settlement_timeout_logs_structured_event():
+def test_settlement_timeout_leaves_trade_pending():
     executor = StubExecutor(place_results=[_make_result(order_id="fill-1")])
     market = _make_market(end_minutes=-20)
     signal = _make_signal(market)
@@ -650,23 +923,17 @@ def test_settlement_timeout_logs_structured_event():
         patch("engine.fetch_resolved_market", return_value=None),
         patch("engine.log_settlement") as mock_settlement,
         patch("engine.log_trade_jsonl") as mock_trade_jsonl,
-        patch("engine.save_trades") as mock_save,
     ):
         engine = Engine(executor=executor)
         trade = engine.execute_paper_trade(signal)
         engine.settle_trades()
 
     assert trade is not None
-    assert trade.status == "lost"
-    assert trade.payout == 0.0
-    assert engine.losses == 1
-    mock_settlement.assert_called_once_with(trade)
-    mock_trade_jsonl.assert_any_call(
-        trade,
-        executor_type="StubExecutor",
-        snapshot_event="settlement",
-    )
-    mock_save.assert_called_once()
+    assert trade.status == "pending"
+    assert engine.losses == 0
+    mock_settlement.assert_not_called()
+    settlement_calls = [c for c in mock_trade_jsonl.call_args_list if c.kwargs.get("snapshot_event") == "settlement"]
+    assert settlement_calls == []
 
 
 def test_tick_does_not_schedule_news_refresh_when_news_trading_disabled():
@@ -735,19 +1002,276 @@ def test_tick_marks_shadow_signal_without_execution():
     mock_try_execute.assert_called_once_with(signal)
 
 
+def test_retry_watch_allows_exactly_one_second_chance_retry_per_market_window():
+    engine = Engine(executor=StubExecutor())
+    market = _make_market()
+    udm = _make_udm(market=market)
+    retry_signal = _make_signal(market=market)
+    retry_signal.strategy_route = "second_chance_retry"
+    retry_signal.entry_price = 0.82
+
+    calls = {"count": 0}
+
+    def _analyze(_udm, extra_min_edge=0.0, retry_context=None):
+        del extra_min_edge
+        calls["count"] += 1
+        if calls["count"] == 1:
+            assert retry_context is None
+            return UpdownAnalysis(
+                udm=_udm,
+                signal=None,
+                reason="too late",
+                decision_stage="analysis_skip",
+                seconds_to_close=45,
+                signal_side="YES",
+                direction="BUY",
+                entry_price=0.90,
+                price_state="too_late_high_prob",
+                strategy_mode="shadow",
+                actual_move_regime="strong",
+                actual_move_side="YES",
+                strategy_route="too_late_or_overpriced",
+                tick_size=0.01,
+            )
+        if calls["count"] == 2:
+            assert retry_context is not None
+            assert retry_context["entry_price"] == pytest.approx(0.90)
+            return UpdownAnalysis(
+                udm=_udm,
+                signal=retry_signal,
+                reason="retry ready",
+                decision_stage="analysis_ready",
+                seconds_to_close=40,
+                signal_side="YES",
+                direction="BUY",
+                confidence=0.8,
+                entry_price=0.82,
+                price_state="second_chance_retry",
+                strategy_mode="live",
+                actual_move_regime="strong",
+                actual_move_side="YES",
+                strategy_route="second_chance_retry",
+                tick_size=0.01,
+            )
+        assert retry_context is None
+        return UpdownAnalysis(
+            udm=_udm,
+            signal=None,
+            reason="used already",
+            decision_stage="analysis_skip",
+            seconds_to_close=35,
+            signal_side="YES",
+            direction="BUY",
+            entry_price=0.81,
+            price_state="mid_regime_no_trade",
+            strategy_mode="live",
+            actual_move_regime="strong",
+            actual_move_side="YES",
+            strategy_route="mid_skip",
+            tick_size=0.01,
+        )
+
+    engine.updown_markets_found = [udm]
+
+    with (
+        patch("engine.TRADING_MODE", "live"),
+        patch("engine.analyze_updown_market_detail", side_effect=_analyze),
+    ):
+        first = engine.check_updown_markets()
+        second = engine.check_updown_markets()
+        third = engine.check_updown_markets()
+
+    assert first[0].signal is None
+    assert second[0].signal is retry_signal
+    assert second[0].strategy_route == "second_chance_retry"
+    assert third[0].signal is None
+    assert market.slug not in engine._retry_watches
+
+
+def test_retry_watch_expires_after_12_seconds():
+    engine = Engine(executor=StubExecutor())
+    market = _make_market()
+    udm = _make_udm(market=market)
+    engine._retry_watches[market.slug] = {
+        "market_slug": market.slug,
+        "actual_move_side": "YES",
+        "entry_price": 0.90,
+        "tick_size": 0.01,
+        "observed_at": 100.0,
+    }
+
+    with patch("engine.time.time", return_value=111.9):
+        engine._prune_retry_watches([udm])
+        assert market.slug in engine._retry_watches
+
+    with patch("engine.time.time", return_value=112.01):
+        engine._prune_retry_watches([udm])
+
+    assert market.slug not in engine._retry_watches
+
+
+@pytest.mark.parametrize(
+    ("result", "expected_stage"),
+    [
+        (_make_result(order_id="fill-1"), "traded"),
+        (
+            _make_result(
+                filled=False,
+                fill_size=0.0,
+                fill_shares=0.0,
+                fill_price=0.58,
+                order_id="live-1",
+                status="submitted",
+                requested_size=2.90,
+                requested_shares=5.0,
+                reserved_size=2.90,
+                remaining_size=2.90,
+                remaining_shares=5.0,
+                needs_reconciliation=True,
+                terminal=False,
+                raw_status="live",
+            ),
+            "order_live",
+        ),
+    ],
+)
+def test_retry_watch_clears_on_fill_or_live_order(result, expected_stage):
+    executor = StubExecutor(place_results=[result])
+    engine = Engine(
+        executor=executor,
+        risk_manager=RiskManager(
+            RiskConfig(
+                max_open_exposure=100.0,
+                max_open_exposure_pct=1.0,
+                hard_position_cap_pct=1.0,
+                max_thesis_exposure_pct=1.0,
+                max_cluster_exposure_pct=1.0,
+            )
+        ),
+    )
+    signal = _make_signal()
+    signal.strategy_mode = "live"
+    signal.strategy_route = "second_chance_retry"
+    signal.requested_size_override = 2.0
+    engine._retry_watches[signal.market.slug] = {
+        "market_slug": signal.market.slug,
+        "actual_move_side": signal.side,
+        "entry_price": 0.90,
+        "tick_size": 0.01,
+        "observed_at": time.time(),
+    }
+
+    with patch("engine.TRADING_MODE", "live"):
+        trade, stage, _ = engine._try_execute(signal)
+
+    assert stage == expected_stage
+    assert signal.market.slug not in engine._retry_watches
+    if expected_stage == "traded":
+        assert trade is not None
+
+
 def test_simulation_executes_shadow_signal():
     executor = StubExecutor(place_results=[_make_result(order_id="sim-shadow-1")])
-    engine = Engine(executor=executor)
     signal = _make_signal()
     signal.strategy_mode = "shadow"
 
     with patch("engine.TRADING_MODE", "simulation"):
+        engine = Engine(
+            executor=executor,
+            risk_manager=RiskManager(
+                RiskConfig(
+                    max_open_exposure=100.0,
+                    max_open_exposure_pct=1.0,
+                    hard_position_cap_pct=1.0,
+                    max_thesis_exposure_pct=1.0,
+                    max_cluster_exposure_pct=1.0,
+                )
+            ),
+        )
         trade, stage, reason = engine._try_execute(signal)
 
     assert trade is not None
     assert trade.order_id == "sim-shadow-1"
     assert stage == "traded"
     assert "filled" in reason
+
+
+def test_live_executes_high_prob_shadow_signal():
+    executor = StubExecutor(place_results=[_make_result(order_id="live-shadow-1")])
+    signal = _make_signal()
+    signal.strategy_mode = "shadow"
+    signal.strategy_route = "high_prob_shadow"
+
+    with patch("engine.TRADING_MODE", "live"):
+        engine = Engine(
+            executor=executor,
+            risk_manager=RiskManager(
+                RiskConfig(
+                    max_open_exposure=100.0,
+                    max_open_exposure_pct=1.0,
+                    hard_position_cap_pct=1.0,
+                    max_thesis_exposure_pct=1.0,
+                    max_cluster_exposure_pct=1.0,
+                )
+            ),
+        )
+        trade, stage, reason = engine._try_execute(signal)
+
+    assert trade is not None
+    assert trade.order_id == "live-shadow-1"
+    assert stage == "traded"
+    assert "filled" in reason
+
+
+def test_live_blocks_non_promoted_shadow_signal():
+    executor = StubExecutor(place_results=[_make_result(order_id="live-shadow-1")])
+    signal = _make_signal()
+    signal.strategy_mode = "shadow"
+    signal.strategy_route = "shadow_probe"
+
+    with patch("engine.TRADING_MODE", "live"):
+        engine = Engine(executor=executor)
+        trade, stage, reason = engine._try_execute(signal)
+
+    assert trade is None
+    assert stage == "shadow_only"
+    assert reason == "shadow-only strategy"
+    assert executor.place_calls == []
+
+
+def test_settle_shadow_signals_logs_resolution_snapshot(tmp_path):
+    events_path = tmp_path / "events.jsonl"
+    events_path.write_text(
+        (
+            '{"type":"signal_event","timestamp":"2026-04-15T00:00:00+00:00",'
+            '"signal_id":"btc-shadow-1","snapshot_event":"analysis","signal_status":"pending",'
+            '"strategy":"updown","strategy_mode":"shadow","signal_side":"YES","decision_stage":"shadow_only",'
+            '"market_slug":"btc-updown-5m-1776263700","market_type":"5m","interval_minutes":5,'
+            '"strategy_route":"mid_follow_candidate","window_start_ts":1776263700.0}\n'
+        ),
+        encoding="utf-8",
+    )
+    engine = Engine(executor=StubExecutor())
+
+    with (
+        patch("engine.EVENTS_JSONL", events_path),
+        patch.object(trade_logger, "EVENTS_JSONL", events_path),
+        patch(
+            "engine.fetch_resolved_market",
+            return_value={"outcomes": ["Yes", "No"], "outcome_prices": [1.0, 0.0]},
+        ),
+        patch("engine.log_signal_event", side_effect=trade_logger.log_signal_event),
+    ):
+        engine.settle_shadow_signals(max_checks=1)
+
+    rows = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(rows) == 2
+    resolution = rows[-1]
+    assert resolution["type"] == "signal_event"
+    assert resolution["snapshot_event"] == "resolution"
+    assert resolution["signal_status"] == "won"
+    assert resolution["resolved_side"] == "YES"
+    assert resolution["market_yes_at_close"] == 1.0
 
 
 def test_bet_size_scales_with_confidence():
@@ -845,6 +1369,8 @@ def test_warm_active_coins_falls_back_to_direct_refresh_for_stale_symbols():
     engine = Engine()
 
     with (
+        patch.object(engine.runtime_data_plane.reference_cache, "price", return_value=None),
+        patch.object(engine.runtime_data_plane.reference_cache, "age_seconds", return_value=None),
         patch("engine.get_prices_batch", return_value={}) as mock_batch,
         patch("engine.ensure_reference_recent", return_value=True) as mock_ensure,
     ):
@@ -908,3 +1434,196 @@ def test_tick_updates_monitor_state_and_emits_signal_event():
     assert engine.monitor_signals[0]["decision_stage"] == "risk_blocked"
     assert "test block" in engine.monitor_signals[0]["reason"]
     mock_signal_event.assert_called_once()
+
+
+def test_live_settlement_marks_winning_trade_redemption_pending():
+    executor = StubExecutor()
+    trade = _make_trade(
+        status="pending",
+        condition_id="0xcondition",
+        end_date=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+    engine = Engine(executor=executor)
+    engine.trades = [trade]
+
+    with (
+        patch("engine.TRADING_MODE", "live"),
+        patch(
+            "engine.fetch_resolved_market",
+            return_value={"outcomes": ["Yes", "No"], "outcome_prices": [1.0, 0.0]},
+        ),
+    ):
+        engine.settle_trades()
+
+    assert trade.status == "won"
+    assert trade.redemption_status == "pending"
+    assert trade.redemption_tx_id == ""
+    assert trade.redemption_updated_at is not None
+
+
+def test_process_redemptions_shares_single_tx_per_condition():
+    executor = StubExecutor(
+        supports_redemption=True,
+        redeem_results=[_make_redemption_result()],
+    )
+    trades = [
+        _make_trade(
+            market_slug="btc-updown-5m-1",
+            order_id="order-1",
+            status="won",
+            condition_id="0xcondition",
+            redemption_status="pending",
+        ),
+        _make_trade(
+            market_slug="btc-updown-5m-2",
+            order_id="order-2",
+            status="won",
+            condition_id="0xcondition",
+            redemption_status="pending",
+        ),
+    ]
+    engine = Engine(executor=executor)
+    engine.trades = trades
+
+    response = MagicMock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = [{"redeemable": True, "negativeRisk": False}]
+
+    with (
+        patch("engine.TRADING_MODE", "live"),
+        patch("engine.requests.get", return_value=response),
+    ):
+        engine._process_redemptions()
+
+    assert executor.redeem_calls == ["0xcondition"]
+    assert all(trade.redemption_tx_id == "redeem-123" for trade in trades)
+    assert all(trade.redemption_status == "pending" for trade in trades)
+
+
+def test_process_redemptions_polls_pending_tx_without_resubmit():
+    executor = StubExecutor(
+        supports_redemption=True,
+        redemption_status_results={
+            "redeem-123": _make_redemption_result(
+                transaction_id="redeem-123",
+                transaction_hash="0xhash",
+                raw_state="STATE_NEW",
+            )
+        },
+    )
+    trade = _make_trade(
+        status="won",
+        condition_id="0xcondition",
+        redemption_status="pending",
+        redemption_tx_id="redeem-123",
+    )
+    engine = Engine(executor=executor)
+    engine.trades = [trade]
+
+    with patch("engine.TRADING_MODE", "live"):
+        engine._process_redemptions()
+
+    assert executor.redemption_status_calls == ["redeem-123"]
+    assert executor.redeem_calls == []
+    assert trade.redemption_status == "pending"
+
+
+def test_process_redemptions_retries_after_failed_cooldown():
+    executor = StubExecutor(
+        supports_redemption=True,
+        redeem_results=[_make_redemption_result()],
+    )
+    trade = _make_trade(
+        status="won",
+        condition_id="0xcondition",
+        redemption_status="failed",
+        redemption_updated_at=datetime.now(timezone.utc) - timedelta(seconds=61),
+    )
+    engine = Engine(executor=executor)
+    engine.trades = [trade]
+
+    response = MagicMock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = [{"redeemable": True, "negativeRisk": False}]
+
+    with (
+        patch("engine.TRADING_MODE", "live"),
+        patch("engine.requests.get", return_value=response),
+    ):
+        engine._process_redemptions()
+
+    assert executor.redeem_calls == ["0xcondition"]
+    assert trade.redemption_tx_id == "redeem-123"
+    assert trade.redemption_status == "pending"
+
+
+def test_process_redemptions_marks_external_when_not_redeemable():
+    executor = StubExecutor(supports_redemption=True)
+    trade = _make_trade(
+        status="won",
+        condition_id="0xcondition",
+        redemption_status="pending",
+    )
+    engine = Engine(executor=executor)
+    engine.trades = [trade]
+
+    response = MagicMock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = []
+
+    with (
+        patch("engine.TRADING_MODE", "live"),
+        patch("engine.requests.get", return_value=response),
+    ):
+        engine._process_redemptions()
+
+    assert executor.redeem_calls == []
+    assert trade.redemption_status == "external"
+
+
+def test_process_redemptions_runs_catch_up_on_startup():
+    executor = StubExecutor(
+        supports_redemption=True,
+        redeem_results=[_make_redemption_result()],
+    )
+    trade = _make_trade(
+        status="won",
+        condition_id="0xcondition",
+        redemption_status="pending",
+        executor_type="LiveExecutor",
+    )
+
+    response = MagicMock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = [{"redeemable": True, "negativeRisk": False}]
+
+    with (
+        patch("engine.TRADING_MODE", "live"),
+        patch("engine.read_trades", return_value=[trade]),
+        patch("engine.requests.get", return_value=response),
+    ):
+        engine = Engine(executor=executor)
+
+    assert executor.redeem_calls == ["0xcondition"]
+    assert engine.trades[0].redemption_tx_id == "redeem-123"
+
+
+@pytest.mark.parametrize("mode", ["paper", "simulation"])
+def test_process_redemptions_skips_non_live_modes(mode):
+    executor = StubExecutor(
+        supports_redemption=True,
+        redeem_results=[_make_redemption_result()],
+    )
+    trade = _make_trade(
+        status="won",
+        condition_id="0xcondition",
+        redemption_status="pending",
+    )
+    engine = Engine(executor=executor)
+    engine.trades = [trade]
+
+    with patch("engine.TRADING_MODE", mode):
+        engine._process_redemptions()
+
+    assert executor.redeem_calls == []
+    assert trade.redemption_tx_id == ""
