@@ -8,3 +8,4 @@ trades.csv
 dist/
 build/
 .pytest_cache/
+.worktrees/
