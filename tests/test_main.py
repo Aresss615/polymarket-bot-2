@@ -1,6 +1,5 @@
 import sys
 from types import ModuleType
-from unittest.mock import patch, MagicMock
 
 import pytest
 
@@ -56,24 +55,14 @@ def test_build_risk_config_uses_relaxed_simulation_limits():
     assert config.max_open_exposure_pct > 1.0
 
 
-def _run_live_validation(monkeypatch, overrides: dict):
+def _setup_live_validation(monkeypatch, overrides: dict):
     import main as _main
 
     defaults = {
-        "TRADING_MODE": "live",
-        "UPDOWN_5M_STRATEGY_MODE": "live",
         "UPDOWN_15M_STRATEGY_MODE": "shadow",
-        "BTC_NO_STRATEGY_MODE": "shadow",
         "ARBITRAGE_STRATEGY_MODE": "disabled",
-        "STRUCTURAL_ARB_STRATEGY_MODE": "shadow",
-        "LIVE_MAX_BET": 5.0,
-        "LIVE_DAILY_MAX_LOSS": 6.0,
-        "LIVE_MAX_OPEN_EXPOSURE": 6.0,
-        "MAX_EXPOSURE_PER_COIN": 10.0,
         "POLYMARKET_RELAYER_URL": "https://relayer-v2.polymarket.com",
         "POLYMARKET_RELAYER_API_KEY": "",
-        "POLYMARKET_WALLET_TYPE": "eoa",
-        "LIVE_STARTING_BALANCE": 5.0,
     }
     defaults.update(overrides)
     for key, val in defaults.items():
@@ -81,52 +70,30 @@ def _run_live_validation(monkeypatch, overrides: dict):
     return _main
 
 
-def test_live_validation_passes_with_valid_config(monkeypatch, capsys):
-    _main = _run_live_validation(monkeypatch, {})
-    with patch.object(_main, "LiveExecutor", return_value=MagicMock()):
-        try:
-            _main.TRADING_MODE = "live"
-            _main.UPDOWN_15M_STRATEGY_MODE = "shadow"
-            _main.ARBITRAGE_STRATEGY_MODE = "disabled"
-            _main.POLYMARKET_RELAYER_API_KEY = ""
-            _main.POLYMARKET_RELAYER_URL = "https://relayer-v2.polymarket.com"
-            if _main.TRADING_MODE != "live":
-                sys.exit(1)
-            if _main.POLYMARKET_RELAYER_API_KEY and "polymarket.com" not in _main.POLYMARKET_RELAYER_URL:
-                sys.exit(1)
-            if _main.UPDOWN_15M_STRATEGY_MODE == "live":
-                sys.exit(1)
-            if _main.ARBITRAGE_STRATEGY_MODE == "live":
-                sys.exit(1)
-        except SystemExit:
-            raise AssertionError("Validation should not fail with valid config")
+def test_live_validation_passes_with_valid_config(monkeypatch):
+    _main = _setup_live_validation(monkeypatch, {})
+    _main._validate_live_config()
 
 
 def test_live_validation_exits_when_15m_is_live(monkeypatch):
-    _main = _run_live_validation(monkeypatch, {"UPDOWN_15M_STRATEGY_MODE": "live"})
+    _main = _setup_live_validation(monkeypatch, {"UPDOWN_15M_STRATEGY_MODE": "live"})
     with pytest.raises(SystemExit) as exc_info:
-        if _main.UPDOWN_15M_STRATEGY_MODE == "live":
-            print("ERROR: UPDOWN_15M_STRATEGY_MODE is 'live'")
-            sys.exit(1)
+        _main._validate_live_config()
     assert exc_info.value.code == 1
 
 
 def test_live_validation_exits_when_arbitrage_is_live(monkeypatch):
-    _main = _run_live_validation(monkeypatch, {"ARBITRAGE_STRATEGY_MODE": "live"})
+    _main = _setup_live_validation(monkeypatch, {"ARBITRAGE_STRATEGY_MODE": "live"})
     with pytest.raises(SystemExit) as exc_info:
-        if _main.ARBITRAGE_STRATEGY_MODE == "live":
-            print("ERROR: ARBITRAGE_STRATEGY_MODE is 'live'")
-            sys.exit(1)
+        _main._validate_live_config()
     assert exc_info.value.code == 1
 
 
 def test_live_validation_exits_when_relayer_url_wrong_and_api_key_set(monkeypatch):
-    _main = _run_live_validation(monkeypatch, {
+    _main = _setup_live_validation(monkeypatch, {
         "POLYMARKET_RELAYER_API_KEY": "some-key",
         "POLYMARKET_RELAYER_URL": "https://bad-relayer.example.com",
     })
     with pytest.raises(SystemExit) as exc_info:
-        if _main.POLYMARKET_RELAYER_API_KEY and "polymarket.com" not in _main.POLYMARKET_RELAYER_URL:
-            print("ERROR: POLYMARKET_RELAYER_URL does not contain 'polymarket.com'")
-            sys.exit(1)
+        _main._validate_live_config()
     assert exc_info.value.code == 1

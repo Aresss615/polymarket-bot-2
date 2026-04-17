@@ -45,6 +45,18 @@ from order_executor import PaperExecutor, SimulationExecutor, LiveExecutor
 from risk_manager import RiskManager
 
 
+def _validate_live_config():
+    if POLYMARKET_RELAYER_API_KEY and "polymarket.com" not in POLYMARKET_RELAYER_URL:
+        print(f"ERROR: POLYMARKET_RELAYER_URL '{POLYMARKET_RELAYER_URL}' does not contain 'polymarket.com'")
+        sys.exit(1)
+    if UPDOWN_15M_STRATEGY_MODE == "live":
+        print("ERROR: UPDOWN_15M_STRATEGY_MODE is 'live' — 15m strategy must not be promoted to live")
+        sys.exit(1)
+    if ARBITRAGE_STRATEGY_MODE == "live":
+        print("ERROR: ARBITRAGE_STRATEGY_MODE is 'live' — arbitrage strategy must not be promoted to live")
+        sys.exit(1)
+
+
 def build_risk_config(mode: str) -> RiskConfig:
     if mode == "live":
         live_defaults = RiskConfig()
@@ -110,26 +122,15 @@ def main():
         if input().strip().lower() != "yes":
             print("Aborted.")
             return
-        if TRADING_MODE != "live":
-            print(f"ERROR: TRADING_MODE is '{TRADING_MODE}', expected 'live'")
-            sys.exit(1)
         print(f"  5m={UPDOWN_5M_STRATEGY_MODE}  15m={UPDOWN_15M_STRATEGY_MODE}"
               f"  btc_no={BTC_NO_STRATEGY_MODE}  arbitrage={ARBITRAGE_STRATEGY_MODE}"
               f"  structural_arb={STRUCTURAL_ARB_STRATEGY_MODE}")
         print(f"  max_bet=${LIVE_MAX_BET}  daily_loss_limit=${LIVE_DAILY_MAX_LOSS:.2f}"
               f"  max_open_exposure=${LIVE_MAX_OPEN_EXPOSURE}"
-              f"  max_exposure_per_coin=${MAX_EXPOSURE_PER_COIN}")
+              f"  max_exposure_per_coin=${min(MAX_EXPOSURE_PER_COIN, LIVE_MAX_OPEN_EXPOSURE)}")
         print(f"  relayer_url={POLYMARKET_RELAYER_URL}  wallet_type={POLYMARKET_WALLET_TYPE}"
               f"  live_balance=${LIVE_STARTING_BALANCE}")
-        if POLYMARKET_RELAYER_API_KEY and "polymarket.com" not in POLYMARKET_RELAYER_URL:
-            print(f"ERROR: POLYMARKET_RELAYER_URL '{POLYMARKET_RELAYER_URL}' does not contain 'polymarket.com'")
-            sys.exit(1)
-        if UPDOWN_15M_STRATEGY_MODE == "live":
-            print("ERROR: UPDOWN_15M_STRATEGY_MODE is 'live' — 15m strategy must not be promoted to live")
-            sys.exit(1)
-        if ARBITRAGE_STRATEGY_MODE == "live":
-            print("ERROR: ARBITRAGE_STRATEGY_MODE is 'live' — arbitrage strategy must not be promoted to live")
-            sys.exit(1)
+        _validate_live_config()
         executor = LiveExecutor(private_key=pk, funder=funder)
         # Override bet sizing for $5 live test
         import config as _cfg
