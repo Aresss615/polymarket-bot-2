@@ -22,9 +22,102 @@ def _env_csv_set(name: str, default_csv: str = "") -> set[str]:
     return {item.strip().upper() for item in str(raw).split(",") if item.strip()}
 
 
+VALID_POLYMARKET_WALLET_TYPES = {"safe", "proxy", "eoa"}
+
+
+def default_polymarket_wallet_type(funder: str | None) -> str:
+    return "safe" if funder else "eoa"
+
+
+def normalize_polymarket_wallet_type(value: str | None) -> str:
+    wallet_type = (value or "").strip().lower()
+    return wallet_type if wallet_type in VALID_POLYMARKET_WALLET_TYPES else ""
+
+
+def resolve_polymarket_wallet_type(value: str | None, funder: str | None) -> str:
+    normalized = normalize_polymarket_wallet_type(value)
+    return normalized or default_polymarket_wallet_type(funder)
+
+
+def polymarket_wallet_signature_type(wallet_type: str) -> int:
+    resolved = resolve_polymarket_wallet_type(wallet_type, None)
+    return {
+        "eoa": 0,
+        "proxy": 1,
+        "safe": 2,
+    }[resolved]
+
+
+def polymarket_wallet_relayer_type(wallet_type: str) -> str:
+    resolved = resolve_polymarket_wallet_type(wallet_type, None)
+    return {
+        "eoa": "",
+        "proxy": "PROXY",
+        "safe": "SAFE",
+    }[resolved]
+
+
+def _normalize_market_side(side: str | None) -> str:
+    return (side or "").strip().upper()
+
+
+def market_outcome_side(label: str | None) -> str:
+    normalized = (label or "").strip().lower()
+    if not normalized:
+        return ""
+    if normalized == "yes" or normalized.startswith("yes ") or " up" in normalized or normalized.startswith("up"):
+        return "YES"
+    if normalized == "no" or normalized.startswith("no ") or " down" in normalized or normalized.startswith("down"):
+        return "NO"
+    return ""
+
+
+def market_side_outcome_index(market: "Market", side: str) -> int | None:
+    normalized_side = _normalize_market_side(side)
+    if normalized_side not in {"YES", "NO"}:
+        return None
+
+    outcomes = list(getattr(market, "outcomes", []) or [])
+    for idx, label in enumerate(outcomes):
+        if market_outcome_side(label) == normalized_side:
+            return idx
+
+    if len(outcomes) >= 2:
+        return 0 if normalized_side == "YES" else 1
+    if outcomes:
+        return 0
+
+    token_ids = list(getattr(market, "token_ids", []) or [])
+    if len(token_ids) >= 2:
+        return 0 if normalized_side == "YES" else 1
+    if token_ids:
+        return 0
+    return None
+
+
+def market_side_token_id(market: "Market", side: str) -> str:
+    index = market_side_outcome_index(market, side)
+    token_ids = list(getattr(market, "token_ids", []) or [])
+    if index is None or index >= len(token_ids):
+        return ""
+    return str(token_ids[index])
+
+
+def market_side_price(market: "Market", side: str) -> float | None:
+    index = market_side_outcome_index(market, side)
+    prices = list(getattr(market, "outcome_prices", []) or [])
+    if index is None or index >= len(prices):
+        return None
+    try:
+        return float(prices[index])
+    except (TypeError, ValueError):
+        return None
+
+
 # --- Trading Mode ---
 TRADING_MODE = os.getenv("TRADING_MODE", "paper")  # "paper", "simulation", "live"
 _LIVE_BALANCE = float(os.getenv("LIVE_BALANCE", "5.0"))
+LIVE_STARTING_BALANCE = _LIVE_BALANCE
 SIMULATION_STARTING_BALANCE = float(os.getenv("SIMULATION_STARTING_BALANCE", "10000.0"))
 PAPER_STARTING_BALANCE = float(os.getenv("PAPER_STARTING_BALANCE", "50.0"))
 MONITOR_HOST = os.getenv("MONITOR_HOST", "127.0.0.1")
@@ -42,6 +135,17 @@ POLYMARKET_USER_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
 POLYMARKET_RTDS_WS_URL = "wss://ws-live-data.polymarket.com/"
 KALSHI_WS_URL = "wss://api.elections.kalshi.com/trade-api/ws/v2"
 
+POLYMARKET_FUNDER = (os.getenv("POLYMARKET_FUNDER") or "").strip() or None
+POLYMARKET_RELAYER_API_KEY = (os.getenv("POLYMARKET_RELAYER_API_KEY") or "").strip()
+POLYMARKET_RELAYER_URL = os.getenv(
+    "POLYMARKET_RELAYER_URL",
+    "https://relayer-v2.polymarket.com",
+).rstrip("/")
+POLYMARKET_WALLET_TYPE = resolve_polymarket_wallet_type(
+    os.getenv("POLYMARKET_WALLET_TYPE"),
+    POLYMARKET_FUNDER,
+)
+
 # --- Offline Research / LLM Settings ---
 # These remain for offline research and labeling. They are intentionally disabled
 # for live trading decisions in v11.
@@ -52,7 +156,7 @@ NEWS_POLL_INTERVAL = 300  # retained for offline research tooling
 
 # --- Strategy Versioning ---
 CODEX_VERSION = "1.3"
-STRATEGY_VERSION = 13
+STRATEGY_VERSION = 14
 MIN_PATCH_TRADES_FOR_EVAL = 20
 
 # --- Strategy Modes ---
@@ -116,7 +220,7 @@ REFERENCE_RETURN_PROBABILITY_SCALE_5M = 0.006
 REFERENCE_RETURN_PROBABILITY_SCALE_15M = 0.009
 WINDOW_OPEN_TRUST_TOLERANCE_SECONDS = 2.0
 WINDOW_OPEN_DEGRADED_TOLERANCE_SECONDS = float(
-    os.getenv("WINDOW_OPEN_DEGRADED_TOLERANCE_SECONDS", "8.0")
+    os.getenv("WINDOW_OPEN_DEGRADED_TOLERANCE_SECONDS", "15.0")
 )
 ACTUAL_MOVE_STRONG_RETURN_5M = float(os.getenv("ACTUAL_MOVE_STRONG_RETURN_5M", "0.0016"))
 ACTUAL_MOVE_STRONG_RETURN_15M = 0.0050
@@ -127,11 +231,21 @@ ACTUAL_MOVE_MAX_SPREAD = 0.03
 ACTUAL_MOVE_EDGE_COST_MULTIPLE = 2.5
 ACTUAL_MOVE_CANDIDATE_MAX_PRICE = 0.78
 ACTUAL_MOVE_HIGH_PROB_UPPER = 0.90
+EARLY_MOMENTUM_MAX_ENTRY_PRICE = float(os.getenv("EARLY_MOMENTUM_MAX_ENTRY_PRICE", "0.60"))
+EARLY_MOMENTUM_MIN_BODY_RATIO = float(os.getenv("EARLY_MOMENTUM_MIN_BODY_RATIO", "0.50"))
+EARLY_MOMENTUM_EXTRA_EDGE = float(os.getenv("EARLY_MOMENTUM_EXTRA_EDGE", "0.01"))
+EARLY_MOMENTUM_NO_BOOK_EXTRA_EDGE = float(os.getenv("EARLY_MOMENTUM_NO_BOOK_EXTRA_EDGE", "0.05"))
 MID_FOLLOW_MIN_RETURN_5M = float(os.getenv("MID_FOLLOW_MIN_RETURN_5M", "0.0012"))
 MID_FOLLOW_MIN_BODY_RATIO = float(os.getenv("MID_FOLLOW_MIN_BODY_RATIO", "0.60"))
 MID_FOLLOW_MAX_SPREAD = float(os.getenv("MID_FOLLOW_MAX_SPREAD", "0.03"))
 MID_FOLLOW_MAX_BOOK_AGE_MS = float(os.getenv("MID_FOLLOW_MAX_BOOK_AGE_MS", "1500.0"))
 MID_FOLLOW_MIN_TOP_OBI = float(os.getenv("MID_FOLLOW_MIN_TOP_OBI", "0.10"))
+MID_FOLLOW_EARLY_MAX_ENTRY_PRICE = float(os.getenv("MID_FOLLOW_EARLY_MAX_ENTRY_PRICE", "0.55"))
+MID_FOLLOW_EARLY_MIN_BODY_RATIO = float(os.getenv("MID_FOLLOW_EARLY_MIN_BODY_RATIO", "0.50"))
+SECOND_CHANCE_WINDOW_SECONDS = float(os.getenv("SECOND_CHANCE_WINDOW_SECONDS", "12.0"))
+SECOND_CHANCE_IMPROVEMENT_TICKS = int(os.getenv("SECOND_CHANCE_IMPROVEMENT_TICKS", "2"))
+SECOND_CHANCE_MAX_ENTRY_PRICE = float(os.getenv("SECOND_CHANCE_MAX_ENTRY_PRICE", "0.82"))
+SECOND_CHANCE_MIN_SECONDS_TO_CLOSE = float(os.getenv("SECOND_CHANCE_MIN_SECONDS_TO_CLOSE", "35.0"))
 MIN_EDGE = 0.06
 MIN_EDGE_NEUTRAL = 0.09
 MIN_EDGE_15M_MID = 0.10
@@ -210,6 +324,7 @@ COIN_MARKOUT_BREACH_LIMIT = 3
 # --- Live Trading ---
 LIVE_MAX_BET = 5.00
 LIVE_MIN_BET = 1.00
+LIVE_MAX_SIZE_EXPANSION = float(os.getenv("LIVE_MAX_SIZE_EXPANSION", "2.0"))
 LIVE_DAILY_MAX_LOSS = 6.0
 LIVE_MAX_OPEN_EXPOSURE = 6.0
 LIVE_MAKER_POST_ONLY = True
@@ -357,6 +472,7 @@ class Signal:
     strategy_mode: str = STRATEGY_MODE_LIVE
     market_type: str = "5m"
     coin: str = ""
+    entry_price: float | None = None
     edge_gross: float = 0.0
     edge_net: float = 0.0
     reference_symbol: str = ""
@@ -393,6 +509,7 @@ class Signal:
     window_open_price: float | None = None
     window_open_source: str = ""
     window_open_price_trusted: bool = False
+    window_open_anchor_age_seconds: float | None = None
     actual_window_return: float | None = None
     actual_move_regime: str = ""
     actual_move_side: str = ""
@@ -423,6 +540,7 @@ class Trade:
     size: float
     confidence: float
     reason: str
+    condition_id: str = ""
     status: str = "pending"   # pending, won, lost
     payout: float = 0.0
     end_date: datetime | None = None
@@ -471,6 +589,7 @@ class Trade:
     window_open_price: float | None = None
     window_open_source: str = ""
     window_open_price_trusted: bool = False
+    window_open_anchor_age_seconds: float | None = None
     actual_window_return: float | None = None
     actual_move_regime: str = ""
     actual_move_side: str = ""
@@ -484,6 +603,11 @@ class Trade:
     markout_1s: float | None = None
     markout_5s: float | None = None
     markout_30s: float | None = None
+    redemption_status: str = ""
+    redemption_tx_id: str = ""
+    redemption_tx_hash: str = ""
+    redemption_error: str = ""
+    redemption_updated_at: datetime | None = None
 
 
 @dataclass
@@ -545,6 +669,7 @@ class OrderResult:
     window_open_price: float | None = None
     window_open_source: str = ""
     window_open_price_trusted: bool = False
+    window_open_anchor_age_seconds: float | None = None
     actual_window_return: float | None = None
     actual_move_regime: str = ""
     actual_move_side: str = ""
@@ -558,6 +683,19 @@ class OrderResult:
     markout_1s: float | None = None
     markout_5s: float | None = None
     markout_30s: float | None = None
+
+
+@dataclass
+class RedemptionResult:
+    status: str
+    success: bool
+    transaction_id: str = ""
+    transaction_hash: str = ""
+    error: str = ""
+    terminal: bool = True
+    retryable: bool = False
+    raw_state: str = ""
+    raw_response: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -624,6 +762,7 @@ class OpenOrder:
     window_open_price: float | None = None
     window_open_source: str = ""
     window_open_price_trusted: bool = False
+    window_open_anchor_age_seconds: float | None = None
     actual_window_return: float | None = None
     actual_move_regime: str = ""
     actual_move_side: str = ""
