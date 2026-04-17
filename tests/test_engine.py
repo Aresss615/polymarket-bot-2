@@ -1170,30 +1170,22 @@ def test_retry_watch_clears_on_fill_or_live_order(result, expected_stage):
         assert trade is not None
 
 
-def test_simulation_executes_shadow_signal():
+def test_simulation_blocks_non_promoted_shadow_signal():
+    """After shadow/live alignment: shadow signals without high_prob_shadow route
+    are blocked in simulation mode the same as in live mode."""
     executor = StubExecutor(place_results=[_make_result(order_id="sim-shadow-1")])
     signal = _make_signal()
     signal.strategy_mode = "shadow"
+    # strategy_route defaults to "" — not "high_prob_shadow"
 
     with patch("engine.TRADING_MODE", "simulation"):
-        engine = Engine(
-            executor=executor,
-            risk_manager=RiskManager(
-                RiskConfig(
-                    max_open_exposure=100.0,
-                    max_open_exposure_pct=1.0,
-                    hard_position_cap_pct=1.0,
-                    max_thesis_exposure_pct=1.0,
-                    max_cluster_exposure_pct=1.0,
-                )
-            ),
-        )
-        trade, stage, reason = engine._try_execute(signal)
+        eng = Engine(executor=executor)
+        trade, stage, reason = eng._try_execute(signal)
 
-    assert trade is not None
-    assert trade.order_id == "sim-shadow-1"
-    assert stage == "traded"
-    assert "filled" in reason
+    assert trade is None
+    assert stage == "shadow_only"
+    assert reason == "shadow-only strategy"
+    assert executor.place_calls == []
 
 
 def test_live_executes_high_prob_shadow_signal():

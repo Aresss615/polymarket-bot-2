@@ -107,9 +107,7 @@ def _history_matches_current_mode(executor_type: str) -> bool:
 def _shadow_signal_allowed(signal: Signal) -> bool:
     if signal.strategy_mode != STRATEGY_MODE_SHADOW:
         return True
-    if TRADING_MODE == "simulation":
-        return True
-    return TRADING_MODE == "live" and (signal.strategy_route or "") == "high_prob_shadow"
+    return (signal.strategy_route or "") == "high_prob_shadow"
 
 
 def _winning_side_from_resolution(resolved: dict) -> str | None:
