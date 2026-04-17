@@ -35,6 +35,7 @@ from config import (
     LIVE_MAKER_POST_ONLY,
     LIVE_MAKER_REFERENCE_REVERSAL,
     LIVE_MAX_SIZE_EXPANSION,
+    LIVE_MIN_SHARES,
     MAX_TAKER_FEE_RATE,
     OpenOrder,
     OrderResult,
@@ -1123,7 +1124,7 @@ class LiveExecutor(OrderExecutor):
                 metadata=metadata,
             )
 
-        min_shares = 5.0
+        min_shares = LIVE_MIN_SHARES
         shares = max(round(size / limit_price, 2), min_shares)
         actual_size = round(shares * limit_price, 2)
         if actual_size > size * LIVE_MAX_SIZE_EXPANSION:
