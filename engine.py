@@ -155,6 +155,7 @@ class Engine:
         self.open_orders: list[OpenOrder] = []
         self.traded_markets: set[str] = set()
         self.executed_signal_keys: set[str] = set()
+        self._clob_open_token_ids: set[str] = set()
         self.running = False
         self.status = "Initializing"
         self.activity_log: deque[str] = deque(maxlen=30)
@@ -179,6 +180,7 @@ class Engine:
             self.copy_trading_service = CopyTradingService(APP_CONFIG.copy_trading.target_wallet)
         self._load_history()
         self._reconcile_wallet_balance()
+        self._seed_clob_open_token_ids()
         self.risk_manager.bootstrap_from_history(self.trades, account_equity=self.account_equity)
         if self.open_orders:
             self._reconcile_open_orders()
@@ -279,6 +281,19 @@ class Engine:
         if self.open_orders:
             self._log(
                 f"Restored {len(self.open_orders)} open orders, ${self.reserved_open_exposure:.2f} reserved"
+            )
+
+    def _seed_clob_open_token_ids(self) -> None:
+        if TRADING_MODE != "live":
+            return
+        clob_token_ids = self.executor.get_clob_open_token_ids()
+        local_token_ids = {order.token_id for order in self.open_orders if order.token_id}
+        untracked = clob_token_ids - local_token_ids
+        if untracked:
+            self._clob_open_token_ids = untracked
+            self._log(
+                f"Seeded {len(untracked)} CLOB open token_id(s) not in open_orders.csv "
+                f"(crash-recovery guard)"
             )
 
     def _reconcile_wallet_balance(self) -> None:
@@ -1437,6 +1452,10 @@ class Engine:
             self._log(f"  Skip (order already live): {signal.market.slug}")
             self._clear_retry_watch(signal.market.slug)
             return None, "active_order_skip", "order already live"
+        signal_token_id = market_side_token_id(signal.market, signal.side)
+        if signal_token_id and signal_token_id in self._clob_open_token_ids:
+            self._log(f"  Skip (CLOB open order for token {signal_token_id[:10]}... not in CSV — crash guard)")
+            return None, "active_order_skip", "clob open order (crash recovery guard)"
         entry_price = self._entry_price_for_signal(signal)
         if signal.strategy == "arbitrage" and not APP_CONFIG.strategies.news.enabled:
             self._log("  Skip (news arbitrage disabled)")

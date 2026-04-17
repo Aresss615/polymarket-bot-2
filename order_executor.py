@@ -225,6 +225,10 @@ class OrderExecutor(ABC):
         """Return live USDC wallet balance, or None if unavailable."""
         return None
 
+    def get_clob_open_token_ids(self) -> set[str]:
+        """Return token_ids of all open orders currently on the CLOB."""
+        return set()
+
 
 class PaperExecutor(OrderExecutor):
     """Instant fill at quoted price with zero fees.
@@ -422,6 +426,17 @@ class LiveExecutor(OrderExecutor):
             return float(raw) if raw is not None else None
         except Exception:
             return None
+
+    def get_clob_open_token_ids(self) -> set[str]:
+        try:
+            orders = self._client.get_orders(self._OpenOrderParams()) or []
+            return {
+                str(o.get("asset_id") or o.get("token_id") or "")
+                for o in orders
+                if isinstance(o, dict) and (o.get("asset_id") or o.get("token_id"))
+            }
+        except Exception:
+            return set()
 
     def _relayer_headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}

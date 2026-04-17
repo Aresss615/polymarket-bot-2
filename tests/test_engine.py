@@ -1645,6 +1645,23 @@ def test_start_runtime_services_emits_session_start():
     assert "wallet_type" in data
 
 
+def test_clob_crash_recovery_guard_blocks_duplicate_order():
+    signal = _make_signal()
+    token_id = signal.market.token_ids[0]  # YES token
+    executor = StubExecutor(place_results=[_make_result()])
+
+    with (
+        patch("engine.TRADING_MODE", "live"),
+        patch.object(executor, "get_clob_open_token_ids", return_value={token_id}),
+    ):
+        engine = Engine(executor=executor)
+        trade, stage, reason = engine._try_execute(signal)
+
+    assert trade is None
+    assert stage == "active_order_skip"
+    assert "crash" in reason
+
+
 def test_wallet_balance_discrepancy_logged():
     executor = StubExecutor()
     with (
