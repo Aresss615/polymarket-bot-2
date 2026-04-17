@@ -56,11 +56,9 @@ const nodes = {
   equityValue: document.getElementById("equityValue"),
   winRateValue: document.getElementById("winRateValue"),
   riskValue: document.getElementById("riskValue"),
-  signalMatrix: document.getElementById("signalMatrix"),
+  activityLog: document.getElementById("activityLog"),
   signalList: document.getElementById("signalList"),
   recentTrades: document.getElementById("recentTrades"),
-  openOrders: document.getElementById("openOrders"),
-  activityLog: document.getElementById("activityLog"),
   filterButtons: Array.from(document.querySelectorAll(".filter-btn")),
   symbolButtons: Array.from(document.querySelectorAll(".symbol-btn")),
   liveClock: document.getElementById("liveClock"),
@@ -217,34 +215,6 @@ function renderHeader(snapshot) {
   nodes.riskValue.textContent = `${fmtMoney(snapshot.reserved_open_exposure)} / ${snapshot.open_orders_count || 0}`;
 }
 
-function renderSignalMatrix(summary = {}) {
-  const tiles = [
-    { marketType: "5m", direction: "BUY" },
-    { marketType: "5m", direction: "SELL" },
-    { marketType: "15m", direction: "BUY" },
-    { marketType: "15m", direction: "SELL" }
-  ];
-
-  nodes.signalMatrix.innerHTML = "";
-  tiles.forEach((tile) => {
-    const data = summary?.[tile.marketType]?.[tile.direction] || { count: 0, actionable: 0, best_confidence: 0 };
-    const el = document.createElement("article");
-    el.className = "matrix-tile";
-    el.innerHTML = `
-      <div class="matrix-head">
-        <div class="matrix-title ${tile.direction === "BUY" ? "dir-buy" : "dir-sell"}">${tile.marketType} ${tile.direction}</div>
-        <div class="badge ${tile.direction === "BUY" ? "buy" : "sell"}">${tile.direction}</div>
-      </div>
-      <div class="matrix-count">${data.count || 0}</div>
-      <div class="matrix-meta">
-        <span>Actionable: ${data.actionable || 0}</span>
-        <span>Best conf: ${fmtPct(data.best_confidence || 0)}</span>
-      </div>
-    `;
-    nodes.signalMatrix.appendChild(el);
-  });
-}
-
 function renderSignalBoard(signalBoard = []) {
   const rows = filteredSignals(signalBoard);
   nodes.signalList.innerHTML = "";
@@ -334,29 +304,6 @@ function renderRecentTrades(trades = []) {
   });
 }
 
-function renderOpenOrders(orders = []) {
-  nodes.openOrders.innerHTML = "";
-  if (!orders.length) {
-    nodes.openOrders.innerHTML = `<div class="empty">No open orders right now.</div>`;
-    return;
-  }
-
-  orders.forEach((order) => {
-    const card = document.createElement("article");
-    card.className = "compact-card";
-    card.innerHTML = `
-      <div class="compact-top">
-        <div class="compact-title">${order.market_slug || "Unknown market"}</div>
-        <div class="badge">${order.status || "--"}</div>
-      </div>
-      <div class="compact-sub">${order.market_type || "--"} | ${order.side || "--"} | Reserved ${fmtMoney(order.reserved_size)}</div>
-      <div class="compact-reason">${order.question || ""}</div>
-      <div class="compact-sub">Updated ${fmtTime(order.updated_at)}</div>
-    `;
-    nodes.openOrders.appendChild(card);
-  });
-}
-
 function renderActivity(lines = []) {
   nodes.activityLog.innerHTML = "";
   if (!lines.length) {
@@ -374,10 +321,8 @@ function renderActivity(lines = []) {
 
 function renderSnapshot(snapshot) {
   renderHeader(snapshot);
-  renderSignalMatrix(snapshot.signal_summary || {});
   renderSignalBoard(snapshot.signal_board || []);
   renderRecentTrades(snapshot.recent_trades || []);
-  renderOpenOrders(snapshot.open_orders || []);
   renderActivity(snapshot.recent_activity || []);
 
   if (!chartPinned) {
@@ -415,7 +360,8 @@ function updateLiveClock() {
   const hours = String(now.getHours()).padStart(2, "0");
   const minutes = String(now.getMinutes()).padStart(2, "0");
   const seconds = String(now.getSeconds()).padStart(2, "0");
-  nodes.liveClock.textContent = `${hours}:${minutes}:${seconds}`;
+  const current = `${hours}:${minutes}:${seconds}`;
+  nodes.liveClock.textContent = current;
 }
 
 function startClock() {

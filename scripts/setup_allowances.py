@@ -7,6 +7,11 @@ import os
 import sys
 
 from dotenv import load_dotenv
+from config import (
+    POLYMARKET_WALLET_TYPE,
+    polymarket_wallet_signature_type,
+    resolve_polymarket_wallet_type,
+)
 load_dotenv()
 
 pk = os.getenv("POLYMARKET_PRIVATE_KEY")
@@ -18,11 +23,15 @@ from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
 
 funder = os.getenv("POLYMARKET_FUNDER") or None
+wallet_type = resolve_polymarket_wallet_type(
+    os.getenv("POLYMARKET_WALLET_TYPE") or POLYMARKET_WALLET_TYPE,
+    funder,
+)
 client = ClobClient(
     "https://clob.polymarket.com",
     key=pk,
     chain_id=137,
-    signature_type=2 if funder else 0,
+    signature_type=polymarket_wallet_signature_type(wallet_type),
     funder=funder,
 )
 

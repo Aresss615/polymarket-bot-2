@@ -78,6 +78,7 @@ Data flow:
   - `TRADING_MODE` controls mode selection
   - `CODEX_VERSION` is currently **1.3**
   - `STRATEGY_VERSION` is currently **13**
+  - Shared helpers now map `Signal.side` to the correct outcome index, token id, and price from `market.outcomes` instead of assuming `YES=0` / `NO=1`
 
 - `main.py`
   - Chooses executor from `TRADING_MODE`
@@ -89,8 +90,11 @@ Data flow:
   - Core v13 deterministic up/down logic with actual-move-first routing
   - Uses trusted window-open anchors plus interval OHLC, interval return, late `60s` and `20s` returns, body ratio, wick imbalance
   - Routes setups into `strong`, `flat`, or `mid` actual-move regimes
-  - Strong moves follow confirmed trend or skip; 5m mid windows can emit `mid_follow_candidate` when momentum and book conditions align
-  - Emits `high_prob_shadow` shadow signals for `0.78-0.90` strong and mid-follow setups instead of promoting them to live execution
+  - Strong moves normally follow confirmed trend, but cheap high-EV strong setups can emit `trend_follow_early` before full dual-late confirmation
+  - 5m mid windows can emit `mid_follow_early` when momentum, book quality, and EV are strong enough
+  - One bounded `second_chance_retry` route can re-promote a recent `too_late_or_overpriced` live skip if price improves quickly and EV still clears stronger buffers
+  - `high_prob_shadow` still handles the generic `0.78-0.90` bucket, while the `>0.90` hard skip remains unchanged
+  - Contrarian strong-move blocks now keep `actual_move_side` in skip telemetry and preserve `legacy_signal_side` only as audit metadata
 
 - `state_cache.py`
   - Stores market-book state and reference price history
@@ -156,6 +160,7 @@ Simulation defaults are intentionally research-friendly:
 ## Actual-Move V13 Highlights
 
 - Trusted exact window-open price is required for candidate/live routing
+- Exact-open trust tolerance stays at `2.0s`, but degraded anchor fallback now allows `window_open_anchor_age_seconds <= 15.0s`
 - Strong actual-move thresholds:
   - 5m actual return: `>= 0.16%`
   - 15m actual return: `>= 0.50%`
@@ -164,8 +169,13 @@ Simulation defaults are intentionally research-friendly:
   - 15m actual return: `<= 0.12%`
 - Strong-move confirmation requires aligned `60s` and `20s` returns, `body_ratio >= 0.60`, fresh book age, and tight spread
 - Strong actual move may only follow the move direction or skip; opposite-side candidate trades are blocked by design
-- `0.78-0.90` strong-move entries are emitted as `high_prob_shadow` shadow signals
+- `trend_follow_early` allows a smaller `0.75x` live entry only when one late-return leg still agrees, `body_ratio >= 0.50`, `entry_price <= 0.60`, and EV clears a stronger `3x` cost buffer plus extra net edge
+- `mid_follow_early` applies the same tighter EV rules to cheap 5m mid-regime entries with aligned late momentum or orderbook pressure
+- `second_chance_retry` allows one live retry per market window within `12s` of a recent too-late skip when price improves by at least `2` ticks, stays `<= 0.82`, and there is still no active trade or live order
+- `0.78-0.90` generic strong-move entries are emitted as `high_prob_shadow` shadow signals unless they qualify for the bounded retry path
+- Outcome-aware token/book selection is now used consistently across analysis, expected-fill telemetry, simulation, and live preflight, including reversed outcome ordering
 - Missing trusted window-open anchor causes `missing_exact_open` skip
+- Signal-event telemetry now includes `window_open_anchor_age_seconds`
 - Confidence caps:
   - strong-trend setups cap at `0.90`
   - mixed or uncertain setups cap at `0.75`
@@ -204,6 +214,8 @@ From `.env.example` and current config:
 - 2026-04-15: Updated `ticker3` web monitor copy and badges to be mode-neutral and simulation-friendly
 - 2026-04-15: Added v13 actual-move-first routing with trusted window-open anchors, follow-or-skip strong-move logic, and dumb-loss audit reporting
 - 2026-04-16: Updated market websocket parsing for `price_change.price_changes[]`, preserved partial top-of-book updates, reconstructed sparse quotes from the opposite token book, and turned `high_prob_shadow` into executable shadow signals for simulation
+- 2026-04-16: Fixed reversed-outcome token/book selection in analysis, simulation, paper execution, and live preflight so `expected_fill_price`, drift checks, and token ids always match the selected side
+- 2026-04-16: Added `trend_follow_early`, `mid_follow_early`, and one-shot `second_chance_retry` routes, expanded degraded exact-open fallback to `15s`, and logged `window_open_anchor_age_seconds` for missing-open diagnostics
 
 ## Suggestions
 

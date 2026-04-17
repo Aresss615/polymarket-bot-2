@@ -24,6 +24,13 @@ from config import (
     MAX_BET,
     STARTING_BALANCE,
     NEWS_POLL_INTERVAL,
+    default_polymarket_wallet_type,
+    market_side_outcome_index,
+    market_side_price,
+    market_side_token_id,
+    polymarket_wallet_relayer_type,
+    polymarket_wallet_signature_type,
+    resolve_polymarket_wallet_type,
     STRATEGY_MODE_DISABLED,
     STRATEGY_MODE_LIVE,
     STRATEGY_MODE_SHADOW,
@@ -157,3 +164,40 @@ def test_constants():
     assert SUPPORTED_COINS["BTC"] == "BTC-USDT"
     assert isinstance(STRATEGY_VERSION, int)
     assert STRATEGY_VERSION >= 1
+
+
+def test_polymarket_wallet_type_resolution():
+    assert default_polymarket_wallet_type("0x123") == "safe"
+    assert default_polymarket_wallet_type(None) == "eoa"
+    assert resolve_polymarket_wallet_type("proxy", "0x123") == "proxy"
+    assert resolve_polymarket_wallet_type("", "0x123") == "safe"
+    assert resolve_polymarket_wallet_type(None, None) == "eoa"
+
+
+def test_polymarket_wallet_mappings():
+    assert polymarket_wallet_signature_type("safe") == 2
+    assert polymarket_wallet_signature_type("proxy") == 1
+    assert polymarket_wallet_signature_type("eoa") == 0
+    assert polymarket_wallet_relayer_type("safe") == "SAFE"
+    assert polymarket_wallet_relayer_type("proxy") == "PROXY"
+    assert polymarket_wallet_relayer_type("eoa") == ""
+
+
+def test_market_side_helpers_follow_outcome_order():
+    market = Market(
+        condition_id="0x1",
+        question="BTC Up or Down?",
+        slug="btc-updown-5m-1",
+        outcomes=["Down", "Up"],
+        outcome_prices=[0.44, 0.56],
+        token_ids=["0xDOWN", "0xUP"],
+        end_date=None,
+        active=True,
+    )
+
+    assert market_side_outcome_index(market, "YES") == 1
+    assert market_side_outcome_index(market, "NO") == 0
+    assert market_side_token_id(market, "YES") == "0xUP"
+    assert market_side_token_id(market, "NO") == "0xDOWN"
+    assert market_side_price(market, "YES") == 0.56
+    assert market_side_price(market, "NO") == 0.44

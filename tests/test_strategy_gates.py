@@ -1,8 +1,26 @@
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import patch, MagicMock
 
 from config import Market, Signal
 from engine import Engine
+from order_executor import OrderExecutor
+
+
+class _StubExecutor(OrderExecutor):
+    def __init__(self):
+        self.calls = []
+
+    def place_order(self, signal, size, entry_price):
+        self.calls.append(
+            {
+                "market_slug": signal.market.slug,
+                "side": signal.side,
+                "size": size,
+                "entry_price": entry_price,
+            }
+        )
+        raise AssertionError("executor should be mocked in this test")
 
 
 def _market(outcome_prices):
@@ -43,8 +61,14 @@ def test_engine_blocks_news_arbitrage_when_disabled(mock_block, mock_settlement,
 @patch("engine.log_trade_jsonl")
 @patch("engine.log_settlement")
 @patch("engine.log_risk_block")
-def test_engine_blocks_low_entry_no_side(mock_block, mock_settlement, mock_jsonl, mock_read):
-    engine = Engine()
+def test_engine_allows_low_entry_no_side_when_strategy_marks_signal_live(
+    mock_block,
+    mock_settlement,
+    mock_jsonl,
+    mock_read,
+):
+    executor = _StubExecutor()
+    engine = Engine(executor=executor)
     signal = Signal(
         market=_market([0.45, 0.55]),
         strategy="updown",
@@ -54,8 +78,20 @@ def test_engine_blocks_low_entry_no_side(mock_block, mock_settlement, mock_jsonl
         bucket="no_mean_reversion",
     )
 
-    trade, stage, reason = engine._try_execute(signal)
-    assert trade is None
-    assert stage == "analysis_skip"
-    assert "low entry" in reason
+    sentinel_trade = SimpleNamespace(entry_price=0.55)
+    with (
+        patch.object(engine, "_position_size_for_signal", return_value=0.5),
+        patch.object(
+            engine.risk_manager,
+            "check_trade_allowed",
+            return_value=MagicMock(allowed=True, reason=""),
+        ),
+        patch.object(engine, "execute_paper_trade", return_value=sentinel_trade) as mock_execute,
+    ):
+        trade, stage, reason = engine._try_execute(signal)
+
+    assert trade is sentinel_trade
+    assert stage == "traded"
+    assert "filled @" in reason
+    mock_execute.assert_called_once_with(signal)
 

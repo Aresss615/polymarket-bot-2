@@ -50,14 +50,15 @@ COINGECKO_IDS = {
 }
 
 _CG_ID_TO_COIN = {v: k for k, v in COINGECKO_IDS.items()}
+CRYPTOCOMPARE_API_URL = "https://min-api.cryptocompare.com/data"
 
 # Legacy price history used by tests and the analyzer.
 _price_history: dict[str, list[tuple[float, float]]] = {}
 _HISTORY_WINDOW = 180
 
 # Source failure tracking: skip sources that repeatedly fail
-_source_failures: dict[str, int] = {"okx": 0, "bybit": 0, "coingecko": 0}
-_source_disabled_until: dict[str, float] = {"okx": 0, "bybit": 0, "coingecko": 0}
+_source_failures: dict[str, int] = {"okx": 0, "bybit": 0, "cryptocompare": 0, "coingecko": 0}
+_source_disabled_until: dict[str, float] = {"okx": 0, "bybit": 0, "cryptocompare": 0, "coingecko": 0}
 _SOURCE_FAIL_THRESHOLD = 3
 _SOURCE_RETRY_INTERVAL = 300
 
@@ -134,6 +135,27 @@ def get_price_coingecko(coin: str) -> float | None:
         return None
 
 
+def get_price_cryptocompare(coin: str) -> float | None:
+    if not _is_source_available("cryptocompare"):
+        return None
+    try:
+        resp = _session.get(
+            f"{CRYPTOCOMPARE_API_URL}/price",
+            params={"fsym": coin.upper(), "tsyms": "USD"},
+            timeout=3,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        price = payload.get("USD")
+        if price in (None, ""):
+            raise ValueError(f"missing USD price for {coin}")
+        _record_source_success("cryptocompare")
+        return float(price)
+    except Exception:
+        _record_source_failure("cryptocompare")
+        return None
+
+
 def _record_price(coin: str, price: float, *, source: str = "poll", chainlink: bool = False) -> None:
     now = time.time()
     if not chainlink:
@@ -163,36 +185,51 @@ def inject_reference_price(
 
 
 def get_prices_batch(coins: set[str]) -> dict[str, float]:
-    """Fetch prices for multiple coins in a single CoinGecko API call."""
+    """Fetch prices for multiple coins, preferring low-friction batch APIs."""
     normalized_coins = {coin.upper() for coin in coins}
-    cg_ids = [COINGECKO_IDS[coin] for coin in normalized_coins if coin in COINGECKO_IDS]
-    if not cg_ids:
-        result = {}
-        for coin in normalized_coins:
-            price = get_price(coin)
-            if price is not None:
-                result[coin] = price
-        return result
-
     result: dict[str, float] = {}
+
     try:
         resp = _session.get(
-            "https://api.coingecko.com/api/v3/simple/price",
-            params={"ids": ",".join(cg_ids), "vs_currencies": "usd"},
+            f"{CRYPTOCOMPARE_API_URL}/pricemulti",
+            params={"fsyms": ",".join(sorted(normalized_coins)), "tsyms": "USD"},
             timeout=5,
         )
         resp.raise_for_status()
         data = resp.json()
-        _record_source_success("coingecko")
-
-        for cg_id, price_data in data.items():
-            coin = _CG_ID_TO_COIN.get(cg_id)
-            if coin and "usd" in price_data:
-                price = float(price_data["usd"])
-                _record_price(coin, price, source="coingecko_batch")
-                result[coin] = price
+        for symbol, price_data in data.items():
+            price = (price_data or {}).get("USD") if isinstance(price_data, dict) else None
+            if price in (None, ""):
+                continue
+            coin = str(symbol).upper()
+            _record_price(coin, float(price), source="cryptocompare_batch")
+            result[coin] = float(price)
+        if result:
+            _record_source_success("cryptocompare")
     except Exception:
-        _record_source_failure("coingecko")
+        _record_source_failure("cryptocompare")
+
+    missing = normalized_coins.difference(result)
+    cg_ids = [COINGECKO_IDS[coin] for coin in missing if coin in COINGECKO_IDS]
+    if cg_ids:
+        try:
+            resp = _session.get(
+                "https://api.coingecko.com/api/v3/simple/price",
+                params={"ids": ",".join(cg_ids), "vs_currencies": "usd"},
+                timeout=5,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            _record_source_success("coingecko")
+
+            for cg_id, price_data in data.items():
+                coin = _CG_ID_TO_COIN.get(cg_id)
+                if coin and "usd" in price_data:
+                    price = float(price_data["usd"])
+                    _record_price(coin, price, source="coingecko_batch")
+                    result[coin] = price
+        except Exception:
+            _record_source_failure("coingecko")
 
     missing = normalized_coins.difference(result)
     for coin in missing:
@@ -203,7 +240,7 @@ def get_prices_batch(coins: set[str]) -> dict[str, float]:
 
 
 def get_price(coin: str) -> float | None:
-    """Get current price. Tries OKX -> Bybit -> CoinGecko, skipping dead sources."""
+    """Get current price. Tries OKX -> Bybit -> CryptoCompare -> CoinGecko."""
     coin = coin.upper()
     symbol = SUPPORTED_COINS.get(coin)
     if symbol:
@@ -215,6 +252,10 @@ def get_price(coin: str) -> float | None:
         if price is not None:
             _record_price(coin, price, source="bybit")
             return price
+    price = get_price_cryptocompare(coin)
+    if price is not None:
+        _record_price(coin, price, source="cryptocompare")
+        return price
     price = get_price_coingecko(coin)
     if price is not None:
         _record_price(coin, price, source="coingecko")

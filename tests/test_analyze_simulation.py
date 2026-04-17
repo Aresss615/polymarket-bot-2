@@ -1,8 +1,10 @@
 from analyze_simulation import (
+    build_signal_state,
     build_dumb_loss_audit,
     build_promotion_report,
     build_trade_state,
     summarize_actual_move,
+    summarize_shadow_signals,
 )
 
 
@@ -143,3 +145,78 @@ def test_actual_move_summary_and_dumb_loss_audit_track_contrarian_cases():
     assert audit["trades_against_actual_move"] == 1
     assert audit["strong_move_disagreements"] == 1
     assert audit["legacy_contrarian_strong_move_examples"] == 1
+
+
+def test_build_signal_state_prefers_latest_resolution_snapshot():
+    events = [
+        {
+            "type": "signal_event",
+            "timestamp": "2026-04-15T00:00:00+00:00",
+            "signal_id": "sig-1",
+            "signal_side": "YES",
+            "strategy_mode": "shadow",
+            "signal_status": "pending",
+            "snapshot_event": "analysis",
+        },
+        {
+            "type": "signal_event",
+            "timestamp": "2026-04-15T00:06:00+00:00",
+            "signal_id": "sig-1",
+            "signal_side": "YES",
+            "strategy_mode": "shadow",
+            "signal_status": "won",
+            "resolved_side": "YES",
+            "snapshot_event": "resolution",
+        },
+    ]
+
+    latest = build_signal_state(events)
+
+    assert len(latest) == 1
+    assert latest[0]["signal_status"] == "won"
+    assert latest[0]["resolved_side"] == "YES"
+
+
+def test_shadow_summary_uses_resolved_signal_snapshots():
+    events = [
+        {
+            "type": "signal_event",
+            "timestamp": "2026-04-15T00:00:00+00:00",
+            "signal_id": "sig-1",
+            "strategy_mode": "shadow",
+            "signal_side": "YES",
+            "decision_stage": "shadow_only",
+            "strategy_route": "mid_follow_candidate",
+            "signal_status": "pending",
+        },
+        {
+            "type": "signal_event",
+            "timestamp": "2026-04-15T00:06:00+00:00",
+            "signal_id": "sig-1",
+            "strategy_mode": "shadow",
+            "signal_side": "YES",
+            "decision_stage": "shadow_only",
+            "strategy_route": "mid_follow_candidate",
+            "signal_status": "won",
+            "resolved_side": "YES",
+        },
+        {
+            "type": "signal_event",
+            "timestamp": "2026-04-15T00:01:00+00:00",
+            "signal_id": "sig-2",
+            "strategy_mode": "shadow",
+            "signal_side": "NO",
+            "decision_stage": "cycle_limit_skip",
+            "strategy_route": "high_prob_shadow",
+            "signal_status": "lost",
+            "resolved_side": "YES",
+        },
+    ]
+
+    summary = summarize_shadow_signals(events)
+
+    assert summary["tracked"] == 2
+    assert summary["settled"] == 2
+    assert summary["wins"] == 1
+    assert summary["losses"] == 1
+    assert summary["by_route"]["mid_follow_candidate"]["signals"] == 1

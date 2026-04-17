@@ -12,6 +12,7 @@ from price_feed import (
     get_price_age,
     get_prices_batch,
     get_price_bybit,
+    get_price_cryptocompare,
     get_price_coingecko,
     get_price_momentum,
     get_price_okx,
@@ -49,6 +50,13 @@ def _mock_coingecko_response(coin_id: str, price: float):
     resp = MagicMock()
     resp.raise_for_status = MagicMock()
     resp.json.return_value = {coin_id: {"usd": price}}
+    return resp
+
+
+def _mock_cryptocompare_response(symbol: str, price: float):
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.json.return_value = {"USD": price}
     return resp
 
 
@@ -100,13 +108,32 @@ def test_get_price_coingecko_unknown_coin():
     assert get_price_coingecko("FAKECOIN") is None
 
 
+@patch("price_feed._session.get")
+def test_get_price_cryptocompare_success(mock_get):
+    mock_get.return_value = _mock_cryptocompare_response("BTC", 84500.0)
+
+    price = get_price_cryptocompare("BTC")
+
+    assert price == 84500.0
+
+
+@patch("price_feed._session.get")
+def test_get_price_cryptocompare_failure(mock_get):
+    mock_get.side_effect = Exception("timeout")
+    price = get_price_cryptocompare("BTC")
+    assert price is None
+
+
 @patch("price_feed.get_price")
 @patch("price_feed._session.get")
 def test_get_prices_batch_falls_back_to_direct_fetch_for_missing_coins(mock_get, mock_direct):
-    resp = MagicMock()
-    resp.raise_for_status = MagicMock()
-    resp.json.return_value = {"bitcoin": {"usd": 84500.0}}
-    mock_get.return_value = resp
+    cryptocompare_resp = MagicMock()
+    cryptocompare_resp.raise_for_status = MagicMock()
+    cryptocompare_resp.json.return_value = {"BTC": {"USD": 84500.0}}
+    coingecko_resp = MagicMock()
+    coingecko_resp.raise_for_status = MagicMock()
+    coingecko_resp.json.return_value = {}
+    mock_get.side_effect = [cryptocompare_resp, coingecko_resp]
     mock_direct.return_value = 2300.0
 
     result = get_prices_batch({"BTC", "ETH"})
@@ -132,22 +159,38 @@ def test_get_price_falls_back_to_bybit(mock_okx, mock_bybit):
     assert price == 84500.5
 
 
-@patch("price_feed.get_price_coingecko")
+@patch("price_feed.get_price_cryptocompare")
 @patch("price_feed.get_price_bybit")
 @patch("price_feed.get_price_okx")
-def test_get_price_falls_back_to_coingecko(mock_okx, mock_bybit, mock_cg):
+def test_get_price_falls_back_to_cryptocompare(mock_okx, mock_bybit, mock_cc):
     mock_okx.return_value = None
     mock_bybit.return_value = None
+    mock_cc.return_value = 84250.0
+    price = get_price("BTC")
+    assert price == 84250.0
+
+
+@patch("price_feed.get_price_coingecko")
+@patch("price_feed.get_price_cryptocompare")
+@patch("price_feed.get_price_bybit")
+@patch("price_feed.get_price_okx")
+def test_get_price_falls_back_to_coingecko(mock_okx, mock_bybit, mock_cc, mock_cg):
+    mock_okx.return_value = None
+    mock_bybit.return_value = None
+    mock_cc.return_value = None
     mock_cg.return_value = 84000.0
     price = get_price("BTC")
     assert price == 84000.0
 
 
+@patch("price_feed.get_price_cryptocompare")
 @patch("price_feed.get_price_okx")
-def test_get_price_unsupported_coin(mock_okx):
+def test_get_price_unsupported_coin(mock_okx, mock_cc):
+    mock_cc.return_value = None
     price = get_price("FAKECOIN")
     assert price is None
     mock_okx.assert_not_called()
+    mock_cc.assert_called_once_with("FAKECOIN")
 
 
 # --- Momentum tests ---
@@ -159,6 +202,7 @@ def test_get_price_momentum_no_history():
     # Mock get_price to return None so no new data is added
     with patch("price_feed.get_price_okx", return_value=None), \
          patch("price_feed.get_price_bybit", return_value=None), \
+         patch("price_feed.get_price_cryptocompare", return_value=None), \
          patch("price_feed.get_price_coingecko", return_value=None):
         result = get_price_momentum("NOSUCHCOIN")
     assert result is None
@@ -176,6 +220,7 @@ def test_get_price_momentum_with_history():
     # Mock get_price to add a current price
     with patch("price_feed.get_price_okx", return_value=None), \
          patch("price_feed.get_price_bybit", return_value=None), \
+         patch("price_feed.get_price_cryptocompare", return_value=None), \
          patch("price_feed.get_price_coingecko", return_value=None):
         # Manually add current price since mock returns None
         _price_history["TEST"].append((now, 103.0))

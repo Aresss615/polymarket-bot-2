@@ -160,6 +160,40 @@ def build_trade_state(trades: list[dict], events: list[dict]) -> list[dict]:
     return sorted(latest_by_key.values(), key=lambda row: row["timestamp"])
 
 
+def _signal_key(event: dict) -> tuple[str, str]:
+    signal_id = event.get("signal_id")
+    if signal_id:
+        return ("signal", str(signal_id))
+    return (
+        "legacy_signal",
+        "|".join(
+            [
+                str(event.get("timestamp") or ""),
+                str(event.get("market_slug") or ""),
+                str(event.get("strategy_mode") or ""),
+                str(event.get("signal_side") or ""),
+                str(event.get("strategy_route") or ""),
+            ]
+        ),
+    )
+
+
+def build_signal_state(events: list[dict]) -> list[dict]:
+    signal_events = sorted(
+        [event for event in events if event.get("type") == "signal_event"],
+        key=lambda row: str(row.get("timestamp") or ""),
+    )
+    latest_by_key: dict[tuple[str, str], dict] = {}
+    for event in signal_events:
+        key = _signal_key(event)
+        existing = latest_by_key.get(key)
+        event_ts = str(event.get("timestamp") or "")
+        existing_ts = str(existing.get("timestamp") or "") if existing is not None else ""
+        if existing is None or event_ts >= existing_ts:
+            latest_by_key[key] = dict(event)
+    return sorted(latest_by_key.values(), key=lambda row: str(row.get("timestamp") or ""))
+
+
 def _trade_pnl(trade: dict) -> float | None:
     status = trade.get("status")
     if status == "won":
@@ -221,7 +255,7 @@ def _performance_breakdown(rows: list[dict], field: str) -> dict[str, dict[str, 
 
 
 def summarize_actual_move(latest_trades: list[dict], events: list[dict]) -> dict:
-    signal_events = [event for event in events if event.get("type") == "signal_event"]
+    signal_events = build_signal_state(events)
     contrarian_events = [event for event in signal_events if event.get("contrarian_block_reason")]
     strong_up_legacy_no = sum(
         1
@@ -265,7 +299,7 @@ def build_dumb_loss_audit(latest_trades: list[dict], events: list[dict]) -> dict
     strong_disagreements = [
         trade for trade in disagreement_trades if trade.get("actual_move_regime") == "strong"
     ]
-    signal_events = [event for event in events if event.get("type") == "signal_event"]
+    signal_events = build_signal_state(events)
     legacy_contrarian_examples = [
         event
         for event in signal_events
@@ -278,6 +312,37 @@ def build_dumb_loss_audit(latest_trades: list[dict], events: list[dict]) -> dict
         "strong_move_disagreements": len(strong_disagreements),
         "strong_move_disagreement_pnl": sum(_trade_pnl(trade) or 0.0 for trade in strong_disagreements),
         "legacy_contrarian_strong_move_examples": len(legacy_contrarian_examples),
+    }
+
+
+def summarize_shadow_signals(events: list[dict]) -> dict:
+    signal_rows = build_signal_state(events)
+    tracked_shadow = [
+        row
+        for row in signal_rows
+        if row.get("strategy_mode") == "shadow"
+        and row.get("signal_side") in {"YES", "NO"}
+        and row.get("decision_stage") not in {"traded", "order_live", "already_traded_skip", "active_order_skip"}
+    ]
+    settled_shadow = [row for row in tracked_shadow if row.get("signal_status") in {"won", "lost"}]
+    wins = sum(1 for row in settled_shadow if row.get("signal_status") == "won")
+
+    by_route: dict[str, dict[str, float | int | None]] = {}
+    for route in sorted({str(row.get("strategy_route") or "unclassified") for row in settled_shadow}):
+        route_rows = [row for row in settled_shadow if str(row.get("strategy_route") or "unclassified") == route]
+        route_wins = sum(1 for row in route_rows if row.get("signal_status") == "won")
+        by_route[route] = {
+            "signals": len(route_rows),
+            "win_rate": (route_wins / len(route_rows)) if route_rows else None,
+        }
+
+    return {
+        "tracked": len(tracked_shadow),
+        "settled": len(settled_shadow),
+        "wins": wins,
+        "losses": len(settled_shadow) - wins,
+        "win_rate": (wins / len(settled_shadow)) if settled_shadow else None,
+        "by_route": by_route,
     }
 
 
@@ -448,6 +513,7 @@ def analyze():
     latest_trades = build_trade_state(trades, events)
     promotion = build_promotion_report(trades, latest_trades, events)
     actual_move_summary = summarize_actual_move(latest_trades, events)
+    shadow_summary = summarize_shadow_signals(events)
     dumb_loss_audit = build_dumb_loss_audit(latest_trades, events)
     settled = [t for t in latest_trades if t.get("status") in ("won", "lost")]
     wins = [t for t in settled if t["status"] == "won"]
@@ -563,6 +629,23 @@ def analyze():
             print(
                 f"{route:<24} {stats['trades']:>6} "
                 f"{(win_rate if win_rate is not None else 0.0):>5.0%} {stats['pnl']:>+9.2f}"
+            )
+        print()
+
+    if shadow_summary["tracked"]:
+        print("--- Shadow Decisions ---")
+        print(f"Tracked:           {shadow_summary['tracked']}")
+        print(f"Settled:           {shadow_summary['settled']}")
+        print(f"Wins/Losses:       {shadow_summary['wins']}W / {shadow_summary['losses']}L")
+        if shadow_summary["win_rate"] is not None:
+            print(f"Win rate:          {shadow_summary['win_rate']:.1%}")
+        else:
+            print("Win rate:          N/A")
+        for route, stats in shadow_summary["by_route"].items():
+            win_rate = stats["win_rate"]
+            print(
+                f"  {route}: {stats['signals']} signals"
+                f"{f', {win_rate:.1%} WR' if win_rate is not None else ''}"
             )
         print()
 

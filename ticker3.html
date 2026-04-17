@@ -10,21 +10,13 @@
   <div class="shell">
     <div class="column left-column">
       <section class="panel header-panel">
-        <div class="hero">
-          <div>
-            <div class="eyebrow">Trading Ops Dashboard</div>
-            <div class="title">Polymarket Bot Monitor</div>
-            <div class="subtitle">
-              A tighter one-screen command center for the bot itself. The chart stage, recent fills,
-              signal filters, and account pulse all stay visible at once so you do not need to zoom out
-              or keep scrolling to understand what the engine is doing in paper, simulation, or live mode.
-            </div>
-          </div>
+        <div class="hero compact-hero">
+          <div class="title compact-title">Polymarket Bot Monitor</div>
           <div class="live-clock" id="liveClock">00:00:00</div>
         </div>
 
         <div class="status-strip">
-          <div id="feedStatus" class="chip warn">Connecting</div>
+          <div id="feedStatus" class="chip warn">Idle</div>
           <div class="chip">Mode<strong id="modeValue">--</strong></div>
           <div class="chip">Tick<strong id="tickValue">0</strong></div>
           <div class="chip">15m<strong id="mode15mValue">waiting</strong></div>
@@ -36,7 +28,6 @@
         <div class="section-head">
           <div>
             <div class="section-title">Market Theater</div>
-            <div class="section-subtitle">Bigger chart focus, larger timeframe controls, and recent trades that are easier to read.</div>
           </div>
           <div class="timeframe-toggle">
             <button class="timeframe-btn active" id="timeframeBtn5m" data-timeframe="5" type="button">5 Minute</button>
@@ -73,9 +64,7 @@
             <div class="subsection-head">
               <div>
                 <div class="section-title">Recent Trades</div>
-                <div class="section-subtitle">Latest fills and settlements, with larger cards and faster scanability across every execution mode.</div>
               </div>
-              <div class="chip">Trade tape</div>
             </div>
             <div id="recentTrades" class="trade-grid"></div>
           </div>
@@ -87,37 +76,45 @@
       <section class="panel status-panel">
         <div class="section-head">
           <div>
-            <div class="section-title">Account Pulse</div>
-            <div class="section-subtitle">Capital, risk, and interval-level pressure at a glance for research and production runs.</div>
+            <div class="section-title">System View</div>
           </div>
-          <div class="chip">System view</div>
         </div>
 
-        <div class="status-content">
-          <div class="stats">
-            <div class="stat">
+        <div class="status-content compact-status-content">
+          <div class="stats compact-stats money-stats">
+            <div class="stat compact-stat">
               <div class="stat-label">Balance</div>
               <div id="balanceValue" class="stat-value">$0.00</div>
             </div>
-            <div class="stat">
+            <div class="stat compact-stat">
               <div class="stat-label">Available</div>
               <div id="availableValue" class="stat-value">$0.00</div>
             </div>
-            <div class="stat">
+            <div class="stat compact-stat">
               <div class="stat-label">Equity</div>
               <div id="equityValue" class="stat-value">$0.00</div>
             </div>
-            <div class="stat">
+            <div class="stat compact-stat">
               <div class="stat-label">Win Rate</div>
               <div id="winRateValue" class="stat-value">0%</div>
             </div>
-            <div class="stat">
+            <div class="stat compact-stat">
               <div class="stat-label">Open Risk</div>
               <div id="riskValue" class="stat-value">$0.00</div>
             </div>
           </div>
+        </div>
+      </section>
 
-          <div id="signalMatrix" class="signal-matrix"></div>
+      <section class="panel activity-panel">
+        <div class="section-head">
+          <div>
+            <div class="section-title">Activity Log</div>
+          </div>
+        </div>
+
+        <div class="activity-panel-body">
+          <div id="activityLog" class="activity compact-activity"></div>
         </div>
       </section>
 
@@ -125,7 +122,6 @@
         <div class="section-head">
           <div>
             <div class="section-title">Signal Board</div>
-            <div class="section-subtitle">Filtered engine calls, order pressure, and monitor chatter.</div>
           </div>
           <div class="filters">
             <button class="filter-btn active" data-filter="actionable" data-value="true" type="button">Actionable</button>
@@ -141,24 +137,6 @@
 
         <div class="ops-body">
           <div id="signalList" class="signal-list"></div>
-
-          <div class="mini-grid">
-            <section class="mini-card">
-              <div class="subsection-head">
-                <div class="section-title">Open Orders</div>
-                <div class="chip">Open exposure</div>
-              </div>
-              <div id="openOrders" class="compact-list"></div>
-            </section>
-
-            <section class="mini-card">
-              <div class="subsection-head">
-                <div class="section-title">Activity Log</div>
-                <div class="chip">Engine log</div>
-              </div>
-              <div id="activityLog" class="activity"></div>
-            </section>
-          </div>
         </div>
       </section>
     </div>

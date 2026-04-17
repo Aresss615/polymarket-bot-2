@@ -32,6 +32,7 @@ def log_trade_jsonl(
         "timestamp": trade.timestamp.isoformat(),
         "market_slug": trade.market_slug,
         "question": trade.question,
+        "condition_id": trade.condition_id,
         "strategy": trade.strategy,
         "strategy_mode": trade.strategy_mode,
         "side": trade.side,
@@ -50,6 +51,15 @@ def log_trade_jsonl(
         "session_id": trade.session_id,
         "bucket": trade.bucket,
         "expected_value": trade.expected_value,
+        "redemption_status": trade.redemption_status,
+        "redemption_tx_id": trade.redemption_tx_id,
+        "redemption_tx_hash": trade.redemption_tx_hash,
+        "redemption_error": trade.redemption_error,
+        "redemption_updated_at": (
+            trade.redemption_updated_at.isoformat()
+            if trade.redemption_updated_at
+            else ""
+        ),
         "order_id": trade.order_id,
         "executor_type": trade.executor_type or executor_type,
         "edge_gross": trade.edge_gross,
@@ -86,6 +96,7 @@ def log_trade_jsonl(
         "window_open_price": trade.window_open_price,
         "window_open_source": trade.window_open_source,
         "window_open_price_trusted": trade.window_open_price_trusted,
+        "window_open_anchor_age_seconds": trade.window_open_anchor_age_seconds,
         "actual_window_return": trade.actual_window_return,
         "actual_move_regime": trade.actual_move_regime,
         "actual_move_side": trade.actual_move_side,
@@ -154,6 +165,7 @@ def log_trade_jsonl(
             "window_open_price": order_result.window_open_price,
             "window_open_source": order_result.window_open_source,
             "window_open_price_trusted": order_result.window_open_price_trusted,
+            "window_open_anchor_age_seconds": order_result.window_open_anchor_age_seconds,
             "actual_window_return": order_result.actual_window_return,
             "actual_move_regime": order_result.actual_move_regime,
             "actual_move_side": order_result.actual_move_side,
@@ -189,6 +201,7 @@ def log_settlement(trade: Trade) -> None:
         {
             "order_id": trade.order_id,
             "market_slug": trade.market_slug,
+            "condition_id": trade.condition_id,
             "side": trade.side,
             "status": trade.status,
             "entry_price": trade.entry_price,
@@ -207,6 +220,18 @@ def log_settlement(trade: Trade) -> None:
             "trend_alignment": trade.trend_alignment,
             "market_yes_at_close": trade.market_yes_at_close,
             "pnl": trade.payout - trade.size if trade.status == "won" else -trade.size,
+        },
+    )
+
+
+def log_redemption_event(event_name: str, condition_id: str, data: dict) -> None:
+    """Log redemption lifecycle events for relayer-backed settlement."""
+    log_event(
+        "redemption_event",
+        {
+            "event": event_name,
+            "condition_id": condition_id,
+            **data,
         },
     )
 

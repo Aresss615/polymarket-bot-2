@@ -59,6 +59,7 @@ CSV_FIELDS = [
     "window_open_price",
     "window_open_source",
     "window_open_price_trusted",
+    "window_open_anchor_age_seconds",
     "actual_window_return",
     "actual_move_regime",
     "actual_move_side",
@@ -76,6 +77,12 @@ CSV_FIELDS = [
     "session_id",
     "bucket",
     "expected_value",
+    "condition_id",
+    "redemption_status",
+    "redemption_tx_id",
+    "redemption_tx_hash",
+    "redemption_error",
+    "redemption_updated_at",
 ]
 
 OPEN_ORDER_FIELDS = [
@@ -139,6 +146,7 @@ OPEN_ORDER_FIELDS = [
     "window_open_price",
     "window_open_source",
     "window_open_price_trusted",
+    "window_open_anchor_age_seconds",
     "actual_window_return",
     "actual_move_regime",
     "actual_move_side",
@@ -276,6 +284,7 @@ def _trade_to_row(trade: Trade) -> list[str]:
         _float_or_blank(trade.window_open_price),
         trade.window_open_source,
         str(trade.window_open_price_trusted),
+        _float_or_blank(trade.window_open_anchor_age_seconds),
         _float_or_blank(trade.actual_window_return),
         trade.actual_move_regime,
         trade.actual_move_side,
@@ -293,6 +302,12 @@ def _trade_to_row(trade: Trade) -> list[str]:
         trade.session_id,
         trade.bucket,
         _float_or_blank(trade.expected_value),
+        trade.condition_id,
+        trade.redemption_status,
+        trade.redemption_tx_id,
+        trade.redemption_tx_hash,
+        trade.redemption_error,
+        _iso_or_blank(trade.redemption_updated_at),
     ]
 
 
@@ -335,6 +350,7 @@ def read_trades(path: Path = TRADES_CSV) -> list[Trade]:
                 size=_safe_float(row.get("size")),
                 confidence=_safe_float(row.get("confidence")),
                 reason=row.get("reason", ""),
+                condition_id=row.get("condition_id", ""),
                 status=row.get("status", "pending"),
                 payout=_safe_float(row.get("payout")),
                 end_date=_safe_datetime(row.get("end_date")),
@@ -467,6 +483,11 @@ def read_trades(path: Path = TRADES_CSV) -> list[Trade]:
                 ),
                 window_open_source=row.get("window_open_source", ""),
                 window_open_price_trusted=str(row.get("window_open_price_trusted", "")).strip().lower() == "true",
+                window_open_anchor_age_seconds=(
+                    _safe_float(row.get("window_open_anchor_age_seconds"))
+                    if row.get("window_open_anchor_age_seconds") not in (None, "")
+                    else None
+                ),
                 actual_window_return=(
                     _safe_float(row.get("actual_window_return"))
                     if row.get("actual_window_return") not in (None, "")
@@ -516,6 +537,11 @@ def read_trades(path: Path = TRADES_CSV) -> list[Trade]:
                     if row.get("markout_30s") not in (None, "")
                     else None
                 ),
+                redemption_status=row.get("redemption_status", ""),
+                redemption_tx_id=row.get("redemption_tx_id", ""),
+                redemption_tx_hash=row.get("redemption_tx_hash", ""),
+                redemption_error=row.get("redemption_error", ""),
+                redemption_updated_at=_safe_datetime(row.get("redemption_updated_at")),
             )
         )
     return trades
@@ -583,6 +609,7 @@ def _open_order_to_row(order: OpenOrder) -> list[str]:
         _float_or_blank(order.window_open_price),
         order.window_open_source,
         str(order.window_open_price_trusted),
+        _float_or_blank(order.window_open_anchor_age_seconds),
         _float_or_blank(order.actual_window_return),
         order.actual_move_regime,
         order.actual_move_side,
@@ -767,6 +794,11 @@ def read_open_orders(path: Path = OPEN_ORDERS_CSV) -> list[OpenOrder]:
                 ),
                 window_open_source=row.get("window_open_source", ""),
                 window_open_price_trusted=str(row.get("window_open_price_trusted", "")).strip().lower() == "true",
+                window_open_anchor_age_seconds=(
+                    _safe_float(row.get("window_open_anchor_age_seconds"))
+                    if row.get("window_open_anchor_age_seconds") not in (None, "")
+                    else None
+                ),
                 actual_window_return=(
                     _safe_float(row.get("actual_window_return"))
                     if row.get("actual_window_return") not in (None, "")

@@ -9,6 +9,7 @@ from config import (
     LIVE_MAX_BET,
     LIVE_MAX_OPEN_EXPOSURE,
     LIVE_MIN_BET,
+    LIVE_STARTING_BALANCE,
     MAX_EXPOSURE_PER_COIN,
     RiskConfig,
     SIMULATION_DAILY_MAX_LOSS,
@@ -38,10 +39,23 @@ from risk_manager import RiskManager
 
 def build_risk_config(mode: str) -> RiskConfig:
     if mode == "live":
+        live_defaults = RiskConfig()
+        # Keep live percentage limits large enough to permit at least one
+        # minimum-sized order on small bankrolls.
+        live_floor_pct = min(1.0, LIVE_MIN_BET / max(LIVE_STARTING_BALANCE, LIVE_MIN_BET))
         return RiskConfig(
             daily_max_loss=LIVE_DAILY_MAX_LOSS,
             max_open_exposure=LIVE_MAX_OPEN_EXPOSURE,
             max_exposure_per_coin=min(MAX_EXPOSURE_PER_COIN, LIVE_MAX_OPEN_EXPOSURE),
+            target_position_pct=max(live_defaults.target_position_pct, live_floor_pct),
+            hard_position_cap_pct=max(live_defaults.hard_position_cap_pct, live_floor_pct),
+            max_open_exposure_pct=max(live_defaults.max_open_exposure_pct, live_floor_pct),
+            daily_realized_loss_limit_pct=max(
+                live_defaults.daily_realized_loss_limit_pct,
+                live_floor_pct,
+            ),
+            max_thesis_exposure_pct=max(live_defaults.max_thesis_exposure_pct, live_floor_pct),
+            max_cluster_exposure_pct=max(live_defaults.max_cluster_exposure_pct, live_floor_pct),
         )
     if mode == "simulation":
         return RiskConfig(

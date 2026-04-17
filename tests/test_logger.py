@@ -102,8 +102,14 @@ def test_read_trades_roundtrip(tmp_csv):
     original = _make_trade(
         status="won",
         payout=16.67,
+        condition_id="0xcondition",
         order_id="order-abc",
         executor_type="LiveExecutor",
+        redemption_status="pending",
+        redemption_tx_id="redeem-123",
+        redemption_tx_hash="0xhash",
+        redemption_error="",
+        redemption_updated_at=datetime(2026, 4, 10, 12, 6, tzinfo=timezone.utc),
     )
     log_trade(original, tmp_csv)
     trades = read_trades(tmp_csv)
@@ -115,8 +121,13 @@ def test_read_trades_roundtrip(tmp_csv):
     assert trades[0].status == "won"
     assert abs(trades[0].payout - 16.67) < 0.01
     assert trades[0].end_date == original.end_date
+    assert trades[0].condition_id == "0xcondition"
     assert trades[0].order_id == "order-abc"
     assert trades[0].executor_type == "LiveExecutor"
+    assert trades[0].redemption_status == "pending"
+    assert trades[0].redemption_tx_id == "redeem-123"
+    assert trades[0].redemption_tx_hash == "0xhash"
+    assert trades[0].redemption_updated_at == datetime(2026, 4, 10, 12, 6, tzinfo=timezone.utc)
 
 
 def test_csv_fields_match_trade():
@@ -133,8 +144,14 @@ def test_read_trades_legacy_csv_without_end_date(tmp_csv):
     trades = read_trades(tmp_csv)
     assert len(trades) == 1
     assert trades[0].end_date is None
+    assert trades[0].condition_id == ""
     assert trades[0].order_id == ""
     assert trades[0].executor_type == ""
+    assert trades[0].redemption_status == ""
+    assert trades[0].redemption_tx_id == ""
+    assert trades[0].redemption_tx_hash == ""
+    assert trades[0].redemption_error == ""
+    assert trades[0].redemption_updated_at is None
 
 
 def test_read_trades_cp1252_fallback(tmp_csv):
