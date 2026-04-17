@@ -30,11 +30,19 @@ from config import (
     CRYPTO_NEAR_CERTAIN_UPPER,
     CRYPTO_SHADOW_ONLY_LOWER,
     CRYPTO_SHADOW_ONLY_UPPER,
+    EARLY_MOMENTUM_EXTRA_EDGE,
+    EARLY_MOMENTUM_NO_BOOK_EXTRA_EDGE,
+    EARLY_MOMENTUM_MAX_ENTRY_PRICE,
+    EARLY_MOMENTUM_MIN_BODY_RATIO,
     EXTREME_PRICE_SIZE_CAP_MULTIPLIER,
     LIVE_CONFIDENCE_CAP,
     LIVE_MAKER_MAX_SPREAD,
     MAX_TAKER_FEE_RATE,
+    market_side_outcome_index,
+    market_side_token_id,
     MID_FOLLOW_MAX_BOOK_AGE_MS,
+    MID_FOLLOW_EARLY_MAX_ENTRY_PRICE,
+    MID_FOLLOW_EARLY_MIN_BODY_RATIO,
     MID_FOLLOW_MAX_SPREAD,
     MID_FOLLOW_MIN_BODY_RATIO,
     MID_FOLLOW_MIN_RETURN_5M,
@@ -50,6 +58,10 @@ from config import (
     REFERENCE_PRICE_NEUTRAL_BAND,
     REFERENCE_RETURN_PROBABILITY_SCALE_15M,
     REFERENCE_RETURN_PROBABILITY_SCALE_5M,
+    SECOND_CHANCE_IMPROVEMENT_TICKS,
+    SECOND_CHANCE_MAX_ENTRY_PRICE,
+    SECOND_CHANCE_MIN_SECONDS_TO_CLOSE,
+    SECOND_CHANCE_WINDOW_SECONDS,
     SLIPPAGE_BUDGET,
     SHADOW_ONLY_COINS,
     STRATEGY_MODE_DISABLED,
@@ -145,6 +157,8 @@ class UpdownAnalysis:
     best_bid: float | None = None
     best_ask: float | None = None
     spread: float | None = None
+    book_age_ms: float | None = None
+    tick_size: float | None = None
     decision_latency_ms: float = 0.0
     thesis_id: str = ""
     selected_side_probability: float | None = None
@@ -172,6 +186,7 @@ class UpdownAnalysis:
     window_open_price: float | None = None
     window_open_source: str = ""
     window_open_price_trusted: bool = False
+    window_open_anchor_age_seconds: float | None = None
     actual_window_return: float | None = None
     actual_move_regime: str = ""
     actual_move_side: str = ""
@@ -180,6 +195,21 @@ class UpdownAnalysis:
     def to_record(self) -> dict:
         market = self.udm.market
         up_price, down_price = _up_down_prices(self.udm)
+        signal_id = _signal_id(
+            self.udm,
+            strategy_mode=self.strategy_mode,
+            signal_side=self.signal_side,
+            strategy_route=self.strategy_route,
+        )
+        signal_status = (
+            "pending"
+            if (
+                signal_id
+                and self.strategy_mode == STRATEGY_MODE_SHADOW
+                and self.decision_stage not in {"traded", "order_live"}
+            )
+            else ""
+        )
         return {
             "strategy": "updown",
             "strategy_mode": self.strategy_mode,
@@ -194,6 +224,10 @@ class UpdownAnalysis:
             "confidence": round(self.confidence, 4),
             "decision_stage": self.decision_stage,
             "reason": self.reason,
+            "signal_id": signal_id,
+            "snapshot_event": "analysis",
+            "signal_status": signal_status,
+            "resolved_side": "",
             "implied_up_prob": _round_or_none(self.implied_up_prob),
             "model_up_prob": _round_or_none(self.model_up_prob),
             "selected_side_probability": _round_or_none(self.selected_side_probability),
@@ -210,6 +244,8 @@ class UpdownAnalysis:
             "best_bid": _round_or_none(self.best_bid),
             "best_ask": _round_or_none(self.best_ask),
             "spread": _round_or_none(self.spread),
+            "book_age_ms": _round_or_none(self.book_age_ms, digits=3),
+            "tick_size": _round_or_none(self.tick_size),
             "decision_latency_ms": _round_or_none(self.decision_latency_ms),
             "thesis_id": self.thesis_id,
             "up_price": _round_or_none(up_price),
@@ -238,6 +274,7 @@ class UpdownAnalysis:
             "window_open_price": _round_or_none(self.window_open_price),
             "window_open_source": self.window_open_source,
             "window_open_price_trusted": self.window_open_price_trusted,
+            "window_open_anchor_age_seconds": _round_or_none(self.window_open_anchor_age_seconds),
             "actual_window_return": _round_or_none(self.actual_window_return),
             "actual_move_regime": self.actual_move_regime,
             "actual_move_side": self.actual_move_side,
@@ -267,6 +304,19 @@ def _trade_direction(signal_side: str, up_outcome_index: int) -> str:
     return "BUY" if predicts_up else "SELL"
 
 
+def _signal_id(
+    udm: UpDownMarket,
+    *,
+    strategy_mode: str,
+    signal_side: str,
+    strategy_route: str,
+) -> str:
+    if signal_side not in {"YES", "NO"}:
+        return ""
+    route = strategy_route or "default"
+    return f"{udm.market.slug}|{strategy_mode}|{signal_side}|{route}"
+
+
 def _build_analysis(
     udm: UpDownMarket,
     *,
@@ -292,6 +342,8 @@ def _build_analysis(
     best_bid: float | None = None,
     best_ask: float | None = None,
     spread: float | None = None,
+    book_age_ms: float | None = None,
+    tick_size: float | None = None,
     decision_latency_ms: float = 0.0,
     thesis_id: str = "",
     selected_side_probability: float | None = None,
@@ -319,6 +371,7 @@ def _build_analysis(
     window_open_price: float | None = None,
     window_open_source: str = "",
     window_open_price_trusted: bool = False,
+    window_open_anchor_age_seconds: float | None = None,
     actual_window_return: float | None = None,
     actual_move_regime: str = "",
     actual_move_side: str = "",
@@ -349,6 +402,8 @@ def _build_analysis(
         best_bid=best_bid,
         best_ask=best_ask,
         spread=spread,
+        book_age_ms=book_age_ms,
+        tick_size=tick_size,
         decision_latency_ms=decision_latency_ms,
         thesis_id=thesis_id,
         selected_side_probability=selected_side_probability,
@@ -376,6 +431,7 @@ def _build_analysis(
         window_open_price=window_open_price,
         window_open_source=window_open_source,
         window_open_price_trusted=window_open_price_trusted,
+        window_open_anchor_age_seconds=window_open_anchor_age_seconds,
         actual_window_return=actual_window_return,
         actual_move_regime=actual_move_regime,
         actual_move_side=actual_move_side,
@@ -481,16 +537,17 @@ def _actual_move_regime(actual_window_return: float | None, interval_minutes: in
 def _book_snapshot_for_side(market, side: str) -> dict:
     if not side or not market.token_ids:
         return {}
-    selected_index = 0 if side == "YES" else 1
-    if selected_index >= len(market.token_ids):
+    selected_index = market_side_outcome_index(market, side)
+    if selected_index is None or selected_index >= len(market.token_ids):
         return {}
     selected_token = market.token_ids[selected_index]
     snapshot = dict(MARKET_CACHE.snapshot(selected_token))
     if len(market.token_ids) < 2:
         return snapshot
 
-    opposite_index = 1 - selected_index
-    if opposite_index >= len(market.token_ids):
+    opposite_side = "NO" if side == "YES" else "YES"
+    opposite_index = market_side_outcome_index(market, opposite_side)
+    if opposite_index is None or opposite_index >= len(market.token_ids):
         return snapshot
     opposite_snapshot = MARKET_CACHE.snapshot(market.token_ids[opposite_index])
     if not opposite_snapshot:
@@ -500,11 +557,45 @@ def _book_snapshot_for_side(market, side: str) -> dict:
     best_ask = snapshot.get("best_ask")
     opposite_best_bid = opposite_snapshot.get("best_bid")
     opposite_best_ask = opposite_snapshot.get("best_ask")
+    implied_best_bid = None
+    implied_best_ask = None
 
-    if best_bid is None and opposite_best_ask is not None:
-        best_bid = _clamp(1.0 - opposite_best_ask, 0.0, 1.0)
-    if best_ask is None and opposite_best_bid is not None:
-        best_ask = _clamp(1.0 - opposite_best_bid, 0.0, 1.0)
+    if opposite_best_ask is not None:
+        implied_best_bid = _clamp(1.0 - opposite_best_ask, 0.0, 1.0)
+    if opposite_best_bid is not None:
+        implied_best_ask = _clamp(1.0 - opposite_best_bid, 0.0, 1.0)
+
+    if best_bid is None and implied_best_bid is not None:
+        best_bid = implied_best_bid
+    if best_ask is None and implied_best_ask is not None:
+        best_ask = implied_best_ask
+
+    tick_size = snapshot.get("tick_size") or opposite_snapshot.get("tick_size") or 0.01
+    direct_spread = (
+        max(best_ask - best_bid, 0.0)
+        if best_bid is not None and best_ask is not None
+        else None
+    )
+    implied_spread = (
+        max(implied_best_ask - implied_best_bid, 0.0)
+        if implied_best_bid is not None and implied_best_ask is not None
+        else None
+    )
+    max_reasonable_spread = max(LIVE_MAKER_MAX_SPREAD, tick_size * 4.0)
+    if (
+        implied_spread is not None
+        and implied_best_bid is not None
+        and implied_best_ask is not None
+        and (
+            direct_spread is None
+            or (
+                direct_spread > max_reasonable_spread * 2.0
+                and implied_spread <= max_reasonable_spread
+            )
+        )
+    ):
+        best_bid = implied_best_bid
+        best_ask = implied_best_ask
 
     snapshot["best_bid"] = best_bid
     snapshot["best_ask"] = best_ask
@@ -533,6 +624,99 @@ def _book_snapshot_for_side(market, side: str) -> dict:
     if opposite_snapshot.get("resolved"):
         snapshot["resolved"] = True
     return snapshot
+
+
+def _book_is_tradeable(
+    market_state: dict,
+    *,
+    max_book_age_ms: float,
+    max_spread: float,
+) -> bool:
+    best_bid = market_state.get("best_bid")
+    best_ask = market_state.get("best_ask")
+    spread = market_state.get("spread")
+    book_age_ms = market_state.get("book_age_ms")
+    return (
+        best_bid is not None
+        and best_ask is not None
+        and spread is not None
+        and spread <= max_spread
+        and book_age_ms is not None
+        and book_age_ms <= max_book_age_ms
+    )
+
+
+def _retry_route_eligible(
+    *,
+    retry_context: dict | None,
+    market_slug: str,
+    actual_move_side: str,
+    actual_seconds: float,
+    entry_price: float,
+    tick_size: float | None,
+    edge_gross: float,
+    edge_net: float,
+    min_edge: float,
+    expected_cost: float,
+) -> bool:
+    if not retry_context or actual_move_side not in {"YES", "NO"}:
+        return False
+    if retry_context.get("market_slug") != market_slug:
+        return False
+    if retry_context.get("actual_move_side") != actual_move_side:
+        return False
+    observed_at = retry_context.get("observed_at")
+    if observed_at is None or (time.time() - float(observed_at)) > SECOND_CHANCE_WINDOW_SECONDS:
+        return False
+    prior_entry_price = retry_context.get("entry_price")
+    if prior_entry_price in (None, 0.0):
+        return False
+    watched_tick_size = retry_context.get("tick_size")
+    effective_tick_size = (
+        float(watched_tick_size)
+        if watched_tick_size not in (None, 0.0)
+        else float(tick_size)
+        if tick_size not in (None, 0.0)
+        else 0.0
+    )
+    if effective_tick_size <= 0:
+        return False
+    if actual_seconds < SECOND_CHANCE_MIN_SECONDS_TO_CLOSE:
+        return False
+    if entry_price > SECOND_CHANCE_MAX_ENTRY_PRICE:
+        return False
+    if (float(prior_entry_price) - entry_price) + 1e-9 < (SECOND_CHANCE_IMPROVEMENT_TICKS * effective_tick_size):
+        return False
+    if edge_gross < expected_cost * 3.0:
+        return False
+    if edge_net < (min_edge + EARLY_MOMENTUM_EXTRA_EDGE):
+        return False
+    return True
+
+
+def _book_midpoint_entry_price(
+    market_state: dict,
+    *,
+    fallback_price: float,
+    max_book_age_ms: float,
+    max_spread: float,
+) -> float:
+    best_bid = market_state.get("best_bid")
+    best_ask = market_state.get("best_ask")
+    midpoint = market_state.get("midpoint")
+    spread = market_state.get("spread")
+    book_age_ms = market_state.get("book_age_ms")
+    if (
+        best_bid is None
+        or best_ask is None
+        or midpoint is None
+        or spread is None
+        or book_age_ms is None
+    ):
+        return fallback_price
+    if book_age_ms > max_book_age_ms or spread > max_spread:
+        return fallback_price
+    return _clamp(midpoint, 0.0, 1.0)
 
 
 def _book_pressure_aligns(side: str, market_state: dict) -> bool:
@@ -844,6 +1028,7 @@ def _analyze_actual_move_first(
     thesis_id: str,
     extra_min_edge: float,
     t0: float,
+    retry_context: dict | None = None,
 ) -> UpdownAnalysis:
     coin = udm.coin
     market = udm.market
@@ -935,6 +1120,8 @@ def _analyze_actual_move_first(
             best_bid=best_bid,
             best_ask=best_ask,
             spread=spread,
+            book_age_ms=book_age_ms,
+            tick_size=tick_size,
             decision_latency_ms=(time.time() - t0) * 1000,
             thesis_id=thesis_id,
             selected_side_probability=selected_side_probability,
@@ -957,6 +1144,7 @@ def _analyze_actual_move_first(
             window_open_price=window_open_price,
             window_open_source=window_open_source,
             window_open_price_trusted=window_open_price_trusted,
+            window_open_anchor_age_seconds=window_open_anchor_age_seconds,
             actual_window_return=actual_window_return,
             actual_move_regime=actual_move_regime,
             actual_move_side=actual_move_side,
@@ -1052,35 +1240,42 @@ def _analyze_actual_move_first(
             override_mode=STRATEGY_MODE_SHADOW,
         )
     if actual_move_regime == "mid" and actual_move_side and udm.interval_minutes == 5:
-        entry_price = up_price if actual_move_side == "YES" else down_price
         market_state = _book_snapshot_for_side(market, actual_move_side)
         best_bid = market_state.get("best_bid")
         best_ask = market_state.get("best_ask")
         spread = market_state.get("spread")
         book_age_ms = market_state.get("book_age_ms")
         tick_size = market_state.get("tick_size")
+        entry_price = _book_midpoint_entry_price(
+            market_state,
+            fallback_price=(up_price if actual_move_side == "YES" else down_price),
+            max_book_age_ms=MID_FOLLOW_MAX_BOOK_AGE_MS,
+            max_spread=MID_FOLLOW_MAX_SPREAD,
+        )
         late_alignment = (
             _sign(late_return_20s) == _sign(actual_window_return)
             or _sign(late_return_60s) == _sign(actual_window_return)
         )
         orderbook_alignment = _book_pressure_aligns(actual_move_side, market_state)
+        book_tradeable = _book_is_tradeable(
+            market_state,
+            max_book_age_ms=MID_FOLLOW_MAX_BOOK_AGE_MS,
+            max_spread=MID_FOLLOW_MAX_SPREAD,
+        )
         if (
             abs(actual_window_return or 0.0) >= MID_FOLLOW_MIN_RETURN_5M
             and body_ratio is not None
-            and body_ratio >= MID_FOLLOW_MIN_BODY_RATIO
-            and best_bid is not None
-            and best_ask is not None
-            and book_age_ms is not None
-            and book_age_ms <= MID_FOLLOW_MAX_BOOK_AGE_MS
-            and spread is not None
-            and spread <= MID_FOLLOW_MAX_SPREAD
+            and body_ratio >= MID_FOLLOW_EARLY_MIN_BODY_RATIO
+            and book_tradeable
             and (late_alignment or orderbook_alignment)
+            and entry_price <= MID_FOLLOW_EARLY_MAX_ENTRY_PRICE
         ):
-            strategy_mode = _strategy_mode_for_signal(udm, actual_move_side)
+            base_strategy_mode = _strategy_mode_for_signal(udm, actual_move_side)
+            strategy_mode = base_strategy_mode
             if strategy_mode == STRATEGY_MODE_LIVE and entry_price < CANDIDATE_MIN_ENTRY_PRICE:
                 strategy_mode = STRATEGY_MODE_SHADOW
             trend_alignment = "mid_follow_late" if late_alignment else "mid_follow_obi"
-            size_multiplier = 0.90
+            size_multiplier = 0.75
             model_up_prob = _reference_probability(actual_window_return, reference_zscore, udm.interval_minutes)
             selected_side_probability = _side_probability(actual_move_side, model_up_prob)
             edge_gross = max(selected_side_probability - entry_price, 0.0)
@@ -1093,7 +1288,22 @@ def _analyze_actual_move_first(
                 seconds_to_close=actual_seconds,
                 interval_return=actual_window_return,
             ) + extra_min_edge
-            strategy_route = "mid_follow_candidate"
+            strategy_route = "mid_follow_early"
+            retry_promoted = (
+                base_strategy_mode == STRATEGY_MODE_LIVE
+                and _retry_route_eligible(
+                    retry_context=retry_context,
+                    market_slug=market.slug,
+                    actual_move_side=actual_move_side,
+                    actual_seconds=actual_seconds,
+                    entry_price=entry_price,
+                    tick_size=tick_size,
+                    edge_gross=edge_gross,
+                    edge_net=edge_net,
+                    min_edge=min_edge,
+                    expected_cost=expected_cost,
+                )
+            )
             if entry_price > ACTUAL_MOVE_HIGH_PROB_UPPER:
                 return build_skip(
                     f"{coin} skip: too late or overpriced ({detail_suffix})",
@@ -1102,11 +1312,14 @@ def _analyze_actual_move_first(
                     route="too_late_or_overpriced",
                     override_mode=STRATEGY_MODE_SHADOW,
                 )
-            shadow_high_prob = entry_price > ACTUAL_MOVE_CANDIDATE_MAX_PRICE
-            if shadow_high_prob:
+            shadow_high_prob = entry_price > ACTUAL_MOVE_CANDIDATE_MAX_PRICE and not retry_promoted
+            if retry_promoted:
+                strategy_mode = STRATEGY_MODE_LIVE
+                strategy_route = "second_chance_retry"
+            elif shadow_high_prob:
                 strategy_mode = STRATEGY_MODE_SHADOW
                 strategy_route = "high_prob_shadow"
-            if edge_net >= min_edge and edge_gross >= expected_cost:
+            if edge_net >= (min_edge + EARLY_MOMENTUM_EXTRA_EDGE) and edge_gross >= (expected_cost * 3.0):
                 confidence = _confidence_score(
                     edge_net=edge_net,
                     min_edge=min_edge,
@@ -1118,8 +1331,9 @@ def _analyze_actual_move_first(
                 )
                 reason = (
                     f"{coin} "
+                    f"{'second-chance retry ' if retry_promoted else ''}"
                     f"{'high-probability shadow ' if shadow_high_prob else ''}"
-                    f"mid-follow {actual_move_side}; model UP {model_up_prob:.0%}; "
+                    f"mid-follow early {actual_move_side}; model UP {model_up_prob:.0%}; "
                     f"selected {actual_move_side} {selected_side_probability:.0%} vs market {entry_price:.0%}; "
                     f"net edge {edge_net:.1%}, {actual_seconds:.0f}s to close, {detail_suffix}"
                 )
@@ -1132,6 +1346,7 @@ def _analyze_actual_move_first(
                     strategy_mode=strategy_mode,
                     market_type=f"{udm.interval_minutes}m",
                     coin=coin,
+                    entry_price=entry_price,
                     edge_gross=edge_gross,
                     edge_net=edge_net,
                     reference_symbol=coin,
@@ -1163,12 +1378,13 @@ def _analyze_actual_move_first(
                     window_open_price=window_open_price,
                     window_open_source=window_open_source,
                     window_open_price_trusted=window_open_price_trusted,
+                    window_open_anchor_age_seconds=window_open_anchor_age_seconds,
                     actual_window_return=actual_window_return,
                     actual_move_regime=actual_move_regime,
                     actual_move_side=actual_move_side,
                     strategy_route=strategy_route,
                     cluster_id=_cluster_id(coin),
-                    signal_epoch_id=f"{market.slug}:mid-follow",
+                    signal_epoch_id=f"{market.slug}:{strategy_route}",
                     book_age_ms=book_age_ms,
                     tick_size=tick_size,
                     expected_fill_price=best_ask if best_ask is not None else entry_price,
@@ -1190,7 +1406,7 @@ def _analyze_actual_move_first(
                     estimated_fee=estimated_fee,
                     min_edge=min_edge,
                     momentum=actual_window_return,
-                    price_state="mid_follow",
+                    price_state="second_chance_retry" if retry_promoted else "mid_follow",
                     strategy_mode=strategy_mode,
                     reference_age_seconds=reference_age,
                     reference_zscore=reference_zscore,
@@ -1198,6 +1414,8 @@ def _analyze_actual_move_first(
                     best_bid=signal.best_bid,
                     best_ask=signal.best_ask,
                     spread=signal.spread,
+                    book_age_ms=book_age_ms,
+                    tick_size=tick_size,
                     decision_latency_ms=signal.decision_latency_ms,
                     thesis_id=thesis_id,
                     selected_side_probability=selected_side_probability,
@@ -1220,6 +1438,7 @@ def _analyze_actual_move_first(
                     window_open_price=window_open_price,
                     window_open_source=window_open_source,
                     window_open_price_trusted=window_open_price_trusted,
+                    window_open_anchor_age_seconds=window_open_anchor_age_seconds,
                     actual_window_return=actual_window_return,
                     actual_move_regime=actual_move_regime,
                     actual_move_side=actual_move_side,
@@ -1233,43 +1452,39 @@ def _analyze_actual_move_first(
             route="mid_skip",
         )
 
-    entry_price = up_price if actual_move_side == "YES" else down_price
     market_state = _book_snapshot_for_side(market, actual_move_side)
     best_bid = market_state.get("best_bid")
     best_ask = market_state.get("best_ask")
     spread = market_state.get("spread")
     book_age_ms = market_state.get("book_age_ms")
     tick_size = market_state.get("tick_size")
+    entry_price = _book_midpoint_entry_price(
+        market_state,
+        fallback_price=(up_price if actual_move_side == "YES" else down_price),
+        max_book_age_ms=ACTUAL_MOVE_MAX_BOOK_AGE_MS,
+        max_spread=ACTUAL_MOVE_MAX_SPREAD,
+    )
+    book_tradeable = _book_is_tradeable(
+        market_state,
+        max_book_age_ms=ACTUAL_MOVE_MAX_BOOK_AGE_MS,
+        max_spread=ACTUAL_MOVE_MAX_SPREAD,
+    )
     trend_alignment = "follow_trend"
     strategy_route = "trend_follow_candidate"
+    late_60_align = _sign(late_return_60s) == _sign(actual_window_return)
+    late_20_align = _sign(late_return_20s) == _sign(actual_window_return)
     confirmed = (
         _sign(actual_window_return) != 0
-        and _sign(late_return_60s) == _sign(actual_window_return)
-        and _sign(late_return_20s) == _sign(actual_window_return)
+        and late_60_align
+        and late_20_align
         and body_ratio is not None
         and body_ratio >= TREND_STRONG_MIN_BODY_RATIO
-        and best_bid is not None
-        and best_ask is not None
-        and book_age_ms is not None
-        and book_age_ms <= ACTUAL_MOVE_MAX_BOOK_AGE_MS
-        and spread is not None
-        and spread <= ACTUAL_MOVE_MAX_SPREAD
+        and book_tradeable
     )
-    if not confirmed:
-        return build_skip(
-            f"{coin} skip: strong move not confirmed ({detail_suffix})",
-            price_state="strong_move_no_confirmation",
-            signal_side=legacy_signal_side if contrarian_block_reason else "",
-            route="trend_follow_candidate",
-        )
-
-    strategy_mode = _strategy_mode_for_signal(udm, actual_move_side)
+    base_strategy_mode = _strategy_mode_for_signal(udm, actual_move_side)
+    strategy_mode = base_strategy_mode
     if strategy_mode == STRATEGY_MODE_LIVE and entry_price < CANDIDATE_MIN_ENTRY_PRICE:
         strategy_mode = STRATEGY_MODE_SHADOW
-    shadow_high_prob = entry_price > ACTUAL_MOVE_CANDIDATE_MAX_PRICE
-    if shadow_high_prob:
-        strategy_mode = STRATEGY_MODE_SHADOW
-        strategy_route = "high_prob_shadow"
     size_multiplier = _size_multiplier(
         candle_regime="trend_strong",
         trend_alignment=trend_alignment,
@@ -1291,6 +1506,31 @@ def _analyze_actual_move_first(
         ),
         expected_cost * ACTUAL_MOVE_EDGE_COST_MULTIPLE,
     ) + extra_min_edge
+    early_follow = (
+        not confirmed
+        and _sign(actual_window_return) != 0
+        and body_ratio is not None
+        and body_ratio >= EARLY_MOMENTUM_MIN_BODY_RATIO
+        and entry_price <= EARLY_MOMENTUM_MAX_ENTRY_PRICE
+        and (late_60_align or late_20_align)
+        and edge_gross >= (expected_cost * 3.0)
+        and edge_net >= (
+            min_edge
+            + EARLY_MOMENTUM_EXTRA_EDGE
+            + (0.0 if book_tradeable else EARLY_MOMENTUM_NO_BOOK_EXTRA_EDGE)
+        )
+    )
+    if not confirmed and not early_follow:
+        return build_skip(
+            f"{coin} skip: strong move not confirmed ({detail_suffix})",
+            price_state="strong_move_no_confirmation",
+            signal_side=actual_move_side,
+            route=strategy_route,
+        )
+    if early_follow:
+        trend_alignment = "follow_trend_early"
+        strategy_route = "trend_follow_early"
+        size_multiplier = min(size_multiplier, 0.75)
 
     if reference_zscore is not None and coin == "BTC":
         if actual_move_side == "NO" and reference_zscore > BTC_TOXIC_FLOW_STRONG_ZSCORE:
@@ -1298,14 +1538,14 @@ def _analyze_actual_move_first(
                 f"{coin} skip: BTC toxic flow z-score {reference_zscore:+.2f} against NO",
                 price_state="toxic_flow",
                 signal_side=actual_move_side,
-                route="trend_follow_candidate",
+                route=strategy_route,
             )
         if actual_move_side == "YES" and reference_zscore < -BTC_TOXIC_FLOW_STRONG_ZSCORE:
             return build_skip(
                 f"{coin} skip: BTC toxic flow z-score {reference_zscore:+.2f} against YES",
                 price_state="toxic_flow",
                 signal_side=actual_move_side,
-                route="trend_follow_candidate",
+                route=strategy_route,
             )
         if actual_move_side == "NO" and BTC_TOXIC_FLOW_WEAK_ZSCORE < reference_zscore <= BTC_TOXIC_FLOW_STRONG_ZSCORE:
             size_multiplier *= BTC_TOXIC_FLOW_SIZE_MULTIPLIER
@@ -1320,6 +1560,28 @@ def _analyze_actual_move_first(
             route="too_late_or_overpriced",
             override_mode=STRATEGY_MODE_SHADOW,
         )
+    retry_promoted = (
+        base_strategy_mode == STRATEGY_MODE_LIVE
+        and _retry_route_eligible(
+            retry_context=retry_context,
+            market_slug=market.slug,
+            actual_move_side=actual_move_side,
+            actual_seconds=actual_seconds,
+            entry_price=entry_price,
+            tick_size=tick_size,
+            edge_gross=edge_gross,
+            edge_net=edge_net,
+            min_edge=min_edge,
+            expected_cost=expected_cost,
+        )
+    )
+    shadow_high_prob = entry_price > ACTUAL_MOVE_CANDIDATE_MAX_PRICE and not retry_promoted
+    if retry_promoted:
+        strategy_mode = STRATEGY_MODE_LIVE
+        strategy_route = "second_chance_retry"
+    elif shadow_high_prob:
+        strategy_mode = STRATEGY_MODE_SHADOW
+        strategy_route = "high_prob_shadow"
     if strategy_mode == STRATEGY_MODE_LIVE and edge_gross < expected_cost * COST_CLEARING_MULTIPLIER:
         return build_skip(
             f"{coin} skip: gross edge {edge_gross:.1%} does not clear "
@@ -1347,8 +1609,10 @@ def _analyze_actual_move_first(
     )
     reason = (
         f"{coin} "
+        f"{'second-chance retry ' if retry_promoted else ''}"
         f"{'high-probability shadow ' if shadow_high_prob else ''}"
-        f"actual-move follow {actual_move_side}; model UP {model_up_prob:.0%}; "
+        f"actual-move {'follow early ' if early_follow and not retry_promoted else 'follow '}{actual_move_side}; "
+        f"model UP {model_up_prob:.0%}; "
         f"selected {actual_move_side} {selected_side_probability:.0%} vs market {entry_price:.0%}; "
         f"net edge {edge_net:.1%}, {actual_seconds:.0f}s to close, {detail_suffix}"
     )
@@ -1361,6 +1625,7 @@ def _analyze_actual_move_first(
         strategy_mode=strategy_mode,
         market_type=f"{udm.interval_minutes}m",
         coin=coin,
+        entry_price=entry_price,
         edge_gross=edge_gross,
         edge_net=edge_net,
         reference_symbol=coin,
@@ -1392,6 +1657,7 @@ def _analyze_actual_move_first(
         window_open_price=window_open_price,
         window_open_source=window_open_source,
         window_open_price_trusted=window_open_price_trusted,
+        window_open_anchor_age_seconds=window_open_anchor_age_seconds,
         actual_window_return=actual_window_return,
         actual_move_regime=actual_move_regime,
         actual_move_side=actual_move_side,
@@ -1419,7 +1685,13 @@ def _analyze_actual_move_first(
         estimated_fee=estimated_fee,
         min_edge=min_edge,
         momentum=actual_window_return,
-        price_state="strong_actual_move",
+        price_state=(
+            "second_chance_retry"
+            if retry_promoted
+            else "strong_actual_move_early"
+            if early_follow
+            else "strong_actual_move"
+        ),
         strategy_mode=strategy_mode,
         reference_age_seconds=reference_age,
         reference_zscore=reference_zscore,
@@ -1427,6 +1699,8 @@ def _analyze_actual_move_first(
         best_bid=signal.best_bid,
         best_ask=signal.best_ask,
         spread=signal.spread,
+        book_age_ms=book_age_ms,
+        tick_size=tick_size,
         decision_latency_ms=signal.decision_latency_ms,
         thesis_id=thesis_id,
         selected_side_probability=selected_side_probability,
@@ -1449,6 +1723,7 @@ def _analyze_actual_move_first(
         window_open_price=window_open_price,
         window_open_source=window_open_source,
         window_open_price_trusted=window_open_price_trusted,
+        window_open_anchor_age_seconds=window_open_anchor_age_seconds,
         actual_window_return=actual_window_return,
         actual_move_regime=actual_move_regime,
         actual_move_side=actual_move_side,
@@ -1456,7 +1731,11 @@ def _analyze_actual_move_first(
     )
 
 
-def analyze_updown_market_detail(udm: UpDownMarket, extra_min_edge: float = 0.0) -> UpdownAnalysis:
+def analyze_updown_market_detail(
+    udm: UpDownMarket,
+    extra_min_edge: float = 0.0,
+    retry_context: dict | None = None,
+) -> UpdownAnalysis:
     """Return a structured analysis result for one up/down market."""
 
     t0 = time.time()
@@ -1519,6 +1798,7 @@ def analyze_updown_market_detail(udm: UpDownMarket, extra_min_edge: float = 0.0)
         thesis_id=thesis_id,
         extra_min_edge=extra_min_edge,
         t0=t0,
+        retry_context=retry_context,
     )
 
     reference = get_reference_snapshot(coin, interval_minutes=udm.interval_minutes)
@@ -1809,9 +2089,7 @@ def analyze_updown_market_detail(udm: UpDownMarket, extra_min_edge: float = 0.0)
 
     selected_token_id = ""
     if market.token_ids:
-        selected_index = 0 if side == "YES" else 1
-        if selected_index < len(market.token_ids):
-            selected_token_id = market.token_ids[selected_index]
+        selected_token_id = market_side_token_id(market, side)
     market_state = MARKET_CACHE.snapshot(selected_token_id) if selected_token_id else {}
     best_bid = market_state.get("best_bid") or entry_price
     best_ask = market_state.get("best_ask") or entry_price
