@@ -221,6 +221,10 @@ class OrderExecutor(ABC):
             raw_response={"transaction_id": transaction_id},
         )
 
+    def get_wallet_balance(self) -> float | None:
+        """Return live USDC wallet balance, or None if unavailable."""
+        return None
+
 
 class PaperExecutor(OrderExecutor):
     """Instant fill at quoted price with zero fees.
@@ -407,6 +411,17 @@ class LiveExecutor(OrderExecutor):
 
     def supports_redemption(self) -> bool:
         return self.redemption_enabled
+
+    def get_wallet_balance(self) -> float | None:
+        try:
+            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+            result = self._client.get_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            )
+            raw = result.get("balance") if isinstance(result, dict) else getattr(result, "balance", None)
+            return float(raw) if raw is not None else None
+        except Exception:
+            return None
 
     def _relayer_headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}

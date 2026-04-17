@@ -178,6 +178,7 @@ class Engine:
         if APP_CONFIG.copy_trading.enabled and APP_CONFIG.copy_trading.target_wallet:
             self.copy_trading_service = CopyTradingService(APP_CONFIG.copy_trading.target_wallet)
         self._load_history()
+        self._reconcile_wallet_balance()
         self.risk_manager.bootstrap_from_history(self.trades, account_equity=self.account_equity)
         if self.open_orders:
             self._reconcile_open_orders()
@@ -278,6 +279,21 @@ class Engine:
         if self.open_orders:
             self._log(
                 f"Restored {len(self.open_orders)} open orders, ${self.reserved_open_exposure:.2f} reserved"
+            )
+
+    def _reconcile_wallet_balance(self) -> None:
+        if TRADING_MODE != "live":
+            return
+        wallet_balance = self.executor.get_wallet_balance()
+        if wallet_balance is None:
+            return
+        discrepancy = abs(wallet_balance - self.balance)
+        if discrepancy > LIVE_MIN_BET:
+            self._log(
+                f"WARNING: computed balance ${self.balance:.2f} differs from "
+                f"wallet balance ${wallet_balance:.2f} by ${discrepancy:.2f} "
+                f"(threshold ${LIVE_MIN_BET:.2f}) — check for manually placed "
+                f"orders or CSV drift"
             )
 
     def _log(self, msg: str):

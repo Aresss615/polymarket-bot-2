@@ -1643,3 +1643,29 @@ def test_start_runtime_services_emits_session_start():
     assert "strategy_version" in data
     assert "relayer_url" in data
     assert "wallet_type" in data
+
+
+def test_wallet_balance_discrepancy_logged():
+    executor = StubExecutor()
+    with (
+        patch("engine.TRADING_MODE", "live"),
+        patch("engine.STARTING_BALANCE", 10.0),
+        patch.object(executor, "get_wallet_balance", return_value=3.0),
+    ):
+        engine = Engine(executor=executor)
+
+    warning_lines = [line for line in engine.activity_log if "WARNING" in line and "wallet" in line.lower()]
+    assert len(warning_lines) == 1
+
+
+def test_wallet_balance_no_warning_within_threshold():
+    executor = StubExecutor()
+    with (
+        patch("engine.TRADING_MODE", "live"),
+        patch("engine.STARTING_BALANCE", 10.0),
+        patch.object(executor, "get_wallet_balance", return_value=10.0),
+    ):
+        engine = Engine(executor=executor)
+
+    warning_lines = [line for line in engine.activity_log if "WARNING" in line and "wallet" in line.lower()]
+    assert len(warning_lines) == 0
