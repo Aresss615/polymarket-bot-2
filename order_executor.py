@@ -377,7 +377,7 @@ class LiveExecutor(OrderExecutor):
         self._session = requests.Session()
 
         self._client = ClobClient(
-            "https://clob.polymarket.com",
+            APP_CONFIG.market_data.clob_api_url,
             key=private_key,
             chain_id=chain_id,
             signature_type=polymarket_wallet_signature_type(self.wallet_type),
@@ -1069,7 +1069,15 @@ class LiveExecutor(OrderExecutor):
                         metadata=metadata,
                     )
             except Exception:
-                pass
+                return self._make_rejection(
+                    entry_price=entry_price,
+                    latency_ms=0.0,
+                    reason="market_data_unavailable",
+                    requested_size=size,
+                    requested_shares=(size / entry_price if entry_price > 0 else 0.0),
+                    token_id=token_id,
+                    metadata=metadata,
+                )
 
         book_snapshot = self._get_book_snapshot(token_id)
         if book_snapshot:

@@ -137,3 +137,16 @@ def test_live_executor_uses_inverted_outcome_token_for_preflight(MockClient):
     create_args = instance.create_order.call_args[0][0]
     assert create_args.token_id == "0xUP"
 
+
+@patch("py_clob_client.client.ClobClient", autospec=True)
+def test_live_executor_rejects_on_market_data_exception(MockClient):
+    md = MagicMock()
+    md.get_execution_quote.side_effect = RuntimeError("connection refused")
+    executor, instance = _make_executor(MockClient, md)
+
+    result = executor.place_order(_signal(), size=2.0, entry_price=0.80)
+
+    assert result.filled is False
+    assert result.reason == "market_data_unavailable"
+    instance.create_order.assert_not_called()
+
